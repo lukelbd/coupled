@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""
+Shared utilities for working with coupled model output.
+"""
+# Internal stuff
+from functools import partial
+from warnings import warn
+_CoupledWarning = type('CoupledWarning', (UserWarning,), {})
+_warn_coupled = partial(warn, category=_CoupledWarning, stacklevel=2)
+
+# Public stuff
+from climopy import ureg, vreg, const  # noqa: F401
+from .output import *  # noqa: F401, F403
+from .figures import *  # noqa: F401, F403

@@ -2,9 +2,9 @@
 """
 Utilities for plotting coupled model output.
 """
+import collections
 import itertools
 import re
-import pandas as pd
 from pathlib import Path
 
 import numpy as np
@@ -13,144 +13,283 @@ import xarray as xr
 import climopy as climo
 import proplot as pplt
 from climopy import ureg, vreg  # noqa: F401
-from cmip_data import output
+from .output import FEEDBACK_DEFINITIONS, MODELS_INSTITUTIONS
+from .output import _update_climate_moisture, _update_climate_units, open_file
 
-# Global constants
-FEEDBACK_ALIASES = {
-    key: name
-    for key, (name, _) in output.FEEDBACK_DEFINITIONS.items()
+
+# Variable constants
+VARIABLE_ALIASES = {
+    key: name for key, (name, _) in FEEDBACK_DEFINITIONS.items()
 }
-REDUCE_DEFAULTS = {  # default feedback selections
-    'period': 'ann',
-    'ensemble': 'flagship',
-    'project': 'all',
-    'author': 'davis',
-    'series': 'response',
-    'statistic': 'regression',
-    'numerator': 'globe',
-    'denominator': 'globe',
+
+# Reduce constants
+REDUCE_ABBREV = {
+    'point': 'local',
+    'globe': 'globe',
+    'latitude': 'zone',
+    'hemisphere': 'hemi',
 }
-REDUCE_DESCRIPTIONS = {  # default is title-case of input
-    '+': 'plus',
-    '-': 'minus',
-    '*': 'times',
-    '/': 'over',
-    'ann': 'Annual',
+REDUCE_LABELS = {  # default is title-case of input
+    'ann': 'annual',
     'djf': 'DJF',
     'mam': 'MAM',
     'jja': 'JJA',
     'son': 'SON',
-    'avg': 'Average',
-    'int': 'Integral',
-    'absmin': 'Minimum',
-    'absmax': 'Maximum',
-    'globe': 'Global',
-    'point': 'Local',
-    'latitude': 'Zonal',
-    'hemisphere': 'Hemisphere',
+    'avg': 'average',
+    'int': 'integral',
+    'absmin': 'minimum',
+    'absmax': 'maximum',
+    'point': 'local',
+    'globe': 'global',
+    'latitude': 'zonal',
+    'hemisphere': 'hemisphere',
 }
 
+# Keyword argument constants
+KWARGS_DEFAULT = {  # default feedback selections
+    'format': {
+        'coast': True,
+        'xscale': 'sine',
+    },
+    'reduce': {
+        'period': 'ann',
+        'experiment': 'control',
+        'ensemble': 'flagship',
+        'source': 'eraint',
+        'statistic': 'regression',
+        'region': 'globe',
+    },
+}
+KWARGS_TUPLE = collections.namedtuple(
+    'kwargs',
+    (
+        'reduce',
+        'format',
+        'colorbar',
+        'legend',
+        'plot'
+    )
+)
+KWARGS_SORT = (
+    'lon',  # regions
+    'lat',
+    'area',
+    'plev',
+    'period',
+    'feedback',  # feedback multi-index
+    'source',
+    'statistic',
+    'region',
+    'facets',  # facet multi-index
+    'project',
+    'model',
+    'ensemble',
+    'experiment',
+)
 
-def _parse_indexers(dataset, **indexers):
+
+def _parse_project(dataset, project):
     """
-    Standardize the indexers and translate into a title suitable for
-    figures. Include special behavior for project indexers.
+    Return plot labels and facet tuples for the project indicator.
 
     Parameters
     ----------
     dataset : xarray.Dataset
-        The dataset. If ``project`` is passed then this should
-        contain a ``'source'`` `~pandas.MultiIndex` coordinate.
+        The dataset. Must contain a ``'facets'`` coordinates.
+    project : str
+        The project selection. Values can optionally start with ``'cmip'`` and must end
+        with integers indicating the facet values. No integer indicates all CMIP5 and
+        CMIP6 models, ``5`` (``6``) indicates just CMIP5 (CMIP6) models, ``56`` (``65``)
+        indicates CMIP5 (CMIP6) models filtered to those from the same institutions as
+        CMIP6 (CMIP5), and ``55`` (``66``) indicates models from institutions found only
+        in CMIP5 (CMIP6). A common combination might be ``5``, ``65``, ``66``. As with
+        other indexers, can use arithmetic operators for combinations (e.g. ``'6-5'``).
+
+    Returns
+    -------
+    abbrev : str
+        The file name abbreviation.
+    label : str
+        The column or row label string.
+    filter : callable
+        Function for filtering ``facets`` coordinates.
+    """
+    # NOTE: Critical that 'facets' selection is a list because accessor reduce method
+    # will pass tuples to '.get()' for interpolation onto variable-derived locations.
+    s1, s2 = object(), object()  # sentinels
+    _, num = project.lower().split('cmip')
+    if not num:
+        filter = lambda key: True  # noqa: U100
+        label = 'CMIP'
+        abbrev = 'cmip'
+    elif num in ('5', '6'):
+        filter = lambda key: key[0][-1] == num
+        label = f'CMIP{num}'
+        abbrev = f'cmip{num}'
+    elif num in ('65', '66', '56', '55'):
+        idx = len(set(num)) - 1  # zero if only one unique integer
+        opp = '5' if num[0] == '6' else '6'  # opposite project number
+        filter = lambda key: key[0][-1] == num[0] and idx == any(
+            MODELS_INSTITUTIONS.get(key[1], s1) == MODELS_INSTITUTIONS.get(other[1], s2)
+            for other in dataset.facets.values  # iterate over keys
+            if other[0][-1] == opp
+        )
+        label = ('Other', 'Matched')[idx] + f' CMIP{num[0]}'
+        abbrev = f'cmip{num}'
+    else:
+        raise ValueError(f'Invalid project {num!r}.')
+    return abbrev, label, filter
+
+
+def _parse_reduce(dataset, **indexers):
+    """
+    Standardize the indexers and translate into labels suitable for figures.
+
+    Parameters
+    ----------
+    dataset : xarray.Dataset
+        The dataset.
     **indexers
         The indexers. Numeric are assumed to be the units of the array and
-        string indexers can have arithmetic operators ``+*/-`` to perform
+        string indexers can have arithmetic operators ``+-`` to perform
         operations between multiple selections (e.g. seasonal differences
-        relative to annual average or one project relative to another).
+        relative to annual average or one project relative to another). Note
+        the special key `project` is handled by `_parse_project`.
 
-    Note
-    ----
-    Here `project` is treated specially. Values can optionally start with ``'cmip'``
-    and must end with integers indicating the source values. No integer indicates all
-    CMIP5 and CMIP6 models, ``5`` (``6``) indicates just CMIP5 (CMIP6) models, ``56``
-    (``65``) indicate CMIP5 (CMIP6) models filtered to those from the same institutions
-    as CMIP6 (CMIP5), and ``55`` (``66``) indicates models from institutions found only
-    in CMIP5 (CMIP6). A common combination might be ``5``, ``65``, ``66``. As with
-    other indexers, can use arithmetic operators for combinations (e.g. ``'6-5'``).
+    Returns
+    -------
+    abbrevs : dict
+        Abbreviations for the coordinate reductions. This is destined
+        for use in file names.
+    labels : dict
+        Labels for the coordinate reductions. This is destined for
+        use in row and column figure labels.
+    operator : str or None
+        The operator used between 2-tuples of selections. This is commonly
+        used for project differences, e.g. ``cmip6-cmip5``.
+    reduce : dict
+        The reduction selections. Contains either scalar sanitized selections
+        or two-tuples of selections for operations.
     """
     # NOTE: Integers are added to titles later to indicate the number of values
     # without NaNs. May be fewer when feedback components are unavailable.
-    # TODO: Add 'add_sel', 'sub_sel', etc. methods to climopy and similar
-    # 'add_<dim>', 'sub_<dim>' methods to reduce() on macbook. For now use
-    # arithmetic indicators in strings for this sort of selection.
+    # NOTE: Critical that we iterate through indexers in order since they the order
+    # is standardized in _parse_spec. Otherwise get different labels and file names.
+    abbrevs, labels, reduce = {}, {}, {}
     operators = set()
-    titles, values = {}, {}
     for dim, coord in indexers.items():
-        tits, vals = [], []
-        iter_ = re.split('([+*/-])', coord) if isinstance(coord, str) else (coord,)
-        if len(iter_) not in (1, 3):  # maximum one operator
+        abvs, labs, sels = [], [], []
+        parts = re.split('([+-])', coord) if isinstance(coord, str) else (coord,)
+        if len(parts) not in (1, 3):  # maximum one operator
             raise ValueError(f'Unexpected coordinate format {coord!r}.')
-        for i, value in enumerate(iter_):
-            if dim == 'project' and value not in '+*/-':
-                regex = re.compile(r'\A([a-zA-Z_]+).*\Z')
-                _, num = value.lower().split('cmip')
-                if not num:
-                    title = 'CMIP models'
-                    func = lambda key: True  # noqa: U100
-                elif num in ('5', '6'):
-                    title = f'CMIP{num} models'
-                    func = lambda key: num == key[0][-1]
-                elif num in ('65', '66', '56', '66'):
-                    idx = len(set(num)) - 1  # zero if only one unique integer
-                    num1, num2 = num[0], '65'[idx]
-                    title = ('Other', 'Matched')[idx] + f' CMIP{num1} models'
-                    func = lambda key: idx == any(
-                        re.match(inst, other[1], re.IGNORECASE)
-                        or inst[:3].lower() == other[1][:3].lower() == 'inm'
-                        for other in dataset.source.values  # iterate over keys
-                        if key[0][-1] == num2 and (inst := regex.sub(r'\1', key[1]))
-                    )
-                else:
-                    raise ValueError(f'Invalid project {num!r}.')
-                key = 'source'
-                value = list(filter(func, dataset.source.values))
-            elif isinstance(value, str):
-                title = REDUCE_DESCRIPTIONS.get(value, value.title())
-                if value in '+*/-':
-                    operators.add(value)
-                    if len(operators) > 1:
-                        raise ValueError(f'Conflicting selection {operators=}.')
-            else:
+        for i, sel in enumerate(parts):
+            if not isinstance(sel, str):
                 coords = dataset[dim]
                 unit = coords.climo.units
-                if not isinstance(value, ureg.Quantity):
-                    value = ureg.Quantity(value, unit)
-                value = value.to(unit)
-                title = f'${value:~L}$'
-            tits.append(title)
-            if value not in operators:
-                vals.append(value)
-        titles[key] = tits
-        values[key] = vals
-    if 'numerator' in titles and 'denominator' in titles:
-        numers, denoms = titles.pop('numerator'), titles.pop('denominator')
-        if len(numers) == 1:
-            numers = numers * len(denoms)
-        if len(denoms) == 1:
-            denoms = denoms * len(numers)
-        if len(numers) != len(denoms):
-            raise ValueError(f'Unexpected {numers=} and {denoms=}.')
-        regions = tuple(
-            numer if i == 1 else f'{numer} vs. {denom}'
-            for i, (numer, denom) in enumerate(zip(numers, denoms))
-        )
-        titles = {'region': regions, **titles}
-    operator = operators.pop() if operators else None
-    titles = {key: ' '.join(tits) for tits in titles}
-    values = {key: vals[0] if len(vals) == 1 else tuple(vals) for key, vals in values.items()}  # noqa: E501
-    return titles, operator, values
+                if not isinstance(sel, ureg.Quantity):
+                    sel = ureg.Quantity(sel, unit)
+                sel = sel.to(unit)
+                label = f'${sel:~L}$'
+                abbrev = f'{sel:~.0f}'.replace('/', 'p').replace(' ', '')
+            elif dim == 'project':
+                dim = 'facets'
+                abbrev, label, sel = _parse_project(dataset, sel)
+            elif sel in '+-':
+                abbrev, label = sel, 'plus' if sel == '+' else 'minus'
+                operators.add('add' if sel == '+' else 'sub')
+                if len(operators) > 1:
+                    raise ValueError(f'Conflicting selection {operators=}.')
+            else:
+                label = REDUCE_LABELS.get(sel, sel)
+                abbrev = REDUCE_ABBREV.get(sel, sel.lower())
+            abvs.append(abbrev)
+            labs.append(label)
+            if not isinstance(sel, str) or sel not in '+-':
+                sels.append(sel)
+        abbrevs[dim] = '-'.join(abvs)
+        labels[dim] = ' '.join(labs)
+        reduce[dim] = sels[0] if len(sels) == 1 else tuple(sels)
+    operator = operators.pop() if operators else None  # only single operator permitted
+    return abbrevs, labels, operator, reduce
 
 
-def _parse_specs(dataset, inspecs, **kwargs):
+def _parse_spec(dataset, spec, **kwargs):
+    """
+    Parse the variable specification.
+
+    Parameters
+    ----------
+    dataset : `xarray.Dataset`
+        The dataset.
+    spec : sequence, str, or dict
+        The specification.
+    **kwargs
+        Additional keyword arguments.
+
+    Returns
+    -------
+    name : str
+        The short name. Summation of multiple variables (e.g. feedback terms)
+        can be indicated with e.g. ``pl+lr+wv``. Shorthand aliases are translated.
+        This is destined for use in file names.
+    long : str
+        The long name. Names are combined for summation of multiple variables
+        using e.g. ``Planck + lapse rate + water vapor``. This is destined for
+        use in figure row or column labels.
+    kwargs : namedtuple of dict
+        A named tuple containing keyword arguments for different plotting-related
+        commands. The keys are as follows:
+
+          * ``reduce``: Passed to `.climo.reduce` for index reductions.
+          * ``format``: Passed to `.format` for cartesian or geographic formatting.
+          * ``colorbar``: Passed to `.colorbar` for scalar mappable outputs.
+          * ``legend``: Passed to `ax.legend` for other artist outputs.
+          * ``plot``: Passed to the plotting command.
+
+        The first four categories are detected automatically using the dataset
+        and a list of possible argument prefixes while the the last category
+        contains all remaining keyword arguments.
+    """
+    options = (*dataset.sizes, 'area', 'volume')
+    options += tuple(name for idx in dataset.indexes.values() for name in idx.names)
+    if spec is None:
+        name, kw = None, {}
+    elif isinstance(spec, str):
+        name, kw = spec, {}
+    elif isinstance(spec, dict):
+        name, kw = None, spec
+    else:  # 2-tuple required
+        name, kw = spec
+    kw = {**kwargs, **kw}  # add shared keywords
+    long, kw_red, kw_fmt, kw_plt, kw_bar, kw_leg = None, {}, {}, {}, {}, {}
+    fmt_detect = ('x', 'y', 'lon', 'lat', 'abc', 'title', 'coast')
+    bar_detect = ('extend', 'tick', 'locator', 'formatter', 'minor')
+    leg_detect = ('ncol', 'order', 'frame', 'handle', 'border', 'column')
+    if name:  # TODO: climopy get() add methods instead?
+        name = '+'.join(VARIABLE_ALIASES.get(n, n) for n in name.split('+'))
+        long = ' + '.join(dataset[n].long_name for n in name.split('+'))
+    sort = lambda key: (
+        KWARGS_SORT.index(key) if key in KWARGS_SORT else len(KWARGS_SORT)
+    )
+    for key in sorted(kw, key=sort):
+        value = kw[key]  # sort for name and label standardization
+        if key in options:
+            kw_red[key] = value  # e.g. for averaging
+        elif any(key.startswith(prefix) for prefix in fmt_detect):
+            kw_fmt[key] = value
+        elif any(key.startswith(prefix) for prefix in bar_detect):
+            kw_bar[key] = value
+        elif any(key.startswith(prefix) for prefix in leg_detect):
+            kw_leg[key] = value
+        else:  # arbitrary plotting keywords
+            kw_plt[key] = value
+    kwargs = KWARGS_TUPLE(kw_red, kw_fmt, kw_bar, kw_leg, kw_plt)
+    return name, long, kwargs
+
+
+def _parse_specs(
+    dataset, rowspecs, colspecs, method1='avg', method2='corr', **kwargs
+):
     """
     Parse variable and project specifications and auto-determine row and column
     labels based on the unique names and/or keywords in the spec lists.
@@ -159,69 +298,148 @@ def _parse_specs(dataset, inspecs, **kwargs):
     ----------
     dataset : xarray.Dataset
         The source dataset.
-    inspecs : list of name, tuple, dict, or list thereof
+    rowspecs : list of name, tuple, dict, or list thereof
         The variable specification(s) per subplot slot.
+    colspecs : list of name, tuple, dict, or list thereof
+        The variable specification(s) per subplot slot.
+    method1 : str, optional
+        The default `facets` reduction method for single-variable specifications.
+    method2 : str, optional
+        The default `facets` reduction method for double-variable specifications.
     **kwargs
         Additional options shared across all specs.
+
+    Returns
+    -------
+    gridspecs : list of list
+        Row and column labels suitable for the figure grid.
+    filespecs : list of str
+        String segments suitable for the file name.
+    plotspecs : list of dict
+        List of per-subplot lists of plot specifications. Indicates the facet reduce
+        `method`, the reduce-selection `operator`, the row varaible `rname`, the
+        column variable `cname`, and the joint keyword args named tuple `kwargs`.
     """
-    # TODO: Migrate and merge the spec parser and the row/col scheme
-    # into the 'idealized' package. And perhaps rename that package.
-    # NOTE: Here we delay reducing along keywords since we want to
-    # share across different rows and column.
-    outspecs = []
-    kw_global = {}  # apply to entire spec list
-    if not isinstance(inspecs, list):
-        inspecs = [inspecs]
-    if isinstance(inspecs[-1], dict) and not all(isinstance(_, dict) for _ in inspecs[:-1]):  # noqa: E501
-        *inspecs, kw_global = inspecs
-    for ispecs in inspecs:
-        ospecs = []
-        kw_local = {}  # apply to this sub-list
-        if not isinstance(ispecs, list):
-            ispecs = [ispecs]
-        if isinstance(ispecs[-1], dict) and not all(isinstance(_, dict) for _ in ispecs[:-1]):  # noqa: E501
-            *ispecs, kw_local = ispecs
-        for spec in ispecs:
-            if spec is None:
-                name, kw = None, {}
-            elif isinstance(spec, str):
-                name, kw = spec, {}
-            elif isinstance(spec, dict):
-                name, kw = None, spec
-            else:  # 2-tuple required
-                name, kw = spec
-            kw = {**kwargs, **kw_global, **kw_local, **kw}  # add shared keywords
-            idxs = [idx for idx in dataset.indexes.values() if isinstance(idx, pd.MultiIndex)]  # noqa: E501
-            names, kw_red, kw_fmt, kw_plt, kw_bar, kw_leg = [], {}, {}, {}, {}, {}
-            fmt_prefixes = ('x', 'y', 'lon', 'lat', 'abc', 'title')
-            bar_prefixes = ('extend', 'tick', 'locator', 'formatter', 'minor')
-            leg_prefixes = ('ncol', 'order', 'frame', 'handle', 'border', 'column')
-            if name:  # TODO: climopy get() add methods instead?
-                names = [FEEDBACK_ALIASES.get(n, n) for n in name.split('+')]
-            for key, value in kw.items():
-                if key in dataset.sizes or any(key in idx.names for idx in idxs):
-                    kw_red[key] = value  # includes 'project'
-                elif any(key.startswith(prefix) for prefix in fmt_prefixes):
-                    kw_fmt[key] = value
-                elif any(key.startswith(prefix) for prefix in bar_prefixes):
-                    kw_bar[key] = value
-                elif any(key.startswith(prefix) for prefix in leg_prefixes):
-                    kw_leg[key] = value
-                else:  # arbitrary plotting keywords
-                    kw_plt[key] = value
-            titles, operator, kw_red = _parse_indexers(dataset, **kw_red)
-            spec = (names, operator, titles, kw_red, kw_fmt, kw_plt, kw_bar, kw_leg)
-            ospecs.append(spec)
-        outspecs.append(ospecs)
-    labels = []
-    names, operators, titles, *kws = zip(*(ospecs[0] for ospecs in outspecs))
-    dims = tuple(dim for tits in titles for dim in tits)
-    for dim in dims:
-        tits = tuple(tits.get(dim, None) for tits in titles)
-        if len(set(tits)) == len(tits):  # all unique entries
-            labels.append(tits)
-    labels = ['\n'.join(labs) for labs in zip(*labels)]
-    return dict(zip(labels, zip(names, operators, *kws)))
+    # Parse variable specs per gridspec row or column and per subplot, and generate
+    # abbreviated figure labels and file names based on the first entries.
+    # NOTE: This permits sharing keywords across each group with trailing dicts
+    # in either the primary gridspec list or any of the subplot sub-lists.
+    filespecs, gridspecs, allspecs = [], [], []
+    for inspecs in (rowspecs, colspecs):
+        # Get general specifications
+        outspecs = []  # specs containing general information
+        if not isinstance(inspecs, list):
+            inspecs = [inspecs]
+        kw_global = {}  # apply to entire spec list
+        if isinstance(inspecs[-1], dict) and not all(isinstance(_, dict) for _ in inspecs[:-1]):  # noqa: E501
+            *inspecs, kw_global = inspecs
+        for ispecs in inspecs:
+            ospecs = []
+            kw_local = {}  # apply to this sub-list
+            if not isinstance(ispecs, list):
+                ispecs = [ispecs]
+            if isinstance(ispecs[-1], dict) and not all(isinstance(_, dict) for _ in ispecs[:-1]):  # noqa: E501
+                *ispecs, kw_local = ispecs
+            for spec in ispecs:
+                kw = {**kwargs, **kw_global, **kw_local}
+                name, long, kw = _parse_spec(dataset, spec, **kw)
+                abbrevs, labels, operator, reduce = _parse_reduce(dataset, **kw.reduce)
+                kw.reduce.clear()
+                kw.reduce.update(reduce)
+                ospecs.append((name, long, abbrevs, labels, operator, kw))
+            outspecs.append(ospecs)
+        allspecs.append(outspecs)
+
+        # Get file labels
+        names, longs, abbrevs, labels, *_ = zip(*(ospecs[0] for ospecs in outspecs))
+        seen = set()
+        reverse = {
+            name: key for key, name in VARIABLE_ALIASES.items()
+            if name not in seen and not seen.add(name)
+        }
+        names = tuple(
+            '+'.join(reverse.get(n, n) for n in name.split('+'))
+            for name in filter(None, names)
+        )
+        seen = set()
+        fspecs = (*names, *(abv for abvs in abbrevs for abv in abvs.values()))
+        fspecs = (spec for spec in fspecs if spec not in seen and not seen.add(spec))
+        fspecs = (spec.replace('_', '') for spec in filter(None, fspecs))
+        filespecs.append(list(fspecs))
+
+        # Get row and column gridspec labels
+        gspecs = []  # row/column grid label specs
+        if len(set(tuple(labs.items()) for labs in labels)) > 1:
+            seen = set()
+            dims = [
+                dim for labs in labels for dim in labs
+                if dim not in seen and not seen.add(dim)
+            ]
+            labels = [tuple(labs.get(dim, None) for labs in labels) for dim in dims]
+            labels = [labs for labs in labels if any(lab != labs[0] for lab in labs)]
+            labels = [' '.join(filter(None, labs)) for labs in zip(*labels)]
+            gspecs.append(labels)
+        if len(set(longs)) > 1:  # unique variables
+            replace_always = (' parameter', ' effective')
+            replace_repeated = (' feedback', ' forcing')
+            for string in replace_always:
+                longs = [long.replace(string, '') for long in longs]
+            for string in replace_repeated:  # NOTE: can add to this
+                if all(string in long for long in longs):
+                    longs = [long.replace(string, '') for long in longs]
+            gspecs.append(longs)
+        gspecs = [' '.join(filter(None, specs)) for specs in zip(*gspecs)]
+        gspecs = [spec[0].upper() + spec[1:] if spec.split()[0].islower() else spec for spec in gspecs]  # noqa: E501
+        gridspecs.append(gspecs or [''] * len(outspecs))
+
+    # Combine row and column specifications for plotting and file naming
+    # NOTE: Multiple plotted values per subplot can be indicated in either the
+    # row or column list, and the specs from the other list will be repeated.
+    methods, plotspecs = [], []
+    nrows, ncols = map(len, allspecs)
+    for (i, rspecs), (j, cspecs) in itertools.product(*map(enumerate, allspecs)):
+        if len(rspecs) == 1:
+            rspecs = list(rspecs) * len(cspecs)
+        if len(cspecs) == 1:
+            cspecs = list(cspecs) * len(rspecs)
+        if len(rspecs) != len(cspecs):
+            raise ValueError(
+                f'Incompatible per-subplot spec count: {len(rspecs)} from '
+                f'the row specs, {len(cspecs)} from the column specs.'
+            )
+        pspecs = []
+        for k, (rspec, cspec) in enumerate(zip(rspecs, cspecs)):
+            rname, _, _, _, roperator, rkwargs = rspec
+            cname, _, _, _, coperator, ckwargs = cspec
+            operator = {roperator, coperator}.pop()
+            kwargs = KWARGS_TUPLE({}, {}, {}, {}, {})
+            for key in ('reduce', 'format', 'colorbar', 'legend', 'plot'):
+                kw = getattr(kwargs, key)
+                kw.update(KWARGS_DEFAULT.get(key, {}))
+                kw.update(getattr(rkwargs, key))
+                kw.update(getattr(ckwargs, key))
+            m1 = m2 = kwargs.plot.pop('method', None)  # input method
+            if rname is None and cname is None:
+                raise ValueError(f'Empty variable specification in slot {(i, j)}.')
+            elif rname is not None and cname is not None:
+                method = m2 or method2
+            else:
+                method = m1 or method1
+            if k == 0 and method not in methods:  # record first item in subplot
+                methods.append(method)
+            pspecs.append((method, operator, rname, cname, kwargs))
+        plotspecs.append(pspecs)
+
+    # Return specifications
+    # NOTE: Grid specs have two entires: the row labels and the column labels. File
+    # specs have four entires: the methods employed, the row-column global specs, the
+    # row-specific specs, and the col-specific specs. Plot specs have as many entries
+    # as there are subplots in the figure (nested for multiple subplots).
+    fboth = [spec for spec in filespecs[0] if spec in filespecs[1]]
+    frows = [spec for spec in filespecs[0] if spec not in fboth]
+    fcols = [spec for spec in filespecs[1] if spec not in fboth]
+    filespecs = ['-'.join(methods), '-'.join(fboth), '-'.join(frows), '-'.join(fcols)]
+    return gridspecs, filespecs, plotspecs
 
 
 def plot_bulk(
@@ -239,7 +457,6 @@ def plot_bulk(
     title=None,
     refwidth=None,
     maxcols=5,
-    absmax=0.5,
     pctile=33.3,
     proj='eqearth',
     save=True,
@@ -259,10 +476,10 @@ def plot_bulk(
         The maximum number of columns. Used only if one of the row or variable
         specs is scalar (in which case there are no row or column labels).
     method1 : {'avg', 'std'}, optional
-        The method for reducing the source dimension on individual non-scalar
+        The method for reducing the facets dimension on individual non-scalar
         variables. The default is an average.
     method2 : {'corr', 'diff'}, optional
-        The method for reducing the source dimension on paired non-scalar
+        The method for reducing the facets dimension on paired non-scalar
         variables. The default is an average.
     hcolorbar, hlegend : {'right', 'left', 'bottom', 'top'}
         The location for colorbars or legends annotating horizontal rows.
@@ -274,9 +491,11 @@ def plot_bulk(
         The default location for colorbars or legends annotating a mix of
         axes. Placed with the figure colorbar or legend method.
     pctile : float, optional
-        The percentiles to use for ``'diff'`` composite differences.
+        The percentiles for the ``'diff'`` composite differences, constructed
+        roughly as ``data[feedback > 100 - pctile] - data[feedback < pctile]``.
     proj : str, optional
-        The cartopy projection for longitude-latitude type plots.
+        The cartopy projection for longitude-latitude type plots. Default
+        is the area-weighted projection ``'eqearth'``.
     save : bool, optional
         Whether to save the results.
     **kwargs
@@ -301,75 +520,87 @@ def plot_bulk(
     # Initital stuff and figure out geometry
     # NOTE: The default behavior is always to draw a map... and users
     # are required to select either lon='avg' or plev=sel for 3D data.
-    rowspecs = _parse_specs(dataset, rowspecs, **kwargs)
-    colspecs = _parse_specs(dataset, colspecs, **kwargs)
-    nrows, ncols = len(rowspecs), len(colspecs)
-    if len(rowspecs) == 1 or len(colspecs) == 1:
-        naxes = max(len(rowspecs), len(colspecs))
+    kwargs.setdefault('coast', True)
+    kwargs.setdefault('xscale', 'sine')
+    (rowlabels, collabels), filespecs, plotspecs = _parse_specs(
+        dataset, rowspecs, colspecs, method1=method1, method2=method2, **kwargs
+    )
+    nrows, ncols = len(rowlabels), len(collabels)
+    if len(rowlabels) == 1 or len(collabels) == 1:
+        naxes = max(len(rowlabels), len(collabels))
         ncols = min(naxes, maxcols)
         nrows = 1 + (ncols - 1) // naxes
+    def _safe_reduce(data, **kwargs):  # noqa: E301
+        if facets := kwargs.pop('facets', None):  # see _parse_projects
+            data = data.sel(facets=list(filter(facets, data.facets.values)))
+        kwargs = {
+            key: value for key, value in kwargs.items()
+            if key in data.sizes
+            or any(key in idx.names for idx in data.indexes.values())  # noqa: E501
+        }
+        if kwargs:
+            data = data.sel(**kwargs)
+        return data
 
     # Iterate over axes and plots
     # NOTE: Critical to disable 'grouping' so that e.g. colorbars or legends that
     # extend into other panel slots are not considered in the tight layout algorithm.
-    gs = pplt.GridSpec(nrows, ncols)
     fig = pplt.figure(refwidth=refwidth, hgroup=False, wgroup=False)
+    gridspec = pplt.GridSpec(nrows, ncols)
+    contours = ('gray8', 'gray3')  # contour colors
     commands = {}
-    for (i, rspecs), (j, cspecs) in itertools.product(
-        enumerate(rowspecs.values()), enumerate(colspecs.values())
-    ):
-        # Get the variables
-        ax = None
+    for i, pspecs in enumerate(plotspecs):
+        ax = None  # restart the axes
         ndims = set()
-        contours = ('gray8', 'gray3')  # contour colors
-        for k, ((rnames, rsource, *rkws), (cnames, csource, *ckws)) in enumerate(
-            itertools.zip_longest(rspecs, cspecs)
-        ):
+        subplotspec = gridspec[i]
+        for j, pspec in enumerate(pspecs):
             # Get the data arrays
-            # NOTE: Assumption for now is that 'feedback' variables (i.e. the thing
-            # we are trying to predict) are on rows and 'climate' variables on
-            # columns. Use this fact when naming correlations and getting composites.
-            datas = []
-            source = sorted(set(rsource) & set(csource))
-            kw_red = {**REDUCE_DEFAULTS, **rkws[0], **ckws[0]}
-            kw_fmt = {**rkws[1], **ckws[1]}
-            kw_plt = {**rkws[2], **ckws[2]}
-            kw_bar = {**rkws[3], **ckws[3]}
-            kw_leg = {**rkws[4], **ckws[4]}
-            m1 = m2 = kw_plt.pop('method', None)  # input method
-            for names in (rnames, cnames):
-                if not names:
+            # NOTE: See `_parse_specs` for more information.
+            datas, infos = [], {}
+            method, operator, rname, cname, kwargs = pspec
+            for name in (rname, cname):
+                if not name:
                     continue
                 with xr.set_options(keep_attrs=True):  # e.g. pl+lr+hus
-                    data = sum(dataset.climo.get(n, quantify=False) for n in names)
-                idxs = [
-                    idx for idx in data.indexes.values()
-                    if isinstance(idx, pd.MultiIndex)
-                ]
-                reduce = {
-                    key: value for key, value in kw_red.items()
-                    if key in data.sizes or any(key in idx.names for idx in idxs)
-                }
-                if reduce:
-                    data = data.climo.reduce(**reduce)
-                data.name = '+'.join(names)
-                mask = (~data.isnull()).any(data.sizes.keys() - {'source'})
-                print(f'Variable: {data.name!r}.')
-                print('Available models:', *data.model[mask].values.flat)
-                print('Missing models:', *data.model[~mask].values.flat)
-                datas.append(data.sel(source=source))
+                    data = sum(dataset[n] for n in name.split('+'))
+                if not operator:
+                    data = _safe_reduce(data, **kwargs.reduce)
+                else:
+                    kw1, kw2 = {}, {}
+                    for dim, sel in kwargs.reduce.items():
+                        if isinstance(sel, tuple) and len(sel) == 2:
+                            kw1[dim], kw2[dim] = sel
+                        else:
+                            kw1[dim] = kw2[dim] = sel
+                    data2 = _safe_reduce(data, **kw2)
+                    data1 = _safe_reduce(data, **kw1)
+                    data = getattr(data2, f'__{operator}__')(data1)  # e.g. subtract
+                data.name = name
+                datas.append(data)
+                mask = (~data.isnull()).any(data.sizes.keys() - {'facets'})
+                min_, max_, mean = data.min().item(), data.mean().item(), data.max().item()  # noqa: E501
+                infos[data.name] = (mask, min_, max_, mean)
             if not datas:
                 continue
 
             # Reduce along the source dimension
             # TODO: Add other possible reduction methods, e.g. covariance
             # or average addition or subtraction of variables.
+            for name, (mask, min_, max_, mean) in infos.items():
+                print(f'Variable {data.name!r} range: ', end=' ')
+                print(f'min {min_:.02f} max {max_:.02f} mean {mean:.02f}')
+                print(f'Variable {data.name!r} facets:', end=' ')
+                print(f'{np.sum(mask).item()} valid {np.sum(~mask).item()} invalid')
+            if len(infos) == 2:
+                name = '-'.join(infos.keys())
+                mask = np.logical_and(*(mask for mask, *_ in infos.values()))
+                print(f'Joined {data.name!r} facets:', end=' ')
+                print(f'{np.sum(mask).item()} valid {np.sum(~mask).item()} invalid')
             if len(datas) == 1:
-                method = m1 or method1
                 if datas[0].ndim == 1:  # 1D histogram with scatter points
                     data = (datas,)
                 elif method == 'avg':
-                    data = datas[0].mean('source', skipna=True, keep_attrs=True)
+                    data = datas[0].mean('facets', skipna=True, keep_attrs=True)
                     data.name = datas[0].name
                     data.attrs['long_name'] = f'{data.long_name} multi-model mean'
                 elif method == 'std':
@@ -379,135 +610,133 @@ def plot_bulk(
                 else:
                     raise ValueError(f'Invalid single-variable method {method}.')
             else:
-                method = m2 or method2
                 if datas[0].ndim == 1:  # 2D histogram with scatter points
                     data = (datas[0], datas[1])
                 elif method == 'corr':  # correlation coefficient
                     da0, da1 = xr.broadcast(*datas)
-                    _, data = climo.corr(*datas, dim='source')  # updates units
+                    _, data = climo.corr(*datas, dim='facets')  # updates units
                     data = data.isel(lag=0)
                     long_name = f'{datas[0].long_name}-{datas[1].long_name} correlation'
-                    data.name = 'corr'
+                    data.name = f'{datas[0].name}-{datas[1].name}'
                     data.attrs['long_name'] = long_name
                 elif method == 'diff':  # composite difference (feedbacks on rows)
                     lo_comp = np.nanpercentile(datas[0], pctile)
                     hi_comp = np.nanpercentile(datas[0], 100 - pctile)
                     lo_mask, = np.where(datas[0] <= lo_comp)
                     hi_mask, = np.where(datas[0] >= hi_comp)
-                    hi_data = datas[1].isel(source=hi_mask).mean('source', keep_attrs=True)  # noqa: E501
-                    lo_data = datas[1].isel(source=lo_mask).mean('source', keep_attrs=True)  # noqa: E501
+                    hi_data = datas[1].isel(facets=hi_mask).mean('facets', keep_attrs=True)  # noqa: E501
+                    lo_data = datas[1].isel(facets=lo_mask).mean('facets', keep_attrs=True)  # noqa: E501
                     with xr.set_options(keep_attrs=True):  # keep units
                         data = hi_data - lo_data
                     long_name = f'{datas[0].long_name}-composite {datas[1].long_name} difference'  # noqa: E501
-                    data.name = datas[1].name
+                    data.name = f'{datas[0].name}-{datas[1].name}'
                     data.attrs['long_name'] = long_name
                 else:
                     raise ValueError(f'Invalid double-variable method {method}')
 
-            # Queue the command
-            # TODO: Should support only adding axes if the x or y units of the
-            # data arrays do not match previous units... consider e.g. using
-            # built-in matplotlib-pint unit conversions.
-            dims = data.sizes.keys() - {'source'}
+            # Queue the command and store auto-generated filename info
+            # TODO: Should support only adding axes if x or y units do not match
+            # previous units... consider e.g. using matplotlib-pint unit conversions.
+            # NOTE: For e.g. correlation between Planck, lapse rate, water vapor
+            # feedbacks and surface temperature name will be 'corr_pl+lr+wv-ts_cmip5'
+            dims = data.sizes.keys() - {'facets'}
+            ndims.add(ndim := len(data.sizes.keys() - {'facets'}))
             projection = proj if dims == {'lon', 'lat'} else 'cartesian'
             if ax is None:
-                ax = iax = fig.add_subplot(gs[i, j], projection=projection)
-            elif hasattr(ax, 'alty') != (projection == 'cartesian'):
+                ax = jax = fig.add_subplot(subplotspec, projection=projection)
+            if hasattr(ax, 'alty') != (projection == 'cartesian'):
                 raise ValueError(f'Conflicting projection types for dimensions {dims}.')
-            ndims.add(ndim := len(data.sizes.keys() - {'source'}))
             if len(ndims) > 1:
                 raise ValueError(f'Conflicting plot types for sizes {ndims}.')
             if ndim == 0:
-                cmd = 'hist2d' if len(datas) == 2 else 'hist'
+                command = 'hist2d' if len(datas) == 2 else 'hist'
             elif ndim == 1:
-                cmd, iax = 'line', ax if k == 0 else ax.alty()
+                command, jax = 'line', ax if j == 0 else ax.alty()
             elif ndim == 2:
-                cmd = ('pcolormesh', 'contour')[min(k, 1)]
-            if cmd == 'contours':
-                kw_plt.setdefault('color', contours[k - 1])
-            key = (data.name, method, cmd)
+                command = ('pcolormesh', 'contour')[min(j, 1)]
+            if command == 'contours':
+                kwargs.plot.setdefault('color', contours[j - 1])
             args = data if isinstance(data, tuple) else (data,)
-            cmds = commands.setdefault(key, None)
-            cmds.append((iax, args, kw_plt, kw_bar, kw_leg))
-            min_, max_, mean = data.min().item(), data.mean().item(), data.max().item()
-            print(f'{method.title()} range:', end=' ')
-            print(f'min {min_:.02f} max {max_:.02f} mean {mean:.02f}')
-            iax.format(**kw_fmt)
+            name = '-'.join(da.name for da in args)
+            values = commands.setdefault((name, method, command), [])
+            values.append((jax, args, kwargs))
+            if projection == 'cartesian':
+                ignore = ('lon', 'lat', 'coast')
+            else:
+                ignore = ('x', 'y')
+            jax.format(**{
+                key: value for key, value in kwargs.format.items()
+                if not any(key.startswith(string) for string in ignore)
+            })
 
     # Carry out the plotting commands
     # NOTE: Axes are always added top-to-bottom and left-to-right so leverage
     # this fact below when selecting axes for legends and colorbars.
-    for (name, method, cmd), parts in commands.items():
+    print(nrows, ncols, fig.subplotgrid)
+    for (name, method, command), values in commands.items():
         # Call plotting commands
-        axs = tuple(part[0] for part in parts)
-        kws_plt, kws_bar, kws_leg = zip(*parts[2:])
-        kw_plt = {key: val for part in parts for key, val in part[3].items()}
-        kw_bar = {key: val for part in parts for key, val in part[3].items()}
-        kw_leg = {key: val for part in parts for key, val in part[4].items()}
-        if cmd in ('pcolormesh', 'contour', 'hist2d'):
+        print(f'Creating plot(s): {name} {method} {command}')
+        axs, args, kw_bar, kw_leg, kw_plt = [], [], {}, {}, {}
+        for ax, arg, kwargs in values:
+            axs.append(ax)
+            args.append(arg)
+            kw_bar.update(kwargs.colorbar)
+            kw_leg.update(kwargs.legend)
+            kw_plt.update(kwargs.plot)
+        if command in ('pcolor', 'pcolormesh', 'contour', 'contourf', 'hist2d'):
             guide = 'colorbar'
-            hori, vert, default, kw_guide = hcolorbar, vcolorbar, dcolorbar, kw_bar
-            args = [arg for _, args, *_ in parts for arg in args]
-            x, y = (args[0].coords[dim] for dim in args[0].dims)  # restrict limits
-            norm, *_ = axs[0]._parse_level_vals(x, y, *args, **kw_plt)
-#         else:
-#  kwargs = commands[0][2].copy()  # identical for all experiments
-#  if all(arg.shape == args[0].shape for arg in args):
-#      x, y = (args[0].coords[dim] for dim in args[0].dims)
-#  else:
-#      x = y = None  # not restricted to in-bounds
-#  if hasattr(ax, '_parse_level_lim'):
-#      vmin, vmax, _ = ax._parse_level_lim(x, y, *args)
-#  else:
-#      vmin, vmax, _ = ax._parse_vlim(x, y, *args)
-#         else:
-#             guide = 'legend'
-#             hori, vert, default, kw_guide = hlegend, vlegend, dlegend, kw_leg
-#         for ax in axs:
+            hori, vert, default, kw_obj = hcolorbar, vcolorbar, dcolorbar, kw_bar
+            kw_obj['label'] = args[0][-1].climo.units_label
+        else:
+            guide = 'legend'
+            hori, vert, default, kw_obj = hlegend, vlegend, dlegend, kw_leg
+            kw_plt['label'] = args[0][-1].climo.units_label
+        if guide == 'colorbar':
+            kw_plt['levels'], *_, = axs[0]._parse_level_vals(
+                *(args[0][-1].coords[dim] for dim in args[0][-1].dims),
+                *(a for arg in args for a in arg),
+                norm_kw={},
+                **kw_plt
+            )
+        for key in ('robust', 'vmin', 'vmax', 'values', 'N'):
+            kw_plt.pop(key, None)
+        for ax, arg in zip(axs, args):
+            obj = getattr(ax, command)(*arg, **kw_plt)  # plot and return guide object
 
         # Generate colorbars and legends
-        rows = set(ax._range_subplotspec('x') for ax in axs)
+        rows = set(ax._range_subplotspec('y') for ax in axs)
         rows = rows.pop() if len(rows) == 1 else None
-        cols = set(ax._range_subplotspec('y') for ax in axs)
+        cols = set(ax._range_subplotspec('x') for ax in axs)
         cols = cols.pop() if len(cols) == 1 else None
-        if not (rows is None) ^ (cols is None):
-            obj = fig
+        if not (rows is None) ^ (cols is None):  # not single column or single row
+            src = fig
             loc = default
-        elif rows is None:  # single column
-            if loc[0] in 'tb':
-                obj = axs[0] if loc[0] == 't' else axs[-1]
+        elif cols is not None:  # single column
+            if vert[0] in 'tb':
+                src = axs[0] if vert[0] == 't' else axs[-1]
             else:
-                obj = axs[len(axs) // 2]  # TODO: support even-numbered axes
+                src = axs[len(axs) // 2]  # TODO: support even-numbered axes
             loc = vert
-        else:
-            if loc[0] in 'lr':
-                obj = axs[0] if loc[0] == 'l' else axs[-1]
+        else:  # single row
+            if hori[0] in 'lr':
+                src = axs[0] if hori[0] == 'l' else axs[-1]
             else:
-                obj = axs[len(axs) // 2]  # TODO: support even-numbered axes
+                src = axs[len(axs) // 2]  # TODO: support even-numbered axes
             loc = hori
-        getattr(obj, guide)(h, queue=True, **kw_guide)
+        getattr(src, guide)(obj, loc=loc, queue=True, **kw_obj)
 
     # Format the axes and optionally save
-    kwargs.setdefault('xscale', 'sine')
-    kwargs.update(
+    fig.format(
         suptitle=title,
-        rowlabels=tuple(rowspecs),
-        collabels=tuple(colspecs),
+        rowlabels=rowlabels or None,
+        collabels=collabels or None,
     )
-    fig.format(**kwargs)
+    if save:
+        path = Path(__file__).parent.parent / 'figures'
+        path = path / ('_'.join(filespecs) + '.pdf')
+        print(f'Saving {path.parent}/{path.name}...')
+        fig.save(path)
     return fig, fig.subplotgrid
-    # if save:
-    #     autoname = lambda *s: '_'.join('-'.join(sorted(set(_))).strip('-') for _ in s) + '.pdf'  # noqa: E501
-    #     base = Path(__file__).parent.parent / 'figures'
-    #     proj = (part for arg in args for part in re.findall(r'\w*', arg['project']) if 'project' in arg)  # noqa: E501
-    #     src = (arg['src'] for arg in args if 'src' in arg)
-    #     term = (arg['term'] for arg in args if 'term' in arg)
-    #     var = (arg['var'] for arg in args if 'var' in arg)
-    #     parts = [(mode,), proj, src, term, var]
-    #     parts.extend(((dims,),) if dims else ())
-    #     filename = autoname(*parts)
-    #     print(f'Saving figure {filename!r}...')
-    #     fig.save(base / filename)
 
 
 def plot_drift(
@@ -574,12 +803,12 @@ def plot_drift(
                 if not file.is_file():
                     print(f'Missing file(s) for model {model!r}.')
                     continue
-                data = output.open_file(file, validate=False)
+                data = open_file(file, validate=False)
                 if variable not in data:
                     print(f'Missing {variable} for model {model!r}.')
                     continue
-                data = output._adjust_moisture_terms(data)
-                data = output._adjust_standard_units(data)
+                data = _update_climate_moisture(data)
+                data = _update_climate_units(data)
                 data = data[variable]
                 isel = {dim: 0 for dim, size in data.sizes.items() if size == 1}
                 drop = tuple(key for key, coord in data.coords.items() if coord.size == 1)  # noqa: E501

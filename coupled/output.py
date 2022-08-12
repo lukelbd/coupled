@@ -35,13 +35,50 @@ __all__ = [
 FACETS_CONCAT = (
     'project',
     'model',
-    'ensemble'
     'experiment',
+    'ensemble',
 )
 FACETS_RENAME = {
     'piControl': 'control',
     'abrupt4xCO2': 'response',
     'abrupt-4xCO2': 'response',
+}
+
+# Climate constants
+# NOTE: This shows all ice terms in snow-water equivalent. Also some of this is
+# written down simply to inform the translation from standard unit strings to
+# short names used in the figures script (pending adding cf variables).
+CLIMATE_UNITS = {
+    'ta': 'K',
+    'ts': 'K',
+    'hus': 'g kg^-1',
+    'huss': 'g kg^-1',
+    'hfls': 'W m^-2',
+    'hfss': 'W m^-2',
+    'prw': ('mm', const.rhow),  # water vapor path not precip
+    'pr': ('mm day^-1', const.rhow),  # divide by second constant
+    'prra': ('mm day^-1', const.rhow),
+    'prsn': ('mm day^-1', const.rhow),
+    'sbl': ('mm day^-1', const.rhow),
+    'evsp': ('mm day^-1', const.rhow),
+    'evspsbl': ('mm day^-1', const.rhow),
+    'clivi': ('mm', const.rhow),
+    'clwvi': ('mm', const.rhow),
+    'cllvi': ('mm', const.rhow),
+    'clw': 'g kg^-1',
+    'cli': 'g kg^-1',
+    'cll': 'g kg^-1',
+    'ua': 'm s^-1',
+    'va': 'm s^-1',
+    'uas': 'm s^-1',
+    'vas': 'm s^-1',
+    'tauu': 'Pa',
+    'tauv': 'Pa',
+    'plev_bot': 'hPa',
+    'plev_top': 'hPa',
+    'psl': 'hPa',
+    'ps': 'hPa',
+    'zg': 'dam',
 }
 
 # Feedback definitions
@@ -59,6 +96,8 @@ FEEDBACK_DEFINITIONS = {
     'erf2x': ('rfnt_erf', 'W m^-2'),  # zelinka definition
     'erf4x': ('rfnt_erf', 'W m^-2'),  # for consistency only
     'net': ('rfnt_lam', 'W m^-2 K^-1'),
+    'lw': ('rlnt_lam', 'W m^-2 K^-1'),
+    'sw': ('rsnt_lam', 'W m^-2 K^-1'),
     'rho': ('tcr_lam', 'W m^-2 K^-1'),  # forster definition
     'kap': ('ohc_lam', 'W m^-2 K^-1'),  # forster definition
     'cs': ('rfntcs_lam', 'W m^-2 K^-1'),
@@ -81,25 +120,28 @@ FEEDBACK_DEFINITIONS = {
     'err': ('resid_rfnt_lam', 'W m^-2 K^-1'),  # forster definition
 }
 
-# Component variables for derivations and dataset loading
+# Transport constants
+# NOTE: The regular expression prefixes exponents expressed by numbers adjacent to
+# units with the carat mark ^, but ignores the scientific notation 1.e6 in scaling
+# factors, so that dry static energy convergence units can be parsed as quantities.
 # NOTE: See Donohoe et al. (2020) for details on transport terms. Precipitation appears
 # in the dry static energy formula because unlike surface evaporation, it deposits heat
 # inside the atmosphere, i.e. it remains after subtracting surface and TOA loss terms.
-REGEX_EXPONENTS = re.compile(  # ignore exponential scale factors
+TRANSPORT_REGEX = re.compile(
     r'([a-df-zA-DF-Z]+)([-+]?[0-9]+)'
 )
-COMPONENTS_EXPLICIT = {
+TRANSPORT_EXPLICIT = {
     'dry static': (1, ('intuadse', 'intvadse')),
     'latent static': (const.Lv, ('intuaw', 'intvaw')),
 }
-COMPONENTS_TRANSPORT = {
+TRANSPORT_IMPLICIT = {
     'dry static': (('hfss', 'rlns', 'rsns', 'rlnt', 'rsnt', 'pr', 'prsn'), ()),
     'latent static': (('hfls',), ('pr', 'prsn')),
     'moist static': (('hfss', 'hfls', 'rlns', 'rsns', 'rlnt', 'rsnt'), ()),
     'ocean': ((), ('hfss', 'hfls', 'rlns', 'rsns')),  # flux into atmosphere
     'total': (('rlnt', 'rsnt'), ()),
 }
-COMPONENTS_RADIATION = {
+TRANSPORT_RADIATION = {
     'rlnt': ('rlut',),  # out of the atmosphere
     'rsnt': ('rsut', 'rsdt'),  # out of the atmosphere (include constant rsdt)
     'rlntcs': ('rlutcs',),  # out of the atmosphere
@@ -110,38 +152,13 @@ COMPONENTS_RADIATION = {
     'rsnscs': ('rsdscs', 'rsuscs'),  # out of and into the atmosphere
     'albedo': ('rsds', 'rsus'),  # full name to differentiate from 'alb' feedback
 }
-
-# Unit conversions for use in transport derivations and standardization for plots
-# NOTE: For now use the standard 1e3 kg/m3 water density (i.e. snow and ice terms
-# represent melted equivalent depth) but could also use 1e2 kg/m3 snow density where
-# relevant. See: https://www.sciencelearn.org.nz/resources/1391-snow-and-ice-density
-CONVERSIONS_TRANSPORT = {
+TRANSPORT_SCALINGS = {
     'pr': const.Lv,
     'prra': const.Lv,
     'prsn': const.Ls - const.Lv,  # remove the 'prsn * Lv' implied inside 'pr' term
     'evspsbl': const.Lv,
     'evsp': const.Lv,
     'sbl': const.Ls - const.Lv,  # remove the 'evspsbl * Lv' implied inside 'pr' term
-}
-CONVERSIONS_STANDARD = {
-    'clw': (1, 'g kg^-1'),
-    'cli': (1, 'g kg^-1'),
-    'cll': (1, 'g kg^-1'),
-    'hus': (1, 'g kg^-1'),
-    'huss': (1, 'g kg^-1'),
-    'psl': (1, 'hPa'),
-    'ps': (1, 'hPa'),
-    'zg': (1, 'dam'),
-    'clivi': (1 / const.rhow, 'mm'),
-    'clwvi': (1 / const.rhow, 'mm'),
-    'cllvi': (1 / const.rhow, 'mm'),
-    'prw': (1 / const.rhow, 'mm'),  # water vapor path
-    'pr': (1 / const.rhow, 'mm day^-1'),
-    'prra': (1 / const.rhow, 'mm day^-1'),
-    'prsn': (1 / const.rhow, 'mm day^-1'),
-    'evspsbl': (1 / const.rhow, 'mm day^-1'),
-    'evsp': (1 / const.rhow, 'mm day^-1'),
-    'sbl': (1 / const.rhow, 'mm day^-1'),
 }
 
 
@@ -210,10 +227,10 @@ def _update_climate_moisture(dataset):
         else:
             with xr.set_options(keep_attrs=True):
                 dataset['clw'] = dataset['cli'] + dataset['clw']
-    for (ice, both, liquid, ratio, descrip) in (
+    for ice, both, liquid, ratio, descrip in (
         ('cli', 'clw', 'cll', 'clp', 'mass fraction cloud %s'),
         ('clivi', 'clwvi', 'cllvi', 'clpvi', 'condensed %s water path'),
-        ('prsn', 'pr', 'prrn', 'prp', '%s precipitation'),
+        ('prsn', 'pr', 'prra', 'prp', '%s precipitation'),
         ('sbl', 'evspsbl', 'evsp', 'sblp', '%s evaporation'),
     ):
         if ice in dataset and both in dataset:  # note the clw variables include ice
@@ -241,7 +258,7 @@ def _update_climate_radiation(dataset):
     # NOTE: Here also add 'albedo' term and generate long name by replacing directional
     # terms in existing long name. Remove the directional components when finished.
     regex = re.compile(r'(upwelling|downwelling|outgoing|incident)')
-    for name, keys in COMPONENTS_RADIATION.items():
+    for name, keys in TRANSPORT_RADIATION.items():
         if all(key in dataset for key in keys):  # skip partial data
             if name == 'albedo':
                 dataset[name] = 100 * dataset[keys[1]] / dataset[keys[0]]
@@ -260,7 +277,7 @@ def _update_climate_radiation(dataset):
             dataset[name].attrs.update({'units': unit, 'long_name': long_name})
 
     dataset = dataset.drop_vars(
-        key for keys in COMPONENTS_RADIATION.values()
+        key for keys in TRANSPORT_RADIATION.values()
         for key in keys if key in dataset
     )
     return dataset
@@ -290,12 +307,12 @@ def _update_climate_transport(dataset):
     # equivalent to adding the latent heat of fusion required to melt snow before a
     # liquid-vapor transition, an additional correction is not needed here.
     alts = ('', '_alt')
-    for (descrip, parts), alt in itertools.product(COMPONENTS_TRANSPORT.items(), alts):
+    for (descrip, parts), alt in itertools.product(TRANSPORT_IMPLICIT.items(), alts):
         # Get component data
         constants = {}
         for i, keys in zip((1, -1), parts):
             keys = list(keys)
-            source = CONVERSIONS_TRANSPORT.copy()
+            source = TRANSPORT_SCALINGS.copy()
             if alt and 'hfls' in keys:
                 idx = keys.index('hfls')
                 keys[idx:idx + 1] = ('evspsbl', 'sbl')
@@ -311,8 +328,10 @@ def _update_climate_transport(dataset):
             data = -1 * resid.climo.to_units('W m^-2')  # negative of residual
             data.attrs['long_name'] = f'{prefix}{descrip} energy transport convergence'
             dataset[name] = data.climo.dequantify()
-            data = data.climo.add_cell_measures().climo.integral('lon')
-            data = data.climo.cumintegral('lat', reverse=True).climo.to_units('PW')
+            # data = data.climo.add_cell_measures().climo.integral('lon')
+            # data = data.climo.cumintegral('lat', reverse=True).climo.to_units('PW')
+            data = data.climo.add_cell_measures().climo.average('lon')
+            data = data.climo.cumintegral('area', reverse=True).climo.to_units('PW')
             data = data.drop_vars(data.coords.keys() - data.sizes.keys())
             data.attrs['long_name'] = f'{prefix}{descrip} energy transport'
             dataset[name[1:]] = data.climo.dequantify()
@@ -322,12 +341,12 @@ def _update_climate_transport(dataset):
 
         # Get explicit convergence and transport terms
         name = f'{name}_exp'
-        pair = COMPONENTS_EXPLICIT.get(descrip, None)
+        pair = TRANSPORT_EXPLICIT.get(descrip, None)
         if pair and all(key in dataset for key in pair[1]):
             scale, (ukey, vkey) = pair
             utrans, vtrans = dataset[ukey], dataset[vkey]
-            utrans *= ureg(REGEX_EXPONENTS.sub(r'\1^\2', utrans.attrs.pop('units')))
-            vtrans *= ureg(REGEX_EXPONENTS.sub(r'\1^\2', vtrans.attrs.pop('units')))
+            utrans *= ureg(TRANSPORT_REGEX.sub(r'\1^\2', utrans.attrs.pop('units')))
+            vtrans *= ureg(TRANSPORT_REGEX.sub(r'\1^\2', vtrans.attrs.pop('units')))
             lon, lat = dataset.climo.coords['lon'], dataset.climo.coords['lat']
             x = (const.a * lon).climo.to_units('m')
             y = (const.a * lat).climo.to_units('m')
@@ -357,7 +376,7 @@ def _update_climate_transport(dataset):
             data.attrs['long_name'] = dataset[lse].long_name.replace('latent', 'moist')
             dataset[name] = data
 
-    drop = set(key for _, parts in COMPONENTS_EXPLICIT.values() for key in parts)
+    drop = set(key for _, parts in TRANSPORT_EXPLICIT.values() for key in parts)
     dataset = dataset.drop_vars(drop & dataset.data_vars.keys())
     return dataset
 
@@ -373,13 +392,19 @@ def _update_climate_units(dataset):
     """
     # NOTE: For converting snow precipitation we assume a simple 10:1 snow:liquid
     # ratio. See: https://www.sciencelearn.org.nz/resources/1391-snow-and-ice-density
-    for variable, (constant, unit) in CONVERSIONS_STANDARD.items():
+    for variable, options in CLIMATE_UNITS.items():
         if variable not in dataset:
             continue
+        if isinstance(options, str):
+            unit, scale = options, 1.0
+        else:
+            unit, scale = options
         data = dataset[variable]
+        if ureg.parse_units(unit) == data.climo.units:
+            continue
         if quantify := not data.climo._is_quantity:
             with xr.set_options(keep_attrs=True):
-                data = constant * data.climo.quantify()
+                data = data.climo.quantify() / scale
         data = data.climo.to_units(unit)
         if quantify:
             with xr.set_options(keep_attrs=True):
@@ -424,7 +449,7 @@ def _update_feedback_info(
         for suffix, outdated, param in zip(
             ('lam', 'erf', 'ecs'),
             ('lambda', 'erf2x', 'ecs2x'),
-            ('feedback parameter', 'effective forcing', '')
+            ('feedback', 'forcing', '')   # keep short for figure labels
         ):
             if component in ('', 'cs'):
                 prefix = f'{rad}{component}'
@@ -484,7 +509,7 @@ def _update_feedback_parts(
     dataset : xarray.Dataset
         The dataset.
     boundary : {'t', 's', 'a'}, optional
-        The boundari(es) to load. Pass a tuple or string of a combination for multiple.
+        The boundari(es) to load. Pass a tuple or longer string for more than one.
     erfparts : bool, optional
         Whether to include the kernel-derived effective forcing components.
     ecsparts : bool, optional
@@ -608,7 +633,7 @@ def open_climate(
         else:
             range_ = (0, 150)
         dates = f'{range_[0]:04d}-{range_[1]:04d}-climate{nodrift}'
-        print(f'{group[1]}_{group[3]}_{range_[0]:04d}-{range_[1]:04d}', end=' ')
+        print(f'{group[1]}_{group[2]}_{range_[0]:04d}-{range_[1]:04d}', end=' ')
 
         # Load the data
         # NOTE: Here open_file automatically populates the mapping MODELS_INSTITUTIONS
@@ -620,22 +645,20 @@ def open_climate(
             variable = key[database.key.index('variable')]
             paths = [path for path in paths if _item_dates(path) == dates]
             if len(paths) != 1:
-                print(f'Warning: Skipping ambiguous duplicate paths {list(map(str, paths))}.')  # noqa: E501
+                print(f'Warning: Skipping ambiguous duplicate paths {list(map(str, paths))}.', end=' ')  # noqa: E501
                 continue
             array = open_file(paths[0], variable, project=database.project)
             if array.time.size != 12:
-                print(f'Warning: Skipping path {paths[0]} with time length {array.time.size}.')  # noqa: E501
+                print(f'Warning: Skipping path {paths[0]} with time length {array.time.size}.', end=' ')  # noqa: E501
                 continue
             months = array.time.dt.month
             if sorted(months.values) != sorted(range(1, 13)):
-                print(f'Warning: Skipping path {paths[0]} with month values {months.values}.')  # noqa: E501
+                print(f'Warning: Skipping path {paths[0]} with month values {months.values}.', end=' ')  # noqa: E501
                 continue
             array = array.assign_coords(time=time)
             descrip = array.attrs.pop('title', variable)  # in case long_name missing
             descrip = array.attrs.pop('long_name', descrip)
             descrip = ' '.join(s if s == 'TOA' else s.lower() for s in descrip.split())
-            if array.climo.standard_units:
-                array = array.climo.to_standard_units()
             array.attrs['long_name'] = descrip
             dataset[variable] = array
 
@@ -643,9 +666,9 @@ def open_climate(
         # NOTE: Critical to put average_periods here to avoid repeated overhead.
         dataset = _update_climate_humidity(dataset)
         dataset = _update_climate_moisture(dataset)
-        dataset = _update_climate_radiation(dataset)
+        dataset = _update_climate_radiation(dataset)  # must come before transport
         dataset = _update_climate_transport(dataset)
-        dataset = _update_climate_units(dataset)
+        dataset = _update_climate_units(dataset)  # must come after transport
         if 'plev' in dataset:  # remove unneeded stratosphere levels
             dataset = dataset.sel(plev=slice(None, 7000))
         dataset = average_periods(dataset, **kw_times)
@@ -697,25 +720,24 @@ def open_feedbacks(
         names = ('source', 'statistic', 'region')
         for sub, replace in FACETS_RENAME.items():
             group = tuple(s.replace(sub, replace) for s in group)
-        files = tuple(
-            file for files in data.values() for file in files
-            if bool(nodrift) == bool('nodrift' in file.name)
+        paths = tuple(
+            path for paths in data.values() for path in paths
+            if bool(nodrift) == bool('nodrift' in path.name)
         )
-        if not files:
+        if not paths:
             continue
 
         # Load the data
         # NOTE: This accounts for files with dedicated regions indicated in the name,
         # files with numerator and denominator multi-index coordinates, and files with
         # just a denominator region coordinate. Note open_file builds the multi-index.
-        print(f'{group[1]}_{group[3]}', end=' ')
-        for file in files:
-            *_, indicator, suffix = file.stem.split('_')
+        print(f'{group[1]}_{group[2]}', end=' ')
+        for path in paths:
+            *_, indicator, suffix = path.stem.split('_')
             source, statistic, *_ = suffix.split('-')
             if sources and source not in sources:
                 continue
-            dataset = open_file(file, project=database.project, validate=False)
-            outdated = 'local' in indicator or 'global' in indicator
+            dataset = open_file(path, project=database.project, validate=False)
             if outdated := 'local' in indicator or 'global' in indicator:
                 if indicator.split('-')[0] != 'local':
                     continue
@@ -752,8 +774,8 @@ def open_feedbacks(
             parts[key] = dataset
         index = xr.DataArray(
             pd.MultiIndex.from_tuples(parts, names=names),
-            dims='feedback',
-            name='feedback',
+            dims='version',
+            name='version',
             attrs={'long_name': 'feedback version information'},
         )
         dataset = xr.concat(
@@ -795,8 +817,8 @@ def open_feedbacks_json(path='~/data/cmip-tables', **constraints):
         index = (source, 'regression', 'globe')
         index = xr.DataArray(
             pd.MultiIndex.from_tuples([index], names=names),
-            dims='feedback',
-            name='feedback',
+            dims='version',
+            name='version',
             attrs={'long_name': 'feedback version'},
         )
         with open(file, 'r') as f:
@@ -811,20 +833,20 @@ def open_feedbacks_json(path='~/data/cmip-tables', **constraints):
                 ensemble = 'flagship' if ensemble == ens_flagship else ensemble
                 if ensemble not in constraints.get('ensemble', (ensemble,)):
                     continue
-                group = (project, model, ensemble, 'response')
+                group = (project, model, 'response', ensemble)
                 dataset = xr.Dataset()
                 for key, value in data.items():
                     name, units = FEEDBACK_DEFINITIONS[key.lower()]
                     if units == 'K':
-                        long_name = 'effective climate sensitivity'
+                        long_name = 'climate sensitivity'
                     elif units == 'W m^-2':
-                        long_name = 'effective forcing'
+                        long_name = 'forcing'  # keep short for figure labels
                     else:
-                        long_name = 'feedback parameter'
+                        long_name = 'feedback'  # keep short for figure labels
                     attrs = {'units': units, 'long_name': long_name}
                     dataset[name] = xr.DataArray(value, attrs=attrs)
-                dataset = dataset.expand_dims(feedback=1)
-                dataset = dataset.assign_coords(feedback=index)
+                dataset = dataset.expand_dims(version=1)
+                dataset = dataset.assign_coords(version=index)
                 if group in datasets:
                     datasets[group].update(dataset)
                 else:
@@ -858,8 +880,8 @@ def open_feedbacks_text(path='~/data/cmip-tables', **constraints):
         index = (source, 'regression', 'globe')
         index = xr.DataArray(
             pd.MultiIndex.from_tuples([index], names=names),
-            dims='feedback',
-            name='feedback',
+            dims='version',
+            name='version',
             attrs={'long_name': 'feedback version'},
         )
         table = pd.read_table(
@@ -872,22 +894,22 @@ def open_feedbacks_text(path='~/data/cmip-tables', **constraints):
         )
         table.index.name = 'model'
         dataset = table.to_xarray()
-        dataset = dataset.expand_dims(feedback=1)
-        dataset = dataset.assign_coords(feedback=index)
+        dataset = dataset.expand_dims(version=1)
+        dataset = dataset.assign_coords(version=index)
         factor = 0.5 if any('4x' in key for key in dataset.data_vars) else 1.0
         for key, da in dataset.data_vars.items():
             name, units = FEEDBACK_DEFINITIONS[key.lower()]
             if units == 'K':
                 scale = factor
-                long_name = 'effective climate sensitivity'
+                long_name = 'climate sensitivity'
             elif units == 'W m^-2':
                 scale = factor
-                long_name = 'effective forcing'
+                long_name = 'forcing'  # keep short for figure labels
             else:
                 scale = 1.0
-                long_name = 'feedback parameter'
+                long_name = 'feedback'  # keep short for figure labels
             for model in dataset.model.values:
-                group = ('CMIP5', model, 'flagship', 'response')
+                group = ('CMIP5', model, 'response', 'flagship')
                 if model not in constraints.get('model', (model,)):
                     continue
                 if 'flagship' not in constraints.get('ensemble', ('flagship',)):
@@ -923,12 +945,12 @@ def open_bulk(
         The default path.
     project : sequence, optional
         The project(s) to use.
-    climate : bool, optional
-        Whether to load processed climate data.
-    feedbacks : bool, optional
-        Whether to load processed feedback files.
-    feedbacks_json, feedbacks_text : bool, optional
-        Whether to load external feedback files.
+    climate : bool or path-like, optional
+        Whether to load processed climate data. Default path is ``~/data``.
+    feedbacks : bool or path-like, optional
+        Whether to load processed feedback files. Default path is ``~/data``.
+    feedbacks_json, feedbacks_text : bool or path-like, optional
+        Whether to load external feedback files. Default path is ``~/data/cmip-tables``.
     **kwargs
         Passed to relevant functions.
     **constraints
@@ -945,7 +967,7 @@ def open_bulk(
     # ``area='avg'`` -- this is a no-op for the spatially uniform external feedbacks.
     # WARNING: Using dataset.update() instead of xr.combine_by_coords() below can
     # result in silently replacing existing data with NaNs (verified with test). The
-    # latter is required when adding new 'facets' and 'feedback' coordinate values.
+    # latter is required when adding new 'facets' and 'version' coordinate values.
     keys_both = ('nodrift', 'annual', 'seasonal', 'monthly')
     keys_climate = ('years',)
     keys_feedbacks = ('source', 'boundary')
@@ -956,20 +978,22 @@ def open_bulk(
     projects = project.split(',') if isinstance(project, str) else ('cmip5', 'cmip6')
     for project in map(str.upper, projects):
         print(f'Project: {project}')
-        path_climate = ''
-        # path_climate = '../scratch2/outdated-processed-nonlatest'
-        # path_feedbacks = '../scratch2/outdated-feedbacks-regional'
-        path_feedbacks = '../scratch2/outdated-feedbacks-numerator'
         for b, function, folder, kw in (
-            (climate, open_climate, path_climate, {**kw_climate, **kw_both}),
-            (feedbacks, open_feedbacks, path_feedbacks, {**kw_feedbacks, **kw_both}),
+            (climate, open_climate, '', {**kw_climate, **kw_both}),
+            (feedbacks, open_feedbacks, '', {**kw_feedbacks, **kw_both}),
             (feedbacks_json, open_feedbacks_json, 'cmip-tables', {}),
             (feedbacks_text, open_feedbacks_text, 'cmip-tables', {}),
         ):
             if not b:
                 continue
-            kw = {**kw, **constraints, 'project': project}
-            parts = function(Path(path).expanduser() / folder, **kw)
+            if isinstance(b, (tuple, list)):
+                paths = tuple(Path(_).expanduser() for _ in b)
+            elif isinstance(b, (str, Path)):
+                paths = (Path(b).expanduser(),)
+            else:
+                paths = (Path('~/data').expanduser() / folder,)
+            kwargs = {**constraints, 'project': project, **kw}
+            parts = function(*paths, **kwargs)
             for group, data in parts.items():
                 if group in datasets:
                     comb = (datasets[group], data)
@@ -984,14 +1008,14 @@ def open_bulk(
     if datasets:
         print('Model:', end=' ')
     for group, dataset in tuple(datasets.items()):  # interpolated datasets
-        print(f'{group[1]}_{group[3]}', end=' ')
+        print(f'{group[1]}_{group[2]}', end=' ')
         for name in names.keys() - dataset.data_vars.keys():
             da = names[name]  # *sample* from another model or project
             da = xr.full_like(da, np.nan)  # preserve attributes as well
-            if 'feedback' in da.sizes and 'feedback' in dataset:
-                da = da.isel(feedback=0, drop=True)
-                da = da.expand_dims(feedback=len(dataset.feedback))
-                da = da.assign_coords(feedback=dataset.feedback)
+            if 'version' in da.sizes and 'version' in dataset:
+                da = da.isel(version=0, drop=True)
+                da = da.expand_dims(version=len(dataset.version))
+                da = da.assign_coords(version=dataset.version)
             dataset[name] = da
     print()
     print('Concatenating datasets.')
@@ -1004,12 +1028,12 @@ def open_bulk(
     dataset = xr.concat(
         datasets.values(),
         dim=index,
-        compat='override',
         coords='minimal',
+        compat='override',
         combine_attrs='override',
     )
-    if 'feedback' in dataset.sizes:
-        dataset = dataset.transpose('feedback', ...)
-    dataset = dataset.climo.standardize_coords()
+    if 'version' in dataset.sizes:
+        dataset = dataset.transpose('version', ...)
+    dataset = dataset.climo.standardize_coords(prefix_levels=True)
     dataset = dataset.climo.add_cell_measures(verbose=False)
     return dataset

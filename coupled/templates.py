@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Utilities for plotting coupled model output.
+Templates for figures detailing coupled model output.
 """
 import collections
 import itertools
@@ -148,7 +148,7 @@ def _apply_reduce(dataset, attrs=None, **kwargs):
     data : xarray.DataArray
         The data array.
     """
-    # WARNING: Sometimes multi-index reductions can eliminate previously valid
+    # NOTE: Sometimes multi-index reductions can eliminate previously valid
     # coordinates, so iterate one-by-one and validate selections each time.
     # NOTE: This silently skips dummy selections (e.g. area=None) that may be
     # required to prevent _parse_bulk from merging variable specs that differ
@@ -239,6 +239,41 @@ def _apply_method(
                 short = UNITS_LABELS.get(units, long)
             array.attrs['short_name'] = short
 
+    # Helper functions for two-variable reduction methods
+    # NOTE: Currently masked arrays are used in climopy 'covar' and might also have
+    # overhead from metadata stripping stuff and permuting. So go manual here.
+    def _covar_parts(data0, data1, both=True, skipna=True):
+        data0, data1 = xr.broadcast(data0, data1)
+        data0 = data0.climo.quantify()
+        data1 = data1.climo.quantify()
+        with np.errstate(all='ignore'):
+            mean0 = data0.mean(dim='facets', skipna=skipna)
+            mean1 = data1.mean(dim='facets', skipna=skipna)
+            anom0 = data0 - mean0
+            anom1 = data1 - mean1
+            covar = (anom0 * anom1).sum(dim='facets', skipna=skipna)
+            std0 = (anom0 ** 2).sum(dim='facets', skipna=skipna)
+            std0 = np.sqrt(std0)
+            if both:
+                std1 = (anom1 ** 2).sum(dim='facets', skipna=skipna)
+                std1 = np.sqrt(std1)
+        return (covar, std0, std1) if both else (covar, std0)
+    def _mask_parts(data0, data1):  # noqa: E301
+        thresh = 33 if pctile is None else pctile
+        data0, data1 = xr.broadcast(data0, data1)
+        comp_lo = np.nanpercentile(data0, thresh)
+        comp_hi = np.nanpercentile(data0, 100 - thresh)
+        mask_lo, = np.where(data0 <= comp_lo)
+        mask_hi, = np.where(data0 >= comp_hi)
+        data_hi = data1.isel(facets=mask_hi)
+        data_lo = data1.isel(facets=mask_lo)
+        with np.errstate(all='ignore'):
+            data_hi = data_hi.mean('facets', keep_attrs=True)
+            data_lo = data_lo.mean('facets', keep_attrs=True)
+        data_hi = data_hi.climo.quantify()
+        data_lo = data_lo.climo.quantify()
+        return data_lo, data_hi
+
     # Combine one array along facets dimension
     # NOTE: Here `pctile` is shared between inter-model percentile differences and
     # composites of a second array based on values in the first array.
@@ -299,12 +334,8 @@ def _apply_method(
             data = (datas[0][mask], datas[1][mask])
             assert max(ndims) == 1
         elif method == 'rsq':  # correlation coefficient
-            datas = xr.broadcast(*datas)
-            _, cov = climo.covar(*datas, dim='facets')  # updates units
-            cov = cov.climo.quantify().isel(lag=0)
-            var0 = datas[0].climo.quantify().var(dim='facets')
-            var1 = datas[1].climo.quantify().var(dim='facets')
-            data = cov ** 2 / (var0 * var1)
+            cov, std0, std1 = _covar_parts(*datas, both=True)
+            data = (cov / (std0 * std1)) ** 2
             data = data.climo.to_units('percent').climo.dequantify()
             short_name = 'variance explained'
             long_name = f'{datas[0].long_name}-{datas[1].long_name} variance explained'
@@ -312,11 +343,7 @@ def _apply_method(
             data.attrs['short_name'] = short_name
             data.attrs['long_name'] = long_name
         elif method == 'corr':  # correlation coefficient
-            datas = xr.broadcast(*datas)
-            _, cov = climo.covar(*datas, dim='facets')  # updates units
-            cov = cov.climo.quantify().isel(lag=0)
-            std0 = datas[0].climo.quantify().std(dim='facets')
-            std1 = datas[1].climo.quantify().std(dim='facets')
+            cov, std0, std1 = _covar_parts(*datas, both=True)
             data = cov / (std0 * std1)
             data = data.climo.to_units('dimensionless').climo.dequantify()
             short_name = 'correlation coefficient'
@@ -324,27 +351,8 @@ def _apply_method(
             data.name = f'{datas[0].name}-{datas[1].name}'
             data.attrs['short_name'] = short_name
             data.attrs['long_name'] = long_name
-        elif method == 'diff':  # composite difference along first arrays
-            pctile = 33 if pctile is None else pctile
-            datas = xr.broadcast(*datas)
-            lo_comp = np.nanpercentile(datas[0], pctile)
-            hi_comp = np.nanpercentile(datas[0], 100 - pctile)
-            lo_mask, = np.where(datas[0] <= lo_comp)
-            hi_mask, = np.where(datas[0] >= hi_comp)
-            hi_data = datas[1].isel(facets=hi_mask).mean('facets')
-            lo_data = datas[1].isel(facets=lo_mask).mean('facets')
-            data = hi_data.climo.quantify() - lo_data.climo.quantify()
-            data = data.climo.dequantify()
-            short_name = f'{datas[1].short_name} difference'
-            long_name = f'{datas[0].long_name}-composite {datas[1].long_name} difference'  # noqa: E501
-            data.name = f'{datas[0].name}-{datas[1].name}'
-            data.attrs['short_name'] = short_name
-            data.attrs['long_name'] = long_name
         elif method == 'proj':  # projection onto x
-            datas = xr.broadcast(*datas)
-            _, cov = climo.covar(*datas, dim='facets')  # updates units
-            cov = cov.climo.quantify().isel(lag=0)
-            std = datas[0].climo.quantify().std(dim='facets')
+            cov, std = _covar_parts(*datas, both=False)
             data = cov / std
             data = data.climo.dequantify()
             short_name = f'{datas[1].short_name} projection'
@@ -353,14 +361,20 @@ def _apply_method(
             data.attrs['short_name'] = short_name
             data.attrs['long_name'] = long_name
         elif method == 'slope':  # regression coefficient
-            datas = xr.broadcast(*datas)
-            _, cov = climo.covar(*datas, dim='facets')  # updates units
-            cov = cov.climo.quantify().isel(lag=0)
-            std = datas[0].climo.quantify().std(dim='facets')
+            cov, std = _covar_parts(*datas, both=False)
             data = cov / std ** 2
             data = data.climo.dequantify()
             short_name = f'{datas[1].short_name} regression'
             long_name = f'{datas[1].long_name} vs. {datas[0].long_name}'
+            data.name = f'{datas[0].name}-{datas[1].name}'
+            data.attrs['short_name'] = short_name
+            data.attrs['long_name'] = long_name
+        elif method == 'diff':  # composite difference along first arrays
+            data_lo, data_hi = _mask_parts(*datas)
+            data = data_hi - data_lo
+            data = data.climo.dequantify()
+            short_name = f'{datas[1].short_name} difference'
+            long_name = f'{datas[0].long_name}-composite {datas[1].long_name} difference'  # noqa: E501
             data.name = f'{datas[0].name}-{datas[1].name}'
             data.attrs['short_name'] = short_name
             data.attrs['long_name'] = long_name
@@ -449,6 +463,7 @@ def _parse_dicts(dataset, spec, **kwargs):
         name, kw = None, spec
     else:  # length-2 iterable
         name, kw = spec
+    kw = kw.copy()  # critical
     alt = kw.pop('name', None)
     name = name or alt  # see below
     kw = {**kwargs, **kw}
@@ -457,7 +472,7 @@ def _parse_dicts(dataset, spec, **kwargs):
     kw_plt, kw_bar, kw_leg = {}, {}, {}
     keys = ('space', 'ratio', 'group', 'equal', 'left', 'right', 'bottom', 'top')
     att_detect = ('short', 'long', 'standard')
-    fig_detect = ('fig', 'ref', 'space', 'share', 'align')
+    fig_detect = ('fig', 'ref', 'space', 'share', 'span', 'align')
     grd_detect = tuple(s + key for key in keys for s in ('w', 'h', ''))
     axs_detect = ('x', 'y', 'lon', 'lat', 'abc', 'title', 'coast')
     bar_detect = ('extend', 'tick', 'locator', 'formatter', 'minor', 'label')
@@ -610,16 +625,18 @@ def _parse_reduce(dataset, **kwargs):
                     sel = part.to(unit)
                     abbrv = f'{sel:~.0f}'.replace('/', 'p').replace(' ', '')
                     label = f'${sel:~L}$'
+            sels.append(sel)
             if abbrv is not None:  # e.g. operator or 'avg'
                 abvs.append(abbrv)
             if label is not None:  # e.g. operator or 'avg'
                 labs.append(label)
-            if sel is not None:
-                sels.append(sel)
-        sels = ('+', *sels) if sels else ()
-        abbrvs[key] = ''.join(abvs)
-        labels[key] = ' '.join(labs)
-        kw_red[key] = tuple(zip(sels[0::2], sels[1::2]))  # (([+-], value), ...) tuple
+        sels = ('+', *sels)  # note sels is never empty (see above notes)
+        sels = tuple(zip(sels[0::2], sels[1::2]))  # tuple of (([+-], value), ...)
+        kw_red[key] = sels
+        if abvs:
+            abbrvs[key] = ''.join(abvs)
+        if labs:
+            labels[key] = ' '.join(labs)
     return abbrvs, labels, kw_red
 
 
@@ -666,7 +683,7 @@ def _parse_labels(specs, refwidth=None):
         gspecs = [tuple(kw.get(key, None) for kw in gspecs) for key in keys]
         gspecs = [tup for tup in gspecs if any(spec != tup[0] for spec in tup)]
         gspecs = [' '.join(filter(None, tup)) for tup in zip(*gspecs)]
-        upper = lambda s: (s[0].upper() if s[0].islower() else s[0]) + s[1:]
+        upper = lambda s: s and ((s[0].upper() if s[0].islower() else s[0]) + s[1:])
         parts = ('feedback', 'forcing', 'energy', 'transport', 'convergence')
         for part in parts:
             if all(f' {part}' in spec for spec in gspecs):
@@ -674,7 +691,7 @@ def _parse_labels(specs, refwidth=None):
         gridspecs.append(list(map(upper, gspecs)) or [''] * len(specs))
 
     # Consolidate figure grid and file name labels
-    # NOTE: Here correlation pairs are handled with 'vs. ' indicators in the row
+    # NOTE: Here correlation pairs are handled with 'vs.' indicators in the row
     # or column labels (also components are kept only if distinct across slots).
     seen = set()
     filespecs = [  # avoid e.g. cmip5-cmip5 segments
@@ -781,8 +798,9 @@ def _parse_bulk(dataset, rowspecs, colspecs, **kwargs):
             cspecs = list(cspecs) * len(rspecs)
         if len(rspecs) != len(cspecs):
             raise ValueError(
-                f'Incompatible per-subplot spec count: {len(rspecs)} from '
-                f'the row specs, {len(cspecs)} from the column specs.'
+                'Incompatible per-subplot spec count.'
+                + f'\nRow specs ({len(rspecs)}): \n' + '\n'.join(map(repr, rspecs))
+                + f'\nColumn specs ({len(cspecs)}): \n' + '\n'.join(map(repr, cspecs))
             )
         pspecs = []
         for k, (rspec, cspec) in enumerate(zip(rspecs, cspecs)):  # subplot entries
@@ -820,10 +838,15 @@ def _parse_bulk(dataset, rowspecs, colspecs, **kwargs):
                 if others:
                     continue
                 others = tuple(other for other in kws_red if set(other) < set(keyval))
-                for other in others:
+                for other in others:  # prefer more selection keywords
                     kws_red.pop(other)
                 kws_red[tuple(keyval)] = kw_red
             kws_red = tuple(kws_red.values())
+            if len(kws_red) > 2:
+                raise RuntimeError(
+                    'Expected 1-2 specs for combining with _apply_method but '
+                    f'got {len(kws_red)} specs: ' + '\n'.join(map(repr, kws_red))
+                )
             pspecs.append((kws_red, kw_all))
         plotspecs.append(pspecs)
 
@@ -897,8 +920,8 @@ def plot_bulk(
         Whether to standardize axis limits to span the same range for all
         plotted content with the same units.
     annotate : bool, optional
-        Whether to annotate scatter plots and `hlines` or `vlines`
-        plots with model names.
+        Whether to annotate scatter plots and bar plots with model names
+        associated with each point.
     linefit : bool, optional
         Whether to draw best-fit lines for scatter plots of two arbitrary
         variables. Uses `climo.linefit`.
@@ -931,7 +954,7 @@ def plot_bulk(
     lighter contours; 1D data will be plotted with `line`, then on an alternate
     axes (so far just two axes are allowed); and 0D data will omit the average
     or correlation step and plot each model with `scatter` (if both variables
-    are defined) or `hlines` (if only one model is defined).
+    are defined) or `barh` (if only one model is defined).
     """
     # Initital stuff and figure out geometry
     # TODO: Support e.g. passing 2D arrays to line plotting methods with built-in
@@ -954,7 +977,7 @@ def plot_bulk(
     kws_contour = []
     kws_contour.append({'color': 'gray8', 'linestyle': None, **kw_contour})
     kws_contour.append({'color': 'gray3', 'linestyle': ':', **kw_contour})
-    kw_hlines = {'negpos': True, 'linewidth': 1.5 * pplt.rc.metawidth}
+    kw_bar = {'negpos': 1, 'width': 1, 'linewidth': pplt.rc.metawidth, 'edgecolor': 'k'}
     kw_line = {'linestyle': '-', 'linewidth': 1.5 * pplt.rc.metawidth}
     kw_scatter = {'color': 'gray7', 'linewidth': 1.5 * pplt.rc.metawidth}
     kw_scatter.update({'marker': 'x', 'markersize': 0.1 * pplt.rc.fontsize ** 2})
@@ -969,10 +992,11 @@ def plot_bulk(
     methods = []
     commands = {}
     iterator = zip(titles, plotspecs)
-    print('Getting data...')
+    print('Getting data:', end=' ')
     for i in range(nrows * ncols):
         if i in gridskip:
             continue
+        print(f'{i + 1}/{nrows * ncols}', end=' ')
         ax = None  # restart the axes
         aunits = set()
         asizes = set()
@@ -1053,7 +1077,7 @@ def plot_bulk(
             asizes.add(tuple(sorted(sizes)))
             sharex = True if 'lat' in sizes or 'plev' in sizes else 'labels'
             sharey = True if 'lat' in sizes or 'plev' in sizes else 'labels'
-            kw_fig = {'sharex': sharex, 'sharey': sharey, 'span': False}
+            kw_fig = {'sharex': sharex, 'sharey': sharey, 'spanx': False, 'spany': False}  # noqa: E501
             kw_axs = {'title': title}  # possibly none
             dims = ('geo',) if sizes == {'lon', 'lat'} else sizes & {'lat', 'plev'}
             projection = proj if sizes == {'lon', 'lat'} else 'cartesian'
@@ -1087,9 +1111,9 @@ def plot_bulk(
                     for key, value in kw_scatter.items():
                         kw_all.plot.setdefault(key, value)
                 else:
-                    command = 'hlines'
+                    command = 'barh'
                     ax.format(ylocator='null')
-                    for key, value in kw_hlines.items():
+                    for key, value in kw_bar.items():
                         kw_all.plot.setdefault(key, value)
             elif len(sizes) == 1:
                 if 'plev' in sizes:
@@ -1144,13 +1168,14 @@ def plot_bulk(
     # Carry out the plotting commands
     # NOTE: Axes are always added top-to-bottom and left-to-right so leverage
     # this fact below when selecting axes for legends and colorbars.
-    print('Plotting data...')
+    print('\nPlotting data...', end=' ')
     axs_objs = {}
     axs_units = {}  # axes grouped by units
     for k, (key, values) in enumerate(commands.items()):
         # Get plotting arguments
         # NOTE: Here 'argskip' is isued to skip arguments with vastly different
         # ranges when generating levels that annotate multiple different subplots.
+        print(f'{k + 1}/{len(commands)}', end=' ')
         name, method, command, cmap, color = key
         axs, args, kw_all = zip(*values)
         kw_bar, kw_leg, kw_plt = {}, {}, {}
@@ -1158,14 +1183,14 @@ def plot_bulk(
             kw_bar.update(kw.colorbar)
             kw_leg.update(kw.legend)
             kw_plt.update(kw.plot)
-        if command in ('pcolormesh', 'contourf', 'contour'):
+        if command in ('contour', 'contourf', 'pcolormesh'):
             xy = (args[0][-1].coords[dim] for dim in args[0][-1].dims)
             zs = (a for l, arg in enumerate(args) for a in arg if l % ncols not in argskip)  # noqa: E501
             kw_add = {key: kw_plt[key] for key in ('extend',) if key in kw_plt}
             levels, *_, kw_plt = axs[0]._parse_level_vals(*xy, *zs, norm_kw={}, **kw_plt)  # noqa: E501
             kw_plt.update({**kw_add, 'levels': levels})
             kw_plt.pop('robust', None)
-        if command in ('pcolormesh', 'contourf') and 'hatches' not in kw_plt:
+        if command in ('contourf', 'pcolormesh') and 'hatches' not in kw_plt:
             guide, kw_guide = 'colorbar', kw_bar
             label = args[0][-1].climo.short_label
             label = re.sub(r' \(', '\n(', label)
@@ -1176,11 +1201,11 @@ def plot_bulk(
             kw_guide.setdefault('extendsize', 1.2 + 0.6 * (ax._name != 'cartesian'))
         else:  # TODO: permit short *or* long
             guide, kw_guide = 'legend', kw_leg
-            climo = args[0][-1].climo
-            label = climo.long_label if command == 'contour' else climo.long_name
+            accessor = args[0][-1].climo
+            label = accessor.short_label if command == 'contour' else accessor.long_name
             label = None if 'hatches' in kw_plt else label
             keys = ('robust', 'symmetric', 'diverging', 'levels', 'locator', 'extend')
-            keys = () if command == 'contour' else keys
+            keys = () if 'contour' in command or 'pcolor' in command else keys
             keys += ('cmap', 'norm', 'norm_kw')
             kw_plt = {key: val for key, val in kw_plt.items() if key not in keys}
             kw_guide.setdefault('ncols', 1)
@@ -1190,11 +1215,11 @@ def plot_bulk(
         obj = result = None
         for l, (ax, arg) in enumerate(zip(axs, args)):
             # Add plotted content and formatting
-            # TODO: Support hist and hist2d plots in addition to hlines and scatter
+            # TODO: Support hist and hist2d plots in addition to scatter and barh plots
             # (or just hist since, hist2d usually looks ugly with so little data)
             if ax._name == 'cartesian':  # x-axis formatting
-                x = arg[-1] if command == 'hlines' else arg[0]
-                if command not in ('linex', 'scatter', 'hlines'):
+                x = arg[-1] if 'bar' in command else arg[0]
+                if command not in ('linex', 'scatter', 'barh'):
                     x = arg[-1].coords[arg[-1].dims[-1]]  # e.g. contour() is y by x
                 units = getattr(x, 'units', None)
                 axes = axs_units.setdefault(('x', units), [])
@@ -1205,8 +1230,8 @@ def plot_bulk(
                     if ax == ax._get_topmost_axes() or max(rows) == nrows - 1:
                         ax.set_xlabel(xlabel)
             if ax._name == 'cartesian':  # y-axis formatting
-                y = None if command == 'hlines' else arg[-1]
-                if command not in ('line', 'scatter', 'hlines'):
+                y = None if 'bar' in command else arg[-1]
+                if command not in ('line', 'scatter', 'barh'):
                     y = arg[-1].coords[arg[-1].dims[0]]
                 units = getattr(y, 'units', None)
                 axes = axs_units.setdefault(('y', units), [])
@@ -1219,24 +1244,41 @@ def plot_bulk(
             with warnings.catch_warnings():  # ignore 'masked to nan'
                 warnings.simplefilter('ignore', UserWarning)
                 result = getattr(ax, command)(*arg, **kw_plt)
-                if isinstance(result, (list, tuple)):  # silent list or tuple
+                if 'line' in command:  # silent list or tuple
                     obj = result[0][1] if isinstance(result[0], tuple) else result[0]
                 elif command == 'contour' and result.collections:
                     obj = result.collections[-1]
                 elif command in ('contourf', 'pcolormesh'):
                     obj = result
-                else:  # e.g. lines or scatter
+                else:  # e.g. bar, violin, scatter
                     pass
 
             # Add other content
+            # NOTE: Want to disable autoscaling based on zero line but not currently
+            # possible with convenience functions axvline and axhline. Instead use
+            # manual plot(). See: https://github.com/matplotlib/matplotlib/issues/14651
             # NOTE: Using set_in_layout False significantly improves appearance since
             # generally don't mind overlapping with tick labels for scatter plots and
             # improves draw time since tight bounding box calculation is expensive.
-            if 'line' in command and ax == ax._get_topmost_axes():
-                kw = dict(color='k', ls='-', lw=1.5 * pplt.rc.metawidth)
-                cmd = 'axhline' if command == 'line' else 'axvline'
-                getattr(ax, cmd)(0.0, **kw)
-            if 'lines' in command:
+            if ax == ax._get_topmost_axes() and ('bar' in command or 'line' in command):
+                kw = {
+                    'color': 'black',
+                    'scalex': False,
+                    'scaley': False,
+                    'linestyle': '-',
+                    'linewidth': 1.25 * pplt.rc.metawidth,
+                }
+                if command in ('bar', 'line', 'vlines'):
+                    transform = ax.get_yaxis_transform()
+                    ax.plot([0, 1], [0, 0], transform=transform, **kw)
+                else:
+                    transform = ax.get_xaxis_transform()
+                    ax.plot([0, 0], [0, 1], transform=transform, **kw)
+            if 'bar' in command or 'lines' in command:
+                for container in result:
+                    for artist in container:
+                        artist.sticky_edges.x.clear()
+                        artist.sticky_edges.y.clear()
                 if annotate:
                     xlim, ylim = ax.get_xlim(), ax.get_ylim()
                     width, _ = ax._get_size_inches()
@@ -1307,6 +1349,7 @@ def plot_bulk(
     # Add colorbar and legend objects
     # TODO: Should support colorbars spanning multiple columns or rows in the
     # center of the gridspec in addition to figure edges.
+    print('\nAdding guides...')
     for key, objs in axs_objs.items():
         *_, guide, label = key
         axs, rows, cols, objs, kws_guide = zip(*objs)
@@ -1370,6 +1413,14 @@ def plot_bulk(
             raise RuntimeError(f'Expected {nlabels} labels but got {len(dlabels)} and {len(clabels)}.')  # noqa: E501
         kw[key] = [clab or dlab for clab, dlab in zip(clabels, dlabels)]
     fig.format(figtitle=figtitle, **kw)
+    if gridskip.size:  # kludge to center super title above empty slots
+        for i in gridskip:
+            ax = fig.add_subplot(gs[i])
+            ax.xaxis.set_visible(False)
+            ax.yaxis.set_visible(False)
+            ax.patch.set_visible(False)
+            for spine in ax.spines.values():
+                spine.set_visible(False)
     if standardize:
         for (axis, _), axes in axs_units.items():
             lims = [getattr(ax, f'get_{axis}lim')() for ax in axes]

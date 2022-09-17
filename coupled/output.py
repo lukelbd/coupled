@@ -339,7 +339,7 @@ def _transport_explicit(udata, vdata, qdata, descrip=None, prefix=None):
     vdiff = diff.deriv_even(y, np.cos(lat) * vdata * qdata, keepedges=True) / np.cos(lat)  # noqa: E501
     cdata = -1 * (udiff + vdiff)  # convergence i.e. negative divergence
     cdata = cdata.assign_coords(qdata.coords)  # re-apply missing cell measures
-    if 'plev' in cdata.sizes:
+    if 'plev' in cdata.dims:
         cdata = cdata.climo.integral('plev')
     string = f'{prefix} ' if prefix else 'stationary '
     cdata = cdata.climo.to_units('W m^-2')
@@ -352,7 +352,7 @@ def _transport_explicit(udata, vdata, qdata, descrip=None, prefix=None):
     sdata = (vdata - vmean) * (qdata - qmean)  # width and height measures removed
     sdata = sdata.assign_coords(qdata.coords)  # reassign measures lost to conflicts
     sdata = sdata.climo.integral('lon')
-    if 'plev' in sdata.sizes:
+    if 'plev' in sdata.dims:
         sdata = sdata.climo.integral('plev')
     string = f'{prefix} ' if prefix else 'stationary '
     sdata = sdata.climo.to_units('PW')
@@ -361,7 +361,7 @@ def _transport_explicit(udata, vdata, qdata, descrip=None, prefix=None):
     mdata = vmean * qmean
     mdata = 2 * np.pi * np.cos(mdata.climo.coords.lat) * const.a * mdata
     # mdata = mdata.climo.integral('lon')  # integrate scalar coordinate
-    if 'plev' in mdata.sizes:
+    if 'plev' in mdata.dims:
         mdata = mdata.climo.integral('plev')
     string = f'{prefix} ' if prefix else 'zonal-mean '
     mdata = mdata.climo.to_units('PW')
@@ -649,29 +649,29 @@ def _update_feedback_info(
     iter_ = itertools.product(boundaries, wavelengths, FEEDBACK_DESCRIPTIONS.items())
     for boundary, wavelength, (component, descrip) in iter_:
         rad = f'r{wavelength[0].lower()}n{boundary[0].lower()}'
-        if wavelength == 'full':
-            descrip = 'net' if descrip == '' else descrip
-            if len(options) > 1:
-                descrip = f'{boundary} {descrip}'
-        else:
-            descrip = wavelength if descrip == '' else f'{wavelength} {descrip}'
-            if len(options) > 1:
-                descrip = f'{boundary} {descrip}'
-        for suffix, outdated, param in zip(
-            ('lam', 'erf', 'ecs'),
-            ('lambda', 'erf2x', 'ecs2x'),
-            ('feedback', 'forcing', '')   # keep short for figure labels
+        for suffix, outdated, param in (
+            ('lam', 'lambda', 'feedback'),
+            ('erf', 'erf2x', 'forcing'),
+            ('ecs', 'ecs2x', 'climate sensitivity'),
         ):
             if component in ('', 'cs'):
                 prefix = f'{rad}{component}'
             else:
                 prefix = f'{component}_{rad}'
+            if wavelength == 'full':
+                descrip = descrip if descrip else 'net' if suffix == 'lam' else 'effective'  # noqa: E501
+                if len(options) > 1:
+                    descrip = f'{boundary} {descrip}'
+            else:
+                descrip = f'{wavelength} {descrip}' if descrip else wavelength
+                if len(options) > 1:
+                    descrip = f'{boundary} {descrip}'
             name = f'{prefix}_{suffix}'
             outdated = f'{prefix}_{outdated}'
             if outdated in dataset:
                 dataset = dataset.rename({outdated: name})
             if name in dataset:
-                if suffix == 'ecs':
+                if suffix == 'ecs' and 'lon' in dataset[name].dims:
                     dataset = dataset.drop_vars(name)
                 else:
                     dataset[name].attrs['long_name'] = f'{descrip} {param}'
@@ -720,7 +720,7 @@ def _update_feedback_parts(dataset, boundary=None, erfextra=None, wavextra=None)
     erfextra : bool, optional
         Whether to include the kernel-derived effective forcing components.
     wavextra : bool, optional
-        Whether to include the non-cloud and non-raw-flux wavelength components.
+        Whether to include the humidity feedback wavelength components.
     """
     # Helper function
     # NOTE: This is necessary so e.g. we can add atmospheric versions of combined
@@ -729,7 +729,7 @@ def _update_feedback_parts(dataset, boundary=None, erfextra=None, wavextra=None)
     boundary = boundary or 't'
     def _iter_dataset(dataset, boundary=boundary, erfextra=erfextra, wavextra=wavextra):  # noqa: E306, E501
         for key in dataset:
-            if 'ecs' in key:  # ignore outdated partial sensitivity estimates
+            if 'ecs' in key and 'lon' in dataset[key].dims:  # ignore outdated values
                 continue
             if not (m := regex.search(key)):
                 continue
@@ -755,7 +755,7 @@ def _update_feedback_parts(dataset, boundary=None, erfextra=None, wavextra=None)
                 long_name = long_name.replace('TOA', 'atmospheric')
                 dataset[atm].attrs['long_name'] = long_name
 
-    # Add non-cloud feedbacks
+    # Add non-cloud temperature + humidity feedbacks
     # NOTE: Want to include 'non-cloud' effective forcing similar to cloud effective
     # forcing due to fast adjustments, so skip the erfextra check.
     for key, m in _iter_dataset(dataset, erfextra=True, wavextra=False):
@@ -766,8 +766,8 @@ def _update_feedback_parts(dataset, boundary=None, erfextra=None, wavextra=None)
             if lr in dataset and hus in dataset:
                 with xr.set_options(keep_attrs=True):
                     dataset[ncl] = dataset[key] + dataset[hus] + dataset[lr]
-                long_name = dataset[key].attrs.get('long_name', None)
-                long_name = long_name.replace('Planck', 'non-cloud')
+                long_name = dataset[key].attrs.get('long_name', '')
+                long_name = long_name.replace('Planck', 'temperature + humidity')
                 dataset[ncl].attrs['long_name'] = long_name
 
     # Add cloud effect feedbacks
@@ -780,7 +780,7 @@ def _update_feedback_parts(dataset, boundary=None, erfextra=None, wavextra=None)
             if cs in dataset:
                 with xr.set_options(keep_attrs=True):
                     dataset[ce] = dataset[key] - dataset[cs]
-                long_name = dataset[cs].attrs.get('long_name', None)
+                long_name = dataset[cs].attrs.get('long_name', '')
                 long_name = long_name.replace('clear-sky', 'cloud')
                 dataset[ce].attrs['long_name'] = long_name
 
@@ -789,12 +789,13 @@ def _update_feedback_parts(dataset, boundary=None, erfextra=None, wavextra=None)
     # effective forcings and feedbacks but interpretation is not useful. Now store
     # zero sensitivity components and only compute after the fact.
     if 't' in boundary and 'rfnt_lam' in dataset and 'rfnt_erf' in dataset:
-        numer = dataset.rfnt_erf.climo.add_cell_measures()
-        denom = dataset.rfnt_lam.climo.add_cell_measures()
-        data = -1 * numer.climo.average('area') / denom.climo.average('area')
-        data.attrs['units'] = 'K'
-        data.attrs['long_name'] = 'effective climate sensitivity'
-        dataset['rfnt_ecs'] = data
+        if 'rfnt_ecs' not in dataset or 'lon' in dataset['rfnt_ecs'].dims:
+            numer = dataset.rfnt_erf.climo.add_cell_measures()
+            denom = dataset.rfnt_lam.climo.add_cell_measures()
+            data = -1 * numer.climo.average('area') / denom.climo.average('area')
+            data.attrs['units'] = 'K'
+            data.attrs['long_name'] = 'effective climate sensitivity'
+            dataset['rfnt_ecs'] = data
     keys = ['pbot', 'ptop', 'rfnt_ecs', *(key for key, _ in _iter_dataset(dataset))]
     dataset = dataset.drop_vars(dataset.data_vars.keys() - set(keys))
     return dataset
@@ -1081,13 +1082,7 @@ def open_feedbacks_json(
                 dataset = xr.Dataset()
                 for key, value in data.items():
                     name, units = FEEDBACK_TRANSLATIONS[key.lower()]
-                    if units == 'K':
-                        long_name = 'climate sensitivity'
-                    elif units == 'W m^-2':
-                        long_name = 'forcing'  # keep short for figure labels
-                    else:
-                        long_name = 'feedback'  # keep short for figure labels
-                    attrs = {'units': units, 'long_name': long_name}
+                    attrs = {'units': units}  # long name assigned below
                     dataset[name] = xr.DataArray(value, attrs=attrs)
                 dataset = dataset.expand_dims(version=1)
                 dataset = dataset.assign_coords(version=index)
@@ -1095,11 +1090,13 @@ def open_feedbacks_json(
                     datasets[group].update(dataset)
                 else:
                     datasets[group] = dataset
-    if standardize:
-        datasets = {
-            group: _standardize_order(dataset)
-            for gruop, dataset in datasets.items()
-        }
+    for group in tuple(datasets):
+        dataset = datasets[group]
+        dataset = _update_feedback_info(dataset, boundary='t')
+        dataset = _update_feedback_parts(dataset, boundary='t')
+        if standardize:
+            dataset = _standardize_order(dataset)
+        datasets[group] = dataset
     return datasets
 
 
@@ -1155,15 +1152,7 @@ def open_feedbacks_text(
         factor = 0.5 if any('4x' in key for key in dataset.data_vars) else 1.0
         for key, da in dataset.data_vars.items():
             name, units = FEEDBACK_TRANSLATIONS[key.lower()]
-            if units == 'K':
-                scale = factor
-                long_name = 'climate sensitivity'
-            elif units == 'W m^-2':
-                scale = factor
-                long_name = 'forcing'  # keep short for figure labels
-            else:
-                scale = 1.0
-                long_name = 'feedback'  # keep short for figure labels
+            scale = factor if units in ('K', 'W m^-2') else 1.0
             for model in dataset.model.values:
                 group = ('CMIP5', model, 'abrupt4xco2', 'flagship')
                 if model not in constraints.get('model', (model,)):
@@ -1174,17 +1163,19 @@ def open_feedbacks_text(
                     continue
                 data = scale * da.sel(model=model, drop=True)
                 data.name = name
-                data.attrs.update({'units': units, 'long_name': long_name})
+                data.attrs.update({'units': units})  # long name assigned below
                 data = data.to_dataset()
                 if group in datasets:  # combine new feedback coordinates
                     tup = (data, datasets[group])
                     data = xr.combine_by_coords(tup, combine_attrs='override')
                 datasets[group] = data
-    if standardize:
-        datasets = {
-            group: _standardize_order(dataset)
-            for gruop, dataset in datasets.items()
-        }
+    for group in tuple(datasets):
+        dataset = datasets[group]
+        dataset = _update_feedback_info(dataset, boundary='t')
+        dataset = _update_feedback_parts(dataset, boundary='t')
+        if standardize:
+            dataset = _standardize_order(dataset)
+        datasets[group] = dataset
     return datasets
 
 
@@ -1275,7 +1266,7 @@ def open_bulk(
         for name in names.keys() - dataset.data_vars.keys():
             da = names[name]  # *sample* from another model or project
             da = xr.full_like(da, np.nan)  # preserve attributes as well
-            if 'version' in da.sizes and 'version' in dataset:
+            if 'version' in da.dims and 'version' in dataset:
                 da = da.isel(version=0, drop=True)
                 da = da.expand_dims(version=len(dataset.version))
                 da = da.assign_coords(version=dataset.version)
@@ -1296,7 +1287,7 @@ def open_bulk(
         combine_attrs='override',
     )
     print('Standardizing result.')
-    if 'version' in dataset.sizes:
+    if 'version' in dataset.dims:
         dataset = dataset.transpose('version', ...)
     if standardize:
         dataset = _standardize_order(dataset)

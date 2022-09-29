@@ -16,7 +16,7 @@ from icecream import ic  # noqa: F401
 from metpy import calc, units
 
 from cmip_data.feedbacks import FEEDBACK_DESCRIPTIONS
-from cmip_data.internals import ENSEMBLES_FLAGSHIP, MODELS_INSTITUTES  # noqa: F401
+from cmip_data.internals import ENSEMBLES_FLAGSHIP
 from cmip_data.internals import Database, glob_files, _item_dates, _parse_constraints
 from cmip_data.utils import average_periods, open_file
 
@@ -1046,7 +1046,7 @@ def open_feedbacks(
             pd.MultiIndex.from_tuples(parts, names=names),
             dims='version',
             name='version',
-            attrs={'long_name': 'feedback version information'},
+            attrs={'long_name': 'feedback version'},
         )
         dataset = xr.concat(
             parts.values(),
@@ -1333,7 +1333,7 @@ def open_bulk(
         pd.MultiIndex.from_tuples(datasets, names=FACETS_CONCAT),
         dims='facets',
         name='facets',
-        attrs={'long_name': 'facet information'},
+        attrs={'long_name': 'source facets'},
     )
     dataset = xr.concat(
         datasets.values(),

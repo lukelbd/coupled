@@ -14,21 +14,9 @@ from icecream import ic  # noqa: F401
 
 import proplot as pplt
 from climopy import decode_units, format_units, ureg, var, vreg  # noqa: F401
-from .output import FEEDBACK_TRANSLATIONS, MODELS_INSTITUTES
 from .internals import apply_method, apply_reduce, apply_variance
+from .internals import _parse_institute, _parse_labels, _parse_project, _parse_reduce
 
-
-# Variable constants
-_seen = set()
-NAMES_LONG = {
-    key: name
-    for key, (name, _) in FEEDBACK_TRANSLATIONS.items()
-}
-NAMES_SHORT = {
-    name: key for key, name in NAMES_LONG.items()
-    if name not in _seen and not _seen.add(name)  # translate with first entry
-}
-del _seen
 
 # Keyword argument constants
 # NOTE: For sake of grammar we place 'ensemble' before 'experiment' here
@@ -42,22 +30,6 @@ KWARGS_ALL = collections.namedtuple(
         'plot',
         'attrs'
     )
-)
-KWARGS_ORDER = (
-    'lon',  # space and time
-    'lat',
-    'area',
-    'plev',
-    'period',
-    'version',  # feedback version index
-    'source',
-    'statistic',
-    'region',
-    'facets',  # cmip facets index
-    'project',
-    'model',
-    'ensemble',
-    'experiment',
 )
 KWARGS_DEFAULT = {
     'geo': {
@@ -80,41 +52,6 @@ KWARGS_DEFAULT = {
         'ylabel': 'pressure (hPa)',
         'refwidth': 1.5,
     },
-}
-
-# Label constants
-# NOTE: Unit constants are partly based on CONVERSIONS_STANDARD from output.py. Need
-# to eventually forget this and use registered variable short names instead.
-REDUCE_ABBRVS = {
-    'avg': None,
-    'int': None,
-    'absmin': 'min',
-    'absmax': 'max',
-    'point': 'point',
-    'globe': 'globe',
-    'latitude': 'zonal',
-    'hemisphere': 'hemi',
-}
-REDUCE_LABELS = {  # default is title-case of input
-    '+': 'plus',
-    '-': 'minus',
-    'avg': None,
-    'int': None,
-    'ann': 'annual',
-    'djf': 'DJF',
-    'mam': 'MAM',
-    'jja': 'JJA',
-    'son': 'SON',
-    'absmin': 'minimum',
-    'absmax': 'maximum',
-    'point': 'local',
-    'globe': 'global',
-    'latitude': 'zonal',
-    'hemisphere': 'hemisphere',
-    'control': 'pre-industrial',
-    'response': r'abrupt 4$\times$CO$_2$',
-    'picontrol': 'pre-industrial',
-    'abrupt4xco2': r'abrupt 4$\times$CO$_2$',
 }
 
 
@@ -161,8 +98,10 @@ def _parse_dicts(dataset, spec, **kwargs):
     # to actual dataset names and intended for file names only). This helps when
     # merging variable specifications between row and column specifications and
     # between tuple-style specifications (see _parse_specs).
-    options = [*dataset.sizes, 'area', 'volume', 'method', 'std', 'pctile', 'invert']
+    options = list(dataset.sizes)
     options.extend(name for idx in dataset.indexes.values() for name in idx.names)
+    options.extend(('area', 'volume', 'institute'))  # see _parse_institute
+    options.extend(('method', 'invert', 'pctile', 'std'))  # see apply_method
     if spec is None:
         name, kw = None, {}
     elif isinstance(spec, str):
@@ -185,10 +124,7 @@ def _parse_dicts(dataset, spec, **kwargs):
     axs_detect = ('x', 'y', 'lon', 'lat', 'abc', 'title', 'coast')
     bar_detect = ('extend', 'tick', 'locator', 'formatter', 'minor', 'label')
     leg_detect = ('ncol', 'order', 'frame', 'handle', 'border', 'column')
-    order = list(KWARGS_ORDER)
-    sort = lambda key: order.index(key) if key in order else len(order)
-    for key in sorted(kw, key=sort):
-        value = kw[key]  # sort for name and label standardization
+    for key, value in kw.items():  # NOTE: sorting performed in _parse_labels
         if key in options:
             kw_red[key] = value  # e.g. for averaging
         elif any(key.startswith(prefix) for prefix in att_detect):
@@ -209,333 +145,6 @@ def _parse_dicts(dataset, spec, **kwargs):
     if isinstance(name, str):
         kw_red['name'] = name  # always place last for gridspec labels
     return kw_red, kw_all
-
-
-def _parse_project(dataset, project):
-    """
-    Return plot labels and facet tuples for the project indicator.
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The dataset. Must contain a ``'facets'`` coordinates.
-    project : str
-        The selection. Values should start with either ``'cmip'`` or ``'fmip'``, with
-        the latter indicating that only one "flaghip" model per institution should be
-        selected, and must end with integers indicating the facet values. No integer
-        indicates all cmip5 and cmip6 models, ``5`` (``6``) indicates just cmip5 (cmip6)
-        models, ``56`` (``65``) indicates cmip5 (cmip6) models filtered to those from
-        the same institutions as cmip6 (cmip5), and ``55`` (``66``) indicates models
-        from institutions found only in cmip5 (cmip6).
-
-    Returns
-    -------
-    abbrv : str
-        The file name abbreviation.
-    label : str
-        The column or row label string.
-    filter : callable
-        Function for filtering ``facets`` coordinates.
-    """
-    # WARNING: Critical that 'facets' selection is list because accessor reduce method
-    # will pass tuples to '.get()' for interpolation onto variable-derived locations.
-    # WARNING: Critical to assign name to filter so that _parse_specs can detect
-    # differences between row and column specs at given subplot entry.
-    project = project.lower()
-    if flagship := project.startswith('fmip'):
-        _, num = project.split('fmip')
-    elif project.startswith('cmip'):
-        _, num = project.split('cmip')
-    else:
-        raise ValueError(f'Invalid project {project}. Must contain cmip or fmip.')
-    model_to_inst = MODELS_INSTITUTES.copy()  # see also _parse_constraints
-    inst_to_model = {(proj, inst): model for (proj, model), inst in model_to_inst.items()}  # noqa: E501
-    if not flagship:
-        label_flag = ''
-        check_flag = lambda key: True  # noqa: U100
-    else:
-        label_flag = 'flagship '
-        check_flag = lambda key: (
-            key[1] == inst_to_model.get(
-                (key[0], model_to_inst.get((key[0], key[1]), None))
-            )
-        )
-    imax = max(1, len(num))
-    labs, nums, checks = [], [], []  # permit e.g. cmip6556 or inst6556
-    for i in range(0, imax, 2):
-        n = num[i:i + 2]
-        if not n:
-            label_proj = ''
-            check_proj = lambda key: True  # noqa: U100
-        elif n in ('5', '6'):
-            label_proj = ''
-            check_proj = lambda key: key[0][-1] == n
-        elif n in ('65', '66', '56', '55'):
-            idx = len(set(n)) - 1  # zero if only one unique integer
-            label_proj = '' if idx == 1 and n[0] == '5' else ('non-matching ', 'matching ')[idx]  # noqa: E501
-            check_proj = lambda key, num=n, opp='5' if n[0] == '6' else '6': (
-                num[0] == key[0][-1] and idx == any(
-                    model_to_inst.get((key[0], key[1]), object())
-                    == model_to_inst.get((other[0], other[1]), object())
-                    for other in dataset.facets.values if opp == other[0][-1]
-                )
-            )
-        else:
-            raise ValueError(f'Invalid project {n!r}.')
-        nums.append('' if n[:1] in nums else n[:1])
-        labs.append('' if label_proj in labs else label_proj)
-        checks.append(check_proj)
-    num = '' if set(nums) == {'5', '6'} else ''.join(nums)
-    label = label_flag + ''.join(labs) + f'CMIP{num}'
-    filter = lambda key: check_flag(key) and any(check(key) for check in checks)
-    abbrv = filter.__name__ = project  # required in _parse_specs
-    return abbrv, label, filter
-
-
-def _parse_reduce(dataset, **kwargs):
-    """
-    Standardize the indexers and translate into labels suitable for figures.
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The dataset.
-    **kwargs
-        The coordinate indexers or `name` specification. Numeric indexers are assumed
-        to have the units of the corresponding coordinate, and string indexers can
-        have arithmetic operators ``+-`` to perform operations between multiple
-        selections or variables (e.g. seasonal differences relative to annual
-        average or one project relative to another). Note the special key `project`
-        is handled by `_parse_project` to permit institution matching.
-
-    Returns
-    -------
-    abbrvs : dict
-        Abbreviations for the coordinate reductions. This is destined
-        for use in file names.
-    labels : dict
-        Labels for the coordinate reductions. This is destined for
-        use in row and column figure labels.
-    reduce : dict
-        The reduction selections. Contains either scalar sanitized selections
-        or two-tuples of selections for operations (plus an `operator` key).
-    """
-    # NOTE: Here a dummy coordinate None might be used to differentiate a variable
-    # spec with reduce dimensions versus a variable spec with unreduced dimensions
-    # before merging in _parse_specs (e.g. global average vs. local feedbacks).
-    abbrvs, labels, kw_red = {}, {}, {}
-    keys = ('method', 'std', 'pctile', 'invert')
-    kw_red.update({key: kwargs.pop(key) for key in keys if key in kwargs})
-    for key, value in kwargs.items():  # WARNING: critical to preserve order
-        abvs, labs, sels = [], [], []
-        parts = re.split('([+-])', value) if isinstance(value, str) else (value,)
-        for i, part in enumerate(parts):
-            if isinstance(part, str):  # string coordinate
-                if key == 'project' and part not in '+-':
-                    abbrv, label, sel = _parse_project(dataset, part)
-                    if i == len(parts) - 1:  # WARNING: critical to wait until end
-                        key = 'facets'
-                elif key == 'name' and part not in '+-':
-                    sel = NAMES_LONG.get(part, part)
-                    abbrv = NAMES_SHORT.get(sel, sel)
-                    label = dataset[sel].long_name
-                else:
-                    if 'control' in dataset.experiment:
-                        opts = {'picontrol': 'control', 'abrupt4xco2': 'respone'}
-                    else:
-                        opts = {'control': 'picontrol', 'response': 'abrupt4xco2'}
-                    sel = opts.get(part, part)
-                    abbrv = REDUCE_ABBRVS.get(sel, sel)
-                    label = REDUCE_LABELS.get(sel, sel)
-            else:  # numeric or dummy coordinate
-                if part is None:
-                    sel = part
-                    abbrv = label = None
-                else:
-                    coords = dataset[key]
-                    unit = coords.climo.units
-                    if not isinstance(part, ureg.Quantity):
-                        part = ureg.Quantity(part, unit)
-                    sel = part.to(unit)
-                    abbrv = f'{sel:~.0f}'.replace('/', 'p').replace(' ', '')
-                    label = f'${sel:~L}$'
-            sels.append(sel)
-            if abbrv is not None:  # e.g. operator or 'avg'
-                abvs.append(abbrv)
-            if label is not None:  # e.g. operator or 'avg'
-                labs.append(label)
-        sels = ('+', *sels)  # note sels is never empty (see above notes)
-        sels = tuple(zip(sels[0::2], sels[1::2]))  # tuple of (([+-], value), ...)
-        kw_red[key] = sels
-        if abvs:
-            abbrvs[key] = ''.join(abvs)
-        if labs:
-            labels[key] = ' '.join(labs)
-    return abbrvs, labels, kw_red
-
-
-def _parse_labels(specs, refwidth=None):
-    """
-    Return suitable grid label and file name strings given the input specs.
-
-    Parameters
-    ----------
-    specs : sequence
-        Sequence of sequence of variable specs in length-1 or length-2 form
-        respresenting either individual reductions or correlations.
-    refwidth : float, optional
-        The reference width used to scale the axes. This is used to auto-wrap
-        lengthy row and column labels.
-
-    Returns
-    -------
-    gridspecs : list of list of str
-        Strings suitable for the figure labels. Returned as a length-2 list of
-        descriptive row and column labels.
-    filespecs : list of list of str
-        Strings suitable for the default file name. Returned as a length-4 list of
-        method indicators, shared indicators, row indicators, and column indicators.
-    """
-    # Reduce the label dicationaries to account for redundancies across the list,
-    # either dropping them (useful for gridspec labels and legend labels) or dropping
-    # everything but the redundancies (useful for figure titles).
-    # TODO: Also drop scalar 'identical' specifications of e.g. 'annual', 'slope',
-    # and 'eraint' default selections for feedback variants and climate averages?
-    def _reduce_labels(kws, identical=False):
-        seen = set()
-        keys = [
-            key for kw in kws for key in kw
-            if key not in seen and not seen.add(key)
-        ]
-        labels, modifiers = {}, ()
-        if not identical:
-            modifiers = ('feedback', 'forcing', 'energy', 'transport', 'convergence')
-        for key in keys:
-            labs = tuple(kw.get(key, None) for kw in kws)  # label per key
-            for modifier in modifiers:
-                modifier = f' {modifier}'
-                if key == 'name' and all(modifier in lab for lab in labs):
-                    labs = [lab.replace(modifier, '') for lab in labs]
-            ident = all(lab == labs[0] for lab in labs)
-            if ident == identical:  # preserve identical or unique labels
-                labels[key] = labs[0] if identical else labs
-        if identical:
-            result = [labels]
-        else:
-            result = [{key: labels[key][i] for key in keys} for i in range(len(kws))]
-        return keys, result
-    # Combine labels
-    # Convert list of strings associated with e.g. gridspec rows and columns or plotted
-    # elements in a single subplot into succinct identical or non-identical labels.
-    def _combine_labels(kws):
-        keys = []
-        labels = []
-        for i in range(2):  # indices in the list
-            ikws = [pair[i] for pair in kws if i < len(pair)]
-            ikeys, labs = _reduce_labels(ikws)
-            if keys:
-                keys.extend(key for key in ikeys if key not in keys)
-            if labs:  # i.e. not an empty list
-                labels.append(labs)
-        pairs = list(zip(*labels))
-        labels = []
-        for pair in pairs:
-            for key in keys:
-                if len(pair) < 2:
-                    continue
-                if all(kw.get(key) == pair[0].get(key) for kw in pair):
-                    del labels[1][key]  # e.g. cmip5 abrupt vs. picontrol
-            seen = set()
-            labs = [' '.join(filter(None, kw.values())) for kw in pair]
-            labs = [lab for lab in labs if lab not in seen and not seen.add(lab)]
-            labels.append(' vs. '.join(labs))  # possibly singleton
-        return labels
-
-    # # Consolidate figure grid and file name labels
-    # # NOTE: Here correlation pairs are handled with 'vs.' indicators in the row
-    # # or column labels (also components are kept only if distinct across slots).
-    # seen = set()
-    # filespecs = [  # avoid e.g. cmip5-cmip5 segments
-    #     spec.replace('_', '') for spec in sorted(filter(None, abbrvs))
-    #     if spec and spec not in seen and not seen.add(spec)
-    # ]
-    # seen = set()
-    # gridspecs = [  # avoid e.g. 'cmip5 vs. cmip5' labels
-    #     ' vs. '.join(filter(None,
-    #         (spec for spec in specs if spec not in seen and not seen.add(spec))  # noqa: E128, E501
-    #     )) for specs in zip(*gridspecs) if not seen.clear()  # refresh each time
-    # ]
-    # Get component pieces
-    # TODO: Apply these labels to the legend handles and figure title automatically.
-    # Can pass to the main function.
-    # NOTE: This selects just the first variable specification in each subplot. Others
-    # are assumed to be secondary and not worth encoding in labels or file name.
-    abbrvs, labels, *_ = zip(
-        *(
-            zip(*ispecs[0])  # specs per correlation pair for first spec in the subplot
-            for ispecs  # specs per subplot
-            in specs  # specs per figure
-        )
-    )
-    abbrvs = tuple(abv for abvs in abbrvs for opts in abvs for abv in opts.values())
-    npairs = max(len(kws) for kws in abbrvs)
-    filespecs = []
-    # for i in range(nspecs):  # indices in the list
-    #     fspecs = [kws[i] for kws in abbrvs if i < len(kws)]
-    #     pass
-    npairs = max(len(kws) for kws in labels)
-    gridspecs = []
-    for i in range(npairs):  # indices in the list
-        gspecs = [kws[i] for kws in labels if i < len(kws)]
-        if len(set(tuple(kw.items()) for kw in gspecs)) <= 1:
-            continue
-        seen = set()
-        keys = [key for kw in gspecs for key in kw if key not in seen and not seen.add(key)]  # noqa: E501
-        gspecs = [tuple(kw.get(key, None) for kw in gspecs) for key in keys]
-        gspecs = [tup for tup in gspecs if any(spec != tup[0] for spec in tup)]
-        gspecs = [' '.join(filter(None, tup)) for tup in zip(*gspecs)]
-        upper = lambda s: s and ((s[0].upper() if s[0].islower() else s[0]) + s[1:])
-        parts = ('feedback', 'forcing', 'energy', 'transport', 'convergence')
-        for part in parts:
-            if all(f' {part}' in spec for spec in gspecs):
-                gspecs = [spec.replace(f' {part}', '') for spec in gspecs]
-        gridspecs.append(list(map(upper, gspecs)) or [''] * len(specs))
-
-    # Consolidate figure grid and file name labels
-    # NOTE: Here correlation pairs are handled with 'vs.' indicators in the row
-    # or column labels (also components are kept only if distinct across slots).
-    seen = set()
-    filespecs = [  # avoid e.g. cmip5-cmip5 segments
-        spec.replace('_', '') for spec in sorted(filter(None, abbrvs))
-        if spec and spec not in seen and not seen.add(spec)
-    ]
-    seen = set()
-    gridspecs = [  # avoid e.g. 'cmip5 vs. cmip5' labels
-        ' vs. '.join(filter(None,
-            (spec for spec in specs if spec not in seen and not seen.add(spec))  # noqa: E128, E501
-        )) for specs in zip(*gridspecs) if not seen.clear()  # refresh each time
-    ]
-
-    # Automatically insert spaces in row and column labels
-    # NOTE: This also ignores math text delimited by dollar signs
-    outspecs = []
-    for gridspec in gridspecs:
-        idxs = np.array([i for i, c in enumerate(gridspec) if c == ' '])
-        adjs = idxs.copy()
-        for m in re.finditer(r'\$[^$]+\$', gridspec):  # ignore non-math texts
-            i, j = m.span()
-            adjs[(i <= idxs) & (idxs <= j)] = 0  # i.e. ignore since lower than thresh
-            adjs[idxs > j] -= j - i
-        refwidth = refwidth or pplt.rc['subplots.refwidth']
-        threshs = pplt.units(refwidth, 'in', 'em') * np.arange(1, 10)
-        chars = list(gridspec)  # string to list
-        for thresh in threshs:
-            mask = adjs > thresh
-            if not mask.any():
-                continue
-            chars[np.min(idxs[mask])] = '\n'
-        outspecs.append(''.join(chars))
-    return filespecs, outspecs
 
 
 def _parse_specs(dataset, rowspecs, colspecs, **kwargs):
@@ -607,6 +216,25 @@ def _parse_specs(dataset, rowspecs, colspecs, **kwargs):
     # row or column list, and the specs from the other list are repeated below.
     # WARNING: Critical to make copies of dictionaries or create new ones
     # here since itertools product repeats the same spec multiple times.
+    def _to_hash(value):
+        if not isinstance(value, tuple):
+            return value
+        elif not all(isinstance(val, tuple) for val in value):
+            return value
+        else:
+            hashes = []
+            for val in value:
+                hash = []
+                for v in val:
+                    if callable(v):  # filter name
+                        h = v.__name__
+                    elif isinstance(v, xr.DataArray):  # groupby array
+                        h = v.name
+                    else:  # e.g. 'avg' string
+                        h = v
+                    hash.append(h)
+                hashes.append(tuple(hash))
+            return tuple(hashes)
     iter_ = itertools.product(*map(enumerate, plotspecs))
     nrows, ncols = map(len, plotspecs)
     plotspecs = []
@@ -634,23 +262,21 @@ def _parse_specs(dataset, rowspecs, colspecs, **kwargs):
                             kw.setdefault(key, value)  # prefer row entries
                 kws.append(kw)
             kw_all = KWARGS_ALL(*kws)
-            rkws_red = tuple(kw.copy() for kw in rkws_red)
+            rkws_red = tuple(kw.copy() for kw in rkws_red)  # NOTE: copy is critical
             ckws_red = tuple(kw.copy() for kw in ckws_red)
             for ikws_red, jkws_red in ((rkws_red, ckws_red), (ckws_red, rkws_red)):
                 for key in ikws_red[0]:
-                    if key in ikws_red[-1] and ikws_red[0][key] == ikws_red[-1][key]:
-                        for kw in jkws_red:  # possible correlation pairs
+                    if key not in ikws_red[-1]:
+                        continue
+                    if _to_hash(ikws_red[0][key]) == _to_hash(ikws_red[-1][key]):
+                        for kw in jkws_red:  # possible correlation pair
                             kw.setdefault(key, ikws_red[0][key])
             kws_red = {}  # filter unique specifications
             for kw_red in (*rkws_red, *ckws_red):
-                keyval = []
-                for key in sorted(kw_red):
-                    value = kw_red[key]
-                    if isinstance(value, tuple) and all(isinstance(val, tuple) for val in value):  # noqa: E501
-                        value = tuple(tuple(getattr(v, '__name__', v) for v in val) for val in value)  # noqa: E501
-                    if key not in ('method',):  # cannot 'intersect' methods
-                        keyval.append((key, value))
-                keyval = tuple(keyval)
+                keyval = tuple(
+                    (key, _to_hash(kw_red[key])) for key in sorted(kw_red)
+                    if key not in ('method',)
+                )
                 if tuple(keyval) in kws_red:
                     continue
                 others = tuple(other for other in kws_red if set(keyval) < set(other))
@@ -781,7 +407,7 @@ def plot_bulk(
     # shadestd, shadepctile, etc. methods instead of using map. See apply_method.
     argskip = np.atleast_1d(() if argskip is None else argskip)
     gridskip = np.atleast_1d(() if gridskip is None else gridskip)
-    filespecs, gridspecs, plotspecs = _parse_specs(dataset, rowspecs, colspecs, **kwargs)
+    filespecs, gridspecs, plotspecs = _parse_specs(dataset, rowspecs, colspecs, **kwargs)  # noqa: E501
     nrows, ncols = map(len, gridspecs)
     nrows, ncols = max(nrows, 1), max(ncols, 1)
     titles = (None,) * nrows * ncols
@@ -793,7 +419,7 @@ def plot_bulk(
         gridspecs = (None, None)
     cycle = pplt.Cycle(cycle or ['blue7', 'red7', 'yellow7', 'gray7'])
     colors = pplt.get_colors(cycle)
-    kw_annotate = {'fontsize': 0.6 * pplt.rc.fontsize, 'textcoords': 'offset points'}
+    kw_annotate = {'fontsize': 'x-small', 'textcoords': 'offset points'}
     kw_contour = {'robust': 96, 'nozero': True, 'linewidth': pplt.rc.metawidth}
     kw_contourf = {'levels': 20, 'extend': 'both'}
     kws_contour = []
@@ -834,8 +460,9 @@ def plot_bulk(
             for kw in kws_red:
                 kw_extra, kw_reduce, scale = {}, {}, 1
                 for key, value in kw.items():
+                    filt = lambda val: isinstance(val, str) and val == '+'
                     if isinstance(value, tuple) and isinstance(value[0], tuple):
-                        kw, count = kw_reduce, sum(pair.count('+') for pair in value)
+                        kw, count = kw_reduce, sum(filt(_) for vals in value for _ in vals)  # noqa: E501
                     else:
                         kw, count = kw_extra, 1  # e.g. a 'std' or 'pctile' keyword
                     kw[key] = value
@@ -855,7 +482,7 @@ def plot_bulk(
             scales, kws_method = zip(*kws_method)
             if len(set(scales)) > 1:
                 raise RuntimeError(f'Mixed reduction scalings {scales}.')
-            all_projs = all_flags = False
+            all_membs, all_projs = True, False
             kws_persum = zip(*kws_method)
             datas_persum = []  # each item represents part of a summation
             methods_persum = set()
@@ -870,10 +497,10 @@ def plot_bulk(
                     for key in tuple(kw_reduce):
                         if key in keys:
                             kw_method.setdefault(key, kw_reduce.pop(key))
-                    project = getattr(kw_reduce.get('facets', None), '__name__', None)
-                    all_projs = all_projs or project in ('cmip', 'fmip')
-                    all_projs = all_projs or any(n in project for n in ('5665', '6556'))  # noqa: E501
-                    all_flags = all_flags or 'cmip' in project
+                    institute = kw_reduce.get('institute', None)
+                    project = getattr(kw_reduce.get('project'), '__name__', None)
+                    all_membs = all_membs and institute is None
+                    all_projs = all_projs or project in ('cmip', 'cmip5665', 'cmip6556')
                     attrs = kw_all.attrs.copy()
                     data = apply_reduce(dataset, attrs=attrs, **kw_reduce)
                     datas.append(data)
@@ -894,7 +521,9 @@ def plot_bulk(
                     arg = arg / scales[0]
                 if isinstance(arg, xr.DataArray):
                     names = (data.name for data in datas if hasattr(data, 'name'))
+                    longs = (data.long_name for data in datas if hasattr(data, 'long_name'))  # noqa: E501
                     arg.name = '-'.join(names)
+                    arg.attrs['long_name']
                 args.append(arg)
 
             # Instantiate and setup the figure, gridspec, axes
@@ -934,37 +563,35 @@ def plot_bulk(
             units = args[-1].attrs['units']  # avoid numpy coordinates
             aunits.add(units)
             if len(sizes) == 0 and len(pspecs) == 1:
+                if all_membs:
+                    _, _, filt = _parse_institute(dataset, 'flagship')
+                    bools_flags = [filt(facet) for facet in args[-1].facets.values]
                 if all_projs:
                     _, _, filt = _parse_project(dataset, 'cmip65')
                     bools_cmip65 = [filt(facet) for facet in args[-1].facets.values]
-                if all_projs:
                     _, _, filt = _parse_project(dataset, 'cmip66')
                     bools_cmip66 = [filt(facet) for facet in args[-1].facets.values]
-                if all_flags:
-                    _, _, filt = _parse_project(dataset, 'fmip')
-                    bools_fmip = [filt(facet) for facet in args[-1].facets.values]
                 if len(args) == 2 and isinstance(args[0], xr.DataArray):
                     command = 'scatter'
                     color = kw_all.plot.get('color', 'gray7')
-                    size = pplt.rc['lines.markersize'] ** 2
+                    size = (0.5 * pplt.rc['lines.markersize']) ** 2
                     if all_projs:  # faded colors for cmip5 project
                         color = [
-                            'gray' + ('8' if b66 else '3' if b65 else '5')
-                            for c, b65, b66 in zip(color, bools_cmip65, bools_cmip66)
+                            pplt.set_alpha('gray8', 1 if b66 else 0.6 if b65 else 0.2)
+                            for b65, b66 in zip(bools_cmip65, bools_cmip66)
                         ]
                         kw_all.plot.setdefault('color', color)
-                    if all_flags:  # larger markers for institution flagships
-                        size = [(size, 2 * size)[b] for b in bools_fmip]
-                        kw_all.plot.setdefault('sizes', size)
+                    if all_membs:  # larger markers for institution flagships
+                        size = [(0.5 * size, 1.5 * size)[b] for b in bools_flags]
+                        kw_all.plot.update(sizes=size, absolute_size=True)
                     for key, value in kw_scatter.items():
                         kw_all.plot.setdefault(key, value)
                 else:
                     command = 'barh' if horizontal else 'bar'
                     ax.format(**{'ylocator' if horizontal else 'xlocator': 'null'})
                     color = [('blue7', 'red7')[val > 0] for val in args[-1].values]
-                    # color = ['yellow9' if units == 'W m^-2' else c for c in color]
-                    # color = ['gray7' if units == 'K' else c for c in color]
-                    color = ['gray7' if units in ('K', 'W m^-2') else c for c in color]  # noqa: E501
+                    color = ['gray8' if units == 'W m^-2' else c for c in color]
+                    color = ['gray8' if units == 'K' else c for c in color]
                     kw_all.plot.setdefault('color', color)
                     if all_projs:  # faded colors for cmip5 project
                         color = [
@@ -980,8 +607,8 @@ def plot_bulk(
                             for b65, b66 in zip(bools_cmip65, bools_cmip66)
                         ]
                         kw_all.plot.update(color=color, edgecolor=edgecolor, linewidth=linewidth)  # noqa: E501
-                    if all_flags:  # hatching for institution flagships
-                        hatch = [(None, '//////')[b] for b in bools_fmip]
+                    if all_membs:  # hatching for institution flagships
+                        hatch = [(None, '//////')[b] for b in bools_flags]
                         kw_all.plot.update(hatch=hatch)
                     for key, value in kw_bar.items():
                         kw_all.plot.setdefault(key, value)

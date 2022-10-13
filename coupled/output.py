@@ -45,9 +45,36 @@ FACETS_RENAME = {
 }
 
 # Climate constants
+# NOTE: For now use the standard 1e3 kg/m3 water density (i.e. snow and ice terms
+# represent melted equivalent depth) but could also use 1e2 kg/m3 snow density where
+# relevant. See: https://www.sciencelearn.org.nz/resources/1391-snow-and-ice-density
 # NOTE: These entries inform the translation from standard unit strings to short
 # names like 'energy flux' and 'energy transport' used in figure functions. In
 # future should group all of these into cfvariables with standard units.
+CLIMATE_SCALES = {  # scaling prior to final unit transformation
+    'prw': 1 / const.rhow,  # water vapor path not precip
+    'pr': 1 / const.rhow,
+    'prl': 1 / const.rhow,  # derived
+    'pri': 1 / const.rhow,
+    'ev': 1 / const.rhow,
+    'evl': 1 / const.rhow,  # derived
+    'evi': 1 / const.rhow,
+    'clwvi': 1 / const.rhow,
+    'cllvi': 1 / const.rhow,  # derived
+    'clivi': 1 / const.rhow,
+}
+CLIMATE_SHORTS = {
+    'K': 'temperature',
+    'hPa': 'pressure',
+    'dam': 'surface height',
+    'mm': 'liquid depth',
+    'mm day^-1': 'accumulation',
+    'm s^-1': 'wind speed',
+    'Pa': 'wind stress',  # default tau units
+    'g kg^-1': 'concentration',
+    'W m^-2': 'flux',
+    'PW': 'transport',
+}
 CLIMATE_UNITS = {
     'ta': 'K',
     'ts': 'K',
@@ -57,11 +84,11 @@ CLIMATE_UNITS = {
     'hfss': 'W m^-2',
     'prw': 'mm',  # water vapor path not precip
     'pr': 'mm day^-1',
-    'prra': 'mm day^-1',  # derived
-    'prsn': 'mm day^-1',
-    'evspsbl': 'mm day^-1',
-    'evsp': 'mm day^-1',  # derived
-    'sbl': 'mm day^-1',
+    'prl': 'mm day^-1',  # derived
+    'pri': 'mm day^-1',  # renamed
+    'ev': 'mm day^-1',  # renamed
+    'evl': 'mm day^-1',  # derived
+    'evi': 'mm day^-1',  # renamed
     'clwvi': 'mm',
     'cllvi': 'mm',  # derived
     'clivi': 'mm',
@@ -85,16 +112,14 @@ CLIMATE_UNITS = {
 # NOTE: These are used to both translate tables from external sources into the more
 # descriptive naming convention, and to translate inputs to plotting functions for
 # convenience (default for each shorthand is to use combined longwave + shortwave toa).
-# The preferred names should also come first becuase these are reverse-translated to
-# help make shorter automatic filenames.
 FEEDBACK_TRANSLATIONS = {
     'ecs': ('rfnt_ecs', 'K'),  # zelinka definition
     'tcr': ('rfnt_tcr', 'K'),  # forster definition
-    'erf': ('rfnt_erf', 'W m^-2'),
+    'erf2x': ('rfnt_erf', 'W m^-2'),  # zelinka definition
+    'erf4x': ('rfnt_erf', 'W m^-2'),
     'f2x': ('rfnt_erf', 'W m^-2'),  # forster definition
     'f4x': ('rfnt_erf', 'W m^-2'),  # geoffroy definition
-    'erf2x': ('rfnt_erf', 'W m^-2'),  # zelinka definition
-    'erf4x': ('rfnt_erf', 'W m^-2'),  # for consistency only
+    'erf': ('rfnt_erf', 'W m^-2'),  # preferred name last (for reverse translation)
     'net': ('rfnt_lam', 'W m^-2 K^-1'),
     'lw': ('rlnt_lam', 'W m^-2 K^-1'),
     'sw': ('rsnt_lam', 'W m^-2 K^-1'),
@@ -120,7 +145,29 @@ FEEDBACK_TRANSLATIONS = {
     'wv': ('hus_rfnt_lam', 'W m^-2 K^-1'),  # zelinka definition
     'rh': ('hur_rfnt_lam', 'W m^-2 K^-1'),  # zelinka definition
     'err': ('resid_rfnt_lam', 'W m^-2 K^-1'),  # forster definition
-    'resid': ('resid_rfnt_lam', 'W m^-2 K^-1'),
+    'resid': ('resid_rfnt_lam', 'W m^-2 K^-1'),  # preferred name last (for reverse translation)  # noqa: E501
+}
+
+# Energetics constants
+# NOTE: Here the flux components table was copied from feedbacks.py. Critical
+# to get net fluxes and execute renames before running transport derivations.
+# NOTE: Rename native surface budget terms to look more like cloud water and
+# ice terms. Then use 'prl'/'prp' and 'evl'/'evp' for ice components.
+ENERGETICS_RENAMES = {
+    'prsn': 'pri',
+    'evspsbl': 'ev',
+    'sbl': 'evi',
+}
+ENERGETICS_COMPONENTS = {
+    'rlnt': ('rlut',),  # out of the atmosphere
+    'rsnt': ('rsut', 'rsdt'),  # out of the atmosphere (include constant rsdt)
+    'rlns': ('rlds', 'rlus'),  # out of and into the atmosphere
+    'rsns': ('rsds', 'rsus'),  # out of and into the atmosphere
+    'rlntcs': ('rlutcs',),  # out of the atmosphere
+    'rsntcs': ('rsutcs', 'rsdt'),  # out of the atmosphere (include constant rsdt)
+    'rlnscs': ('rldscs', 'rlus'),  # out of and into the atmosphere
+    'rsnscs': ('rsdscs', 'rsuscs'),  # out of and into the atmosphere
+    'albedo': ('rsds', 'rsus'),  # full name to differentiate from 'alb' feedback
 }
 
 # Transport constants
@@ -135,7 +182,7 @@ FEEDBACK_TRANSLATIONS = {
 # hfls = Lv * evsp + Ls * sbl exactly (compare below terms), where the sbl term is
 # equivalent to adding the latent heat of fusion required to melt snow before a
 # liquid-vapor transition, an additional correction is not needed here.
-TRANSPORT_DESCRIPS = {
+TRANSPORT_DESCRIPTIONS = {
     'gse': 'potential static',
     'hse': 'sensible static',
     'dse': 'dry static',
@@ -144,71 +191,44 @@ TRANSPORT_DESCRIPS = {
     'ocean': 'storage + ocean',
     'total': 'total',
 }
-TRANSPORT_INTEGRATED = {
-    'dse': (1, 'intuadse', 'intvadse'),
-    'lse': (const.Lv, 'intuaw', 'intvaw'),
+TRANSPORT_SCALES = {  # scaling prior to implicit transport calculations
+    'pr': const.Lv,
+    'prl': const.Lv,
+    'pri': const.Ls - const.Lv,  # remove the 'pri * Lv' implied inside 'pr' term
+    'ev': const.Lv,
+    'evl': const.Lv,
+    'evi': const.Ls - const.Lv,  # remove the 'evi * Lv' implied inside 'pr' term
+}
+TRANSPORT_IMPLICIT = {
+    'dse': (('hfss', 'rlns', 'rsns', 'rlnt', 'rsnt', 'pr', 'pri'), ()),
+    'lse': (('hfls',), ('pr', 'pri')),
+    'ocean': ((), ('hfss', 'hfls', 'rlns', 'rsns')),  # flux into atmosphere
+    'total': (('rlnt', 'rsnt'), ()),
 }
 TRANSPORT_INDIVIDUAL = {
     'gse': ('zg', const.g, 'dam m s^-1'),
     'hse': ('ta', const.cp, 'K m s^-1'),
     'lse': ('hus', const.Lv, 'g kg^-1 m s^-1'),
 }
-TRANSPORT_IMPLICIT = {
-    'dse': (('hfss', 'rlns', 'rsns', 'rlnt', 'rsnt', 'pr', 'prsn'), ()),
-    'lse': (('hfls',), ('pr', 'prsn')),
-    'ocean': ((), ('hfss', 'hfls', 'rlns', 'rsns')),  # flux into atmosphere
-    'total': (('rlnt', 'rsnt'), ()),
-}
-TRANSPORT_RADIATION = {
-    'rlnt': ('rlut',),  # out of the atmosphere
-    'rsnt': ('rsut', 'rsdt'),  # out of the atmosphere (include constant rsdt)
-    'rlntcs': ('rlutcs',),  # out of the atmosphere
-    'rsntcs': ('rsutcs', 'rsdt'),  # out of the atmosphere (include constant rsdt)
-    'rlns': ('rlds', 'rlus'),  # out of and into the atmosphere
-    'rsns': ('rsds', 'rsus'),  # out of and into the atmosphere
-    'rlnscs': ('rldscs', 'rlus'),  # out of and into the atmosphere
-    'rsnscs': ('rsdscs', 'rsuscs'),  # out of and into the atmosphere
-    'albedo': ('rsds', 'rsus'),  # full name to differentiate from 'alb' feedback
+TRANSPORT_INTEGRATED = {
+    'dse': (1, 'intuadse', 'intvadse'),
+    'mse': (1, 'intuamse', 'intvamse'),  # not currently provided in cmip
+    'lse': (const.Lv, 'intuaw', 'intvaw'),
 }
 
 # Water cycle constants
-# NOTE: Here the %s is filled in with water, liquid, or ice depending on the
-# component of the particular variable category.
+# NOTE: Here the %s is filled in with water, liquid, or ice depending
+# on the component of the particular variable category.
 WATER_DEPENDENCIES = {
     'hur': ('plev', 'ta', 'hus'),
     'hurs': ('ps', 'ts', 'huss'),
 }
 WATER_COMPONENTS = [
+    ('ev', 'evl', 'evi', 'evp', '%s evaporation'),
+    ('pr', 'prl', 'pri', 'prp', '%s precipitation'),
     ('clw', 'cll', 'cli', 'clp', 'mass fraction cloud %s'),
     ('clwvi', 'cllvi', 'clivi', 'clpvi', 'condensed %s water path'),
-    ('pr', 'prra', 'prsn', 'prp', '%s precipitation'),
-    ('evspsbl', 'evsp', 'sbl', 'sblp', '%s evaporation'),
 ]
-
-# Transformation constants
-# NOTE: For now use the standard 1e3 kg/m3 water density (i.e. snow and ice terms
-# represent melted equivalent depth) but could also use 1e2 kg/m3 snow density where
-# relevant. See: https://www.sciencelearn.org.nz/resources/1391-snow-and-ice-density
-SCALES_IMPLICIT = {  # scaling prior to implicit transport calculations
-    'pr': const.Lv,
-    'prra': const.Lv,
-    'prsn': const.Ls - const.Lv,  # remove the 'prsn * Lv' implied inside 'pr' term
-    'evspsbl': const.Lv,
-    'evsp': const.Lv,
-    'sbl': const.Ls - const.Lv,  # remove the 'evspsbl * Lv' implied inside 'pr' term
-}
-SCALES_UNITS = {  # scaling prior to final unit transformation
-    'prw': 1 / const.rhow,  # water vapor path not precip
-    'pr': 1 / const.rhow,
-    'prra': 1 / const.rhow,  # derived
-    'prsn': 1 / const.rhow,
-    'evspsbl': 1 / const.rhow,
-    'evsp': 1 / const.rhow,  # derived
-    'sbl': 1 / const.rhow,
-    'clwvi': 1 / const.rhow,
-    'cllvi': 1 / const.rhow,  # derived
-    'clivi': 1 / const.rhow,
-}
 
 
 def _standardize_order(dataset):
@@ -245,8 +265,8 @@ def _standardize_order(dataset):
     if unknowns:
         print('Warning: Unknown order for variables:', ', '.join(unknowns))
     results = {name: dataset[name] for name in (*names, *unknowns) if name in dataset}
-    return xr.Dataset(results)
-    # dataset = xr.Dataset(results)
+    dataset = xr.Dataset(results)
+    return dataset
     # dataset = dataset.drop_vars(results.keys())
     # dataset.update(results)
     # return dataset
@@ -373,8 +393,8 @@ def _transport_explicit(udata, vdata, qdata, descrip=None, prefix=None):
 
 def _update_climate_units(dataset):
     """
-    Convert dataset units into human-readable form, first multiplying by
-    constants if necessary.
+    Convert dataset units into human-readable form, possibly
+    multiplying by constants, and add a unit-based short name.
 
     Parameters
     ----------
@@ -386,7 +406,7 @@ def _update_climate_units(dataset):
     for variable, unit in CLIMATE_UNITS.items():
         if variable not in dataset:
             continue
-        scale = SCALES_UNITS.get(variable, 1.0)
+        scale = CLIMATE_SCALES.get(variable, 1.0)
         data = dataset[variable]
         if ureg.parse_units(unit) == data.climo.units:
             continue
@@ -398,10 +418,19 @@ def _update_climate_units(dataset):
             with xr.set_options(keep_attrs=True):
                 data = data.climo.dequantify()
         dataset[variable] = data
+    for src in (dataset.data_vars, dataset.coords):
+        for variable, data in src.items():
+            long = data.attrs.get('long_name', None)
+            unit = data.attrs.get('units', None)
+            short = CLIMATE_SHORTS.get(unit, long)  # default long name, e.g. longitude
+            if variable == 'time':  # possibly missing long name
+                short = 'time'
+            if short is not None:
+                data.attrs['short_name'] = short
     return dataset
 
 
-def _update_climate_radiation(dataset):
+def _update_climate_energetics(dataset, clear=False, drop_components=True):
     """
     Add albedo and net fluxes from upwelling and downwelling components and remove
     the original directional variables.
@@ -410,12 +439,23 @@ def _update_climate_radiation(dataset):
     ----------
     dataset : xarray.Dataset
         The dataset.
+    clear : bool, default: False
+        Whether to compute clear-sky components.
+    drop_components : bool, optional
+        Whether to drop the directional components
     """
     # NOTE: Here also add 'albedo' term and generate long name by replacing directional
     # terms in existing long name. Remove the directional components when finished.
     regex = re.compile(r'(upwelling|downwelling|outgoing|incident)')
-    for name, keys in TRANSPORT_RADIATION.items():
+    for key, name in ENERGETICS_RENAMES.items():
+        if key in dataset:
+            dataset = dataset.rename({key: name})
+    keys_components = set()
+    for name, keys in ENERGETICS_COMPONENTS.items():
+        keys_components.update(keys)
         if any(key not in dataset for key in keys):  # skip partial data
+            continue
+        if not clear and name[-2:] == 'cs':
             continue
         if name == 'albedo':
             dataset[name] = 100 * dataset[keys[1]] / dataset[keys[0]]
@@ -432,12 +472,14 @@ def _update_climate_radiation(dataset):
         long_name = long_name.replace('radiation', 'flux')
         long_name = regex.sub('net', long_name)
         dataset[name].attrs.update({'units': unit, 'long_name': long_name})
-    drop = set(key for keys in TRANSPORT_RADIATION.values() for key in keys)
-    dataset = dataset.drop_vars(drop & dataset.data_vars.keys())
+    if drop_components:
+        dataset = dataset.drop_vars(keys_components & dataset.data_vars.keys())
     return dataset
 
 
-def _update_climate_transport(dataset):
+def _update_climate_transport(
+    dataset, fluxes=False, drop_implicit=True, drop_explicit=True
+):
     """
     Add zonally-integrated meridional transport and pointwise transport convergence
     to the dataset with dry-moist and transient-stationary-mean breakdowns.
@@ -446,26 +488,33 @@ def _update_climate_transport(dataset):
     ----------
     dataset : xarray.Dataset
         The dataset.
-    explicit : bool, optional
-        Whether to load explicit data.
+    fluxes : bool, default: False
+        Whether to compute additional flux estimates.
+    drop_implicit : bool, optional
+        The boundaries to drop for implicit transport terms.
+    drop_explicit : bool, optional
+        Whether to drop explicit transport terms.
     """
     # Get total, ocean, dry, and latent transport
-    # WARNING: This must come after _update_climate_radiation
     # NOTE: The below regex prefixes exponents expressed by numbers adjacent to units
     # with the carat ^, but ignores the scientific notation 1.e6 in scaling factors,
     # so dry static energy convergence units can be parsed as quantities.
+    # WARNING: This must come after _update_climate_energetics
     ends = ('', '_alt', '_exp')  # implicit, alternative, explicit
+    keys_keep = {'pr', 'pri', 'ev', 'evi', 'rlnt', 'rsnt'}
+    keys_implicit = set(ENERGETICS_COMPONENTS)  # components should be dropped
+    keys_explicit = set()
     for (name, pair), end in itertools.product(TRANSPORT_IMPLICIT.items(), ends[:2]):
         # Implicit transport
         constants = {}  # store component data
-        for c, keys in zip((1, -1), pair):
-            keys = list(keys)
+        for c, keys in zip((1, -1), map(list, pair)):
             if end and 'hfls' in keys:
-                keys[(idx := keys.index('hfls')):idx + 1] = ('evspsbl', 'sbl')
-            constants.update({k: c * SCALES_IMPLICIT.get(k, 1) for k in keys})
-        if end and 'sbl' not in constants:  # skip redundant calculation
+                keys[(idx := keys.index('hfls')):idx + 1] = ('ev', 'evi')
+            keys_implicit.update(keys)
+            constants.update({k: c * TRANSPORT_SCALES.get(k, 1) for k in keys})
+        if end and 'evi' not in constants:  # skip redundant calculation
             continue
-        descrip = TRANSPORT_DESCRIPS[name]
+        descrip = TRANSPORT_DESCRIPTIONS[name]
         kwargs = {'descrip': descrip, 'prefix': 'alternative' if end else ''}
         if all(k in dataset for k in constants):
             data = sum(c * dataset.climo.vars[k] for k, c in constants.items())
@@ -476,6 +525,7 @@ def _update_climate_transport(dataset):
         if end and True:  # only run explicit calcs after first run
             continue
         scale, ukey, vkey = TRANSPORT_INTEGRATED.get(name, (None, None, None))
+        keys_explicit.update((ukey, vkey))
         kwargs = {'descrip': descrip, 'prefix': 'explicit'}
         regex = re.compile(r'([a-df-zA-DF-Z]+)([-+]?[0-9]+)')
         if ukey and vkey and ukey in dataset and vkey in dataset:
@@ -487,27 +537,33 @@ def _update_climate_transport(dataset):
             cdata, _, tdata = _transport_explicit(udata, vdata, qdata, **kwargs)
             cname, tname = f'{name}c_exp', f'{name}t_exp'
             dataset.update({cname: cdata, tname: tdata})
-        dataset = dataset.drop_vars({ukey, vkey} & dataset.data_vars.keys())
+    # Optionally drop terms
+    drop = keys_implicit & dataset.data_vars.keys() - keys_keep
+    if drop_implicit:
+        dataset = dataset.drop_vars(drop)
+    drop = keys_explicit & dataset.data_vars.keys()
+    if drop_explicit:
+        dataset = dataset.drop_vars(drop)
 
-    # Get mean transport, stationary transport, and stationary convergence
+    # Get basic transport terms
     # NOTE: Here convergence can be broken down into just two components: a
     # stationary term and a transient term.
+    # NOTE: Here transient sensible transport is calculated from the residual of the dry
+    # static energy minus both the sensible and geopotential stationary components. The
+    # all-zero transient geopotential is stored for consistency if sensible is present.
     for name, (quant, scale, _) in TRANSPORT_INDIVIDUAL.items():
+        # Get mean transport, stationary transport, and stationary convergence
         if 'ps' not in dataset or 'va' not in dataset or quant not in dataset:
             continue
-        descrip = TRANSPORT_DESCRIPS[name]
+        descrip = TRANSPORT_DESCRIPTIONS[name]
         qdata = scale * dataset.climo.vars[quant]
         udata, vdata = dataset.climo.vars['ua'], dataset.climo.vars['va']
         cdata, sdata, mdata = _transport_explicit(udata, vdata, qdata, descrip=descrip)
         cname, sname, mname = f's{name}c', f's{name}t', f'm{name}t'
         dataset.update({cname: cdata, sname: sdata, mname: mdata})
-
-    # Get missing transient components and total sensible and geopotential terms
-    # NOTE: Here transient sensible transport is calculated from the residual of the dry
-    # static energy minus both the sensible and geopotential stationary components. The
-    # all-zero transient geopotential is stored for consistency if sensible is present.
     iter_ = itertools.product(TRANSPORT_INDIVIDUAL, ('cs', 'tsm'), ends)
     for name, (suffix, *prefixes), end in iter_:
+        # Get missing transient components and total sensible and geopotential terms
         ref = f'{prefixes[0]}{name}{suffix}'  # reference component
         total = 'lse' if name == 'lse' else 'dse'
         total = f'{total}{suffix}{end}'
@@ -528,15 +584,20 @@ def _update_climate_transport(dataset):
             data.attrs['long_name'] = data.long_name.replace('transient ', '')
             dataset[f'{name}{suffix}{end}'] = data
 
-    # Get dry and moist static energy from component transport and convergence terms
+    # Get combined components and inferred average fluxes
     # NOTE: Here a residual between total and storage + ocean would also suffice
     # but this also gets total transient and stationary static energy terms.
+    # NOTE: Flux values will have units K/s, m2/s2, and g/kg m/s and are more
+    # relevant to local conditions on a given latitude band. Could get vertically
+    # resolved values for stationary components, but impossible for residual transient
+    # component, so decided to only store this 'vertical average' for consistency.
     replacements = {'dse': ('sensible', 'dry'), 'mse': ('dry', 'moist')}
     dependencies = {'dse': ('hse', 'gse'), 'mse': ('dse', 'lse')}
     prefixes = ('', 'm', 's', 't')  # total, zonal-mean, stationary, transient
     suffixes = ('t', 'c', 'r')  # convergence, residual, transport
     iter_ = itertools.product(('dse', 'mse'), prefixes, suffixes, ends)
     for name, prefix, suffix, end in iter_:
+        # Get dry and moist static energy from component transport and convergence terms
         variable = f'{prefix}{name}{suffix}{end}'
         parts = [variable.replace(name, part) for part in dependencies[name]]
         if variable in dataset or any(part not in dataset for part in parts):
@@ -545,14 +606,11 @@ def _update_climate_transport(dataset):
             data = sum(dataset[part] for part in parts)
         data.attrs['long_name'] = data.long_name.replace(*replacements[name])
         dataset[variable] = data
-
-    # Get average flux terms from the integrated terms
-    # NOTE: These values will have units K/s, m2/s2, and g/kg m/s and are more
-    # relevant to local conditions on a given latitude band. Could get vertically
-    # resolved values for stationary components, but impossible for residual transient
-    # component, so decided to only store this 'vertical average' for consistency.
     iter_ = itertools.product(('hse', 'gse', 'lse'), prefixes, ends)
     for name, prefix, end in iter_:
+        # Get average flux terms from the integrated terms
+        if not fluxes:
+            continue
         variable = f'{prefix}{name}t{end}'
         if variable not in dataset:
             continue
@@ -567,7 +625,7 @@ def _update_climate_transport(dataset):
     return dataset
 
 
-def _update_climate_water(dataset):
+def _update_climate_water(dataset, ratio=True, liquid=False):
     """
     Add relative humidity and ice and liquid water terms and standardize
     the insertion order for the resulting dataset variables.
@@ -576,6 +634,10 @@ def _update_climate_water(dataset):
     ----------
     dataset : xarray.Dataset
         The dataset.
+    ratio : bool, default: True
+        Whether to add ice-liquid ratio estimate.
+    liquid : bool, default: False
+        Whether to add liquid components.
     """
     # Add humidity terms
     # NOTE: Generally forego downloading relative humidity variables... true that
@@ -607,20 +669,22 @@ def _update_climate_water(dataset):
         else:
             with xr.set_options(keep_attrs=True):
                 dataset['clw'] = dataset['cli'] + dataset['clw']
-    for both, liquid, ice, ratio, descrip in WATER_COMPONENTS:
-        if both in dataset and ice in dataset:  # note the clw variables include ice
+    for both, liq, ice, rat, descrip in WATER_COMPONENTS:
+        if not liquid and liq in dataset:
+            dataset = dataset.drop_vars(liq)
+        if liquid and both in dataset and ice in dataset:
             da = dataset[both] - dataset[ice]
             da.attrs = {'units': dataset[both].units, 'long_name': descrip % 'liquid'}
-            dataset[liquid] = da
+            dataset[liq] = da
+        if ratio and both in dataset and ice in dataset:
             da = (100 * dataset[ice] / dataset[both]).clip(0, 100)
             da.attrs = {'units': '%', 'long_name': descrip % 'ice' + ' ratio'}
-            dataset[ratio] = da
-    for both, liquid, ice, _, descrip in WATER_COMPONENTS:
-        for name, string in zip((ice, both, liquid), ('ice', 'water', 'liquid')):
-            if name in dataset:
-                data = dataset[name]
-            else:
+            dataset[rat] = da
+    for both, liq, ice, _, descrip in WATER_COMPONENTS:
+        for name, string in zip((ice, both, liq), ('ice', 'water', 'liquid')):
+            if name not in dataset:
                 continue
+            data = dataset[name]
             if string not in data.long_name:
                 data.attrs['long_name'] = descrip % string
     return dataset
@@ -660,7 +724,7 @@ def _update_feedback_info(
     for boundary, wavelength, (component, descrip) in iter_:
         rad = f'r{wavelength[0].lower()}n{boundary[0].lower()}'
         num = 4 if quadruple else 2
-        for suffix, outdated, category in (
+        for suffix, outdated, short in (
             ('lam', 'lambda', 'feedback'),
             ('erf', 'erf2x', 'forcing'),
             ('ecs', 'ecs2x', 'climate sensitivity'),
@@ -669,10 +733,6 @@ def _update_feedback_info(
                 tail = descrip if descrip else 'net' if suffix == 'lam' else 'effective'  # noqa: E501
             else:
                 tail = f'{wavelength} {descrip}' if descrip else wavelength
-            xco2 = rf'{num}$\times$CO$_2$' if suffix in ('erf', 'ecs') else ''
-            head = boundary if len(options) > 1 else ''
-            long_name = f'{xco2} {head} {tail} {category}'
-            long_name = re.sub('  +', ' ', long_name).strip()
             if component in ('', 'cs'):
                 prefix = f'{rad}{component}'
             else:
@@ -681,11 +741,17 @@ def _update_feedback_info(
             outdated = f'{prefix}_{outdated}'
             if outdated in dataset:
                 dataset = dataset.rename({outdated: name})
-            if name in dataset:
-                if suffix == 'ecs' and 'lon' in dataset[name].dims:
-                    dataset = dataset.drop_vars(name)
-                else:
-                    dataset[name].attrs['long_name'] = long_name
+            if name not in dataset:
+                continue
+            data = dataset[name]
+            spec = rf'{num}$\times$CO$_2$' if suffix in ('erf', 'ecs') else ''
+            head = boundary if len(options) > 1 else ''
+            long = f'{spec} {head} {tail} {short}'
+            long = re.sub('  +', ' ', long).strip()
+            data.attrs['long_name'] = long
+            data.attrs['short_name'] = short
+            if suffix == 'ecs' and 'lon' in dataset[name].dims:
+                dataset = dataset.drop_vars(name)
 
     # Other metadata repairs
     # NOTE: This mimics the behavior of average_periods in open_climate
@@ -749,7 +815,8 @@ def _update_feedback_terms(
     regex = re.compile(r'(\A|[^_]*)(_?r)([lsf])([udn])([tsa])(|cs|ce)(?=_)')
     boundary = boundary or 't'
     def _iter_dataset(dataset, boundary=boundary, erfextra=erfextra, wavextra=wavextra):  # noqa: E301, E501
-        components = ('', 'cl', 'alb', 'atm', 'resid')
+        erfparts = ('', 'cl', 'alb', 'atm', 'resid')
+        wavparts = ('', 'cl')
         for key in dataset:
             if 'ecs' in key and 'lon' in dataset[key].dims:  # ignore outdated values
                 continue
@@ -757,9 +824,9 @@ def _update_feedback_terms(
                 continue
             if boundary and m.group(5) not in boundary:
                 continue
-            if not wavextra and m.group(3) != 'f' and m.group(1) not in components:
+            if not erfextra and 'erf' in key and m.group(1) not in erfparts:
                 continue
-            if not erfextra and 'erf' in key and m.group(1) not in components:
+            if not wavextra and m.group(3) != 'f' and m.group(1) not in wavparts:
                 continue
             yield key, m
 
@@ -850,7 +917,13 @@ def open_climate(
     # as with other processing functions. Ensembles are added in a MultiIndex
     # NOTE: This loads all available variables by default, but can be
     # restricted to a few with e.g. variable=['ts', 'ta'].
+    keys_energetics = ('clear', 'drop_components')
+    keys_transport = ('fluxes', 'drop_explicit', 'drop_implicit')
+    keys_water = ('liquid', 'ratio')
     keys_times = ('annual', 'seasonal', 'monthly')
+    kw_energetics = {key: constraints.pop(key) for key in keys_energetics if key in constraints}  # noqa: E501
+    kw_transport = {key: constraints.pop(key) for key in keys_transport if key in constraints}  # noqa: E501
+    kw_water = {key: constraints.pop(key) for key in keys_water if key in constraints}
     kw_times = {key: constraints.pop(key, True) for key in keys_times}
     files, *_ = glob_files(*paths, project=constraints.get('project', None))
     constraints.setdefault('table', ['Amon', 'Emon'])
@@ -915,12 +988,12 @@ def open_climate(
         # time-covariance of surface pressure and near-surface flux terms is
         # effectively factored in (since average_periods only includes explicit
         # month-length weights and ignores implicit cell height weights).
-        if 'ps' not in dataset:
+        if 'ps' not in dataset and 'plev' in dataset.coords:
             print('Warning: Surface pressure is unavailable.', end=' ')
         dataset = dataset.climo.add_cell_measures(surface=('ps' in dataset))
-        dataset = _update_climate_radiation(dataset)  # must come before transport
-        dataset = _update_climate_transport(dataset)
-        dataset = _update_climate_water(dataset)
+        dataset = _update_climate_energetics(dataset, **kw_energetics)  # must come first  # noqa: E501
+        dataset = _update_climate_transport(dataset, **kw_transport)
+        dataset = _update_climate_water(dataset, **kw_water)
         dataset = _update_climate_units(dataset)  # must come after transport
         if 'time' in dataset:
             dataset = average_periods(dataset, **kw_times)
@@ -943,7 +1016,6 @@ def open_feedbacks(
     *paths,
     source=None,
     nodrift=False,
-    boundary=None,
     standardize=True,
     quadruple=False,
     **constraints,
@@ -970,13 +1042,15 @@ def open_feedbacks(
     """
     # NOTE: To reduce the number of variables this filters out
     # unneeded boundaries and effective forcings automatically.
-    keys_terms = ('boundary', 'erfextra', 'wavextra')
+    keys_shared = ('boundary',)
+    keys_terms = ('erfextra', 'wavextra')
     keys_times = ('annual', 'seasonal', 'monthly')
+    kw_shared = {key: constraints.pop(key) for key in keys_shared if key in constraints}
     kw_terms = {key: constraints.pop(key) for key in keys_terms if key in constraints}
     kw_times = {key: constraints.pop(key, True) for key in keys_times}
     kw_terms['quadruple'] = kw_times['quadruple'] = quadruple
     files, *_ = glob_files(*paths, project=constraints.get('project', None))
-    constraints['variable'] = 'feedbacks'
+    constraints['variable'] = 'feedbacks'  # TODO: similar technique for open_climate
     database = Database(files, FACETS_CONCAT, flagship_translate=True, **constraints)
     sources = (source,) if isinstance(source, str) else tuple(source or ())
     nodrift = nodrift and '-nodrift' or ''
@@ -1034,8 +1108,8 @@ def open_feedbacks(
         # lats. Also critical to use 'override' for combine_attrs in case conventions
         # changed between running feedback calculations on different models.
         for key, dataset in versions.items():
-            dataset = _update_feedback_info(dataset, boundary=boundary, **kw_times)
-            dataset = _update_feedback_terms(dataset, boundary=boundary, **kw_terms)
+            dataset = _update_feedback_info(dataset, **kw_shared, **kw_times)
+            dataset = _update_feedback_terms(dataset, **kw_shared, **kw_terms)
             if 'pbot' in dataset:
                 bnds['pbot'] = dataset['pbot']
             if 'ptop' in dataset:
@@ -1349,4 +1423,6 @@ def open_bulk(
         dataset = _standardize_order(dataset)
     dataset = dataset.climo.standardize_coords(prefix_levels=True)
     dataset = dataset.climo.add_cell_measures(surface=('ps' in dataset))
+    if 'plev_bot' in dataset:  # causes issues as coordinate variable and duplicates ps
+        dataset = dataset.drop_vars('plev_bot')
     return dataset

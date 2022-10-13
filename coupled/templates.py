@@ -4,7 +4,6 @@ Templates for figures detailing coupled model output.
 """
 import collections
 import itertools
-import re
 import warnings
 from pathlib import Path
 
@@ -14,48 +13,460 @@ from icecream import ic  # noqa: F401
 
 import proplot as pplt
 from climopy import decode_units, format_units, ureg, var, vreg  # noqa: F401
-from .internals import apply_method, apply_reduce, apply_variance
-from .internals import _parse_institute, _parse_labels, _parse_project, _parse_reduce
+from .internals import _apply_method, _parse_institute, _parse_project, get_data
+from .internals import _infer_abbrevs, _infer_labels, _infer_newlines
 
 
-# Keyword argument constants
-# NOTE: For sake of grammar we place 'ensemble' before 'experiment' here
-KWARGS_ALL = collections.namedtuple(
-    'kwargs', (
-        'figure',
-        'gridspec',
-        'axes',
-        'colorbar',
-        'legend',
-        'plot',
-        'attrs'
-    )
-)
+# Figure and axes default keyword arguments
 KWARGS_DEFAULT = {
+    'fig': {
+        'refwidth': 1.5,
+        'abcloc': 'left',
+        'abc': 'A.',
+    },
     'geo': {
         'coast': True,
         'lonlines': 30,
         'latlines': 30,
         'refwidth': 2.3,
+        'abcloc': 'upper left',
     },
     'lat': {
         'xlabel': 'latitude',
         'xformatter': 'deg',
         'xlocator': 30,
-        'xscale': 'linear',
+        'xscale': 'sine',  # or sine scale
         'xlim': (-89, 89),
-        'refwidth': 1.5,
     },
     'plev': {
         'ylocator': 200,
         'yreverse': True,
         'ylabel': 'pressure (hPa)',
-        'refwidth': 1.5,
     },
 }
 
 
-def _parse_dicts(dataset, spec, **kwargs):
+def _adjust_bars(ax, data, collection, horizontal=False, annotate=False):
+    """
+    Adjust and optionally add content to bar plots.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The axes.
+    data : xarray.DataArray
+        The original data.
+    collection : matplotlib.collection.BarCollection
+        The collection.
+    horizontal : bool, optional
+        Whether the bars were plotted horizontally.
+    annotate : bool, optional
+        Whether to add annotations to the bars.
+    """
+    # NOTE: Using set_in_layout False significantly improves appearance since
+    # generally don't mind overlapping with tick labels for bar plots and
+    # improves draw time since tight bounding box calculation is expensive.
+    kw_annotate = {'fontsize': 'x-small', 'textcoords': 'offset points'}
+    for container in collection:
+        container = container if np.iterable(container) else (container,)
+        for artist in container:
+            artist.sticky_edges.x.clear()
+            artist.sticky_edges.y.clear()
+    if annotate:
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        if not horizontal:
+            height, _ = ax._get_size_inches()
+            diff = (pplt.rc.fontsize / 72) * (max(ylim) - min(ylim)) / height  # noqa: E501
+            along, across = 5 * diff, 0.5 * diff
+            ymin = ylim[0] - along * np.any(data < 0)
+            ymax = ylim[1] + along * np.any(data > 0)
+            xmin, xmax = xlim[0] - across, xlim[1] + across
+        else:
+            width, _ = ax._get_size_inches()
+            diff = (pplt.rc.fontsize / 72) * (max(xlim) - min(xlim)) / width
+            along, across = 5 * diff, 0.5 * diff
+            xmin = xlim[0] - along * np.any(data < 0)
+            xmax = xlim[1] + along * np.any(data > 0)
+            ymin, ymax = ylim[0] - across, ylim[1] + across
+        xlim = (xmin, xmax) if ax.get_autoscalex_on() else None
+        ylim = (ymin, ymax) if ax.get_autoscaley_on() else None
+        ax.format(xlim=xlim, ylim=ylim)  # skip if overridden by user
+        for i, a in enumerate(data):  # iterate over scalar arrays
+            if not horizontal:
+                va = 'bottom' if a > 0 else 'top'
+                kw = {'ha': 'center', 'va': va, 'rotation': 90, **kw_annotate}  # noqa: E501
+                xy = (i, a.item())
+                xytext = (0, 2 if a > 0 else -2)
+            else:
+                ha = 'left' if a > 0 else 'right'
+                kw = {'ha': ha, 'va': 'center', **kw_annotate}
+                xy = (a.item(), i)
+                xytext = (2 if a > 0 else -2, 0)
+            tup = a.facets.item()  # multi-index is destroyed
+            model = tup[1] if 'CMIP' in tup[0] else tup[0]
+            res = ax.annotate(model, xy, xytext, **kw)
+            res.set_in_layout(False)
+
+
+def _adjust_points(ax, data0, data1, oneone=False, linefit=False, annotate=False):
+    """
+    Adjust and optionally add content to scatter plots.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The axes.
+    data0, data1 : xarray.DataArray
+        The original data.
+    collection : matplotlib.collection.BarCollection
+        The collection.
+    oneone : bool, optional
+        Whether to add a one-one line.
+    linefit : bool, optional
+        Whether to add a least-squares fit line.
+    annotate : bool, optional
+        Whether to add annotations to the bars.
+    """
+    # NOTE: Using set_in_layout False significantly improves appearance since
+    # generally don't mind overlapping with tick labels for scatter plots and
+    # improves draw time since tight bounding box calculation is expensive.
+    kw_annotate = {'fontsize': 'x-small', 'textcoords': 'offset points'}
+    if annotate:
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        width, _ = ax._get_size_inches()
+        diff = (pplt.rc.fontsize / 72) * (max(xlim) - min(xlim)) / width
+        xmax = xlim[1] + 5 * diff if ax.get_autoscalex_on() else None
+        ymin = ylim[0] - 1 * diff if ax.get_autoscaley_on() else None
+        ax.format(xmax=xmax, ymin=ymin)  # skip if overridden by user
+        for x, y in zip(data0, data1):  # iterate over scalar arrays
+            kw = {'ha': 'left', 'va': 'top', **kw_annotate}
+            tup = x.facets.item()  # multi-index is destroyed
+            model = tup[1] if 'CMIP' in tup[0] else tup[0]
+            res = ax.annotate(model, (x.item(), y.item()), (2, -2), **kw)
+            res.set_in_layout(False)
+    if oneone:
+        lim = (*ax.get_xlim(), *ax.get_ylim())
+        lim = (min(lim), max(lim))
+        avg = 0.5 * (lim[0] + lim[1])
+        span = lim[1] - lim[0]
+        ones = (avg - 1e3 * span, avg + 1e3 * span)
+        ax.format(xlim=lim, ylim=lim)  # autoscale disabled
+        ax.plot(ones, ones, ls='--', lw=1.5 * pplt.rc.metawidth, color='k')
+    if linefit:  # https://en.wikipedia.org/wiki/Simple_linear_regression
+        x, y = xr.align(data0, data1)
+        idx = np.argsort(x.values)
+        x, y = x.values[idx], y.values[idx]
+        slope, stderr, rsquare, fit, lower, upper = var.linefit(x, y, adjust=False)  # noqa: E501
+        sign = '(\N{MINUS SIGN})' if slope < 0 else ''  # point out negative r-squared
+        rsquare = ureg.Quantity(rsquare.item(), '').to('percent')
+        ax.format(ultitle=rf'$R^2 = {sign}{rsquare:~L.1f}$'.replace('%', r'\%'))
+        ax.plot(x, fit, color='r', ls='-', lw=1.5 * pplt.rc.metawidth)
+        ax.area(x, lower, upper, color='r', alpha=0.5 ** 2, lw=0)
+
+
+def _adjust_format(ax, command, *args, refwidth=None):
+    """
+    Adjust x and y axis labels and possibly add zero lines.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The axes.
+    command : str
+        The plotting command.
+    *args : array-like
+        The plotting arguments.
+
+    Returns
+    -------
+    xunits, yunits : str
+        The associated x and y-axis units.
+    """
+    # Add zero line
+    # NOTE: Want to disable autoscaling based on zero line but not currently
+    # possible with convenience functions axvline and axhline. Instead use
+    # manual plot(). See: https://github.com/matplotlib/matplotlib/issues/14651
+    top = ax._get_topmost_axes()
+    args = list(args)
+    nrows, ncols, *_ = top.get_subplotspec()._get_geometry()  # custom geometry function
+    refwidth = 1.5 * ax.figure._refwidth  # permit overlap
+    kw_zero = {
+        'color': 'black',
+        'scalex': False,
+        'scaley': False,
+        'zorder': 0.5,
+        'linestyle': '-',
+        'linewidth': 1.25 * pplt.rc.metawidth,
+    }
+    if ax == top:
+        if command in ('bar', 'box', 'violin', 'line', 'vlines'):
+            transform = ax.get_yaxis_transform()
+            ax.plot([0, 1], [0, 0], transform=transform, **kw_zero)
+        if command in ('barh', 'boxh', 'violinh', 'linex', 'hlines'):
+            transform = ax.get_xaxis_transform()
+            ax.plot([0, 0], [0, 1], transform=transform, **kw_zero)
+
+    # Handle x and y axis labels
+    # TODO: Handle this automatically with climopy and proplot autoformatting
+    if command in ('bar', 'box', 'violin'):
+        x = None
+    elif command in ('barh', 'boxh', 'violinh'):
+        x = args[-1]
+    elif command in ('linex', 'scatter'):
+        x = args[0]
+    else:
+        x = args[-1].coords[args[-1].dims[-1]]  # e.g. contour() is y by x
+    if x is None:
+        xunits = None
+        ax.format(xlocator='null')
+        # if 'bar' in command:
+        #     ax.format(xlocator='null')
+        # else:
+        #     ax.format(xgrid=False, xlocator=1, xtickminor=False, xformatter='null')
+    else:
+        x = x.copy()
+        x.attrs.pop('short_prefix', None)  # ignore legend indicators
+        xunits = x.attrs.get('units', None)
+        xprefix = x.attrs.get('xlabel_prefix', None)  # keep scatter prefix
+        if command == 'scatter' and len(xprefix) < 20:  # see _parse_bulk
+            x.attrs['short_prefix'] = xprefix
+        xlabel = x.climo.short_label if xunits is not None else None
+        if ncols > 1:
+            xlabel = _infer_newlines(xlabel, refwidth=refwidth)
+        if not ax.get_xlabel():
+            rows = top._range_subplotspec('y')
+            if ax == top or not ax.figure._sharex or min(rows) == 0:  # topmost axes
+                ax.set_xlabel(xlabel)
+    if command in ('barh', 'boxh', 'violinh'):
+        y = None
+    elif command in ('bar', 'box', 'violin', 'line', 'scatter'):
+        y = args[-1]
+    else:
+        y = args[-1].coords[args[-1].dims[0]]
+    if y is None:
+        yunits = None
+        ax.format(ylocator='null')
+        # if 'bar' in command:
+        #     ax.format(ylocator='null')
+        # else:
+        #     ax.format(ygrid=False, ylocator=1, ytickminor=False, yformatter='null')
+    else:
+        y = y.copy()
+        y.attrs.pop('short_prefix', None)  # ignore legend indicators
+        yunits = y.attrs.get('units', None)
+        yprefix = y.attrs.get('ylabel_prefix', None)  # keep scatter prefix
+        if command == 'scatter' and len(yprefix) < 20:  # see _parse_bulk
+            y.attrs['short_prefix'] = yprefix
+        ylabel = y.climo.short_label if yunits is not None else None
+        if nrows > 1:
+            ylabel = _infer_newlines(ylabel, refwidth=refwidth)
+        if not ax.get_ylabel():
+            cols = top._range_subplotspec('x')
+            if ax == top or not ax.figure._sharey or max(cols) == ncols - 1:
+                ax.set_ylabel(ylabel)
+    return xunits, yunits
+
+
+def _infer_command(
+    *args,
+    ax=None,
+    num=None,
+    offset=None,
+    alternate=False,
+    multiple=False,
+    horizontal=False,
+    projects=False,
+    members=False,
+    pcolor=False,
+    cycle=None,
+    label=False,
+    **kwargs,
+):
+    """
+    Infer the plotting command from the input arguments and apply settings.
+
+    Parameters
+    ----------
+    *args : xarray.DataArray
+        The plotting arguments.
+    ax : matplotlib.axes.Axes, optional
+        The axes instance. Possibly turned into a duplicate.
+    num : int, optional
+        The index in the subplot.
+    offset : float, optional
+        The optional offset for the coordinate.
+    alternate : bool, optional
+        Whether to create an alternate axes.
+    multiple : bool, optional
+        Whether multiple distributions or correlations should be plotted.
+    horizontal : bool, optional
+        Whether to use horizontal or vertical bars and violins.
+    projects : bool, optoinal
+        Whether to color-code cmip5 and cmip6 models.
+    members : bool, optoinal
+        Whether to color-code flagship and non-flagship models.
+    pcolor : bool, optional
+        Whether to use `pcolormesh` instead of `contourf`.
+    cycle : cycle-spec, optional
+        The default cycle color-spec.
+    label : bool, optional
+        Whether to label violin and bar plots.
+    **kwargs
+        Additional keyword arguments.
+
+    Returns
+    -------
+    ax : matplotlib.axes.Axes
+        The plotting axes.
+    command : str
+        The plotting command.
+    args : tuple
+        The possibly modified plotting arguments.
+    kwargs : dict
+        The possibly modified plotting keyword arguments.
+    """
+    # Initial stuff
+    # NOTE: Bar plots support 'list of' hatch arguments alongside linewidth,
+    # edgecolor, and color, even though it is not listed in documentation.
+    def _ints_member(data):
+        ints = []
+        filt_flag = _parse_institute(data, 'flagship')
+        for facet in args[-1].facets.values:
+            int_ = int(filt_flag(facet))
+            ints.append(int_)
+        return ints
+    def _ints_project(data):  # noqa: E301
+        ints = []
+        filt_cmip65 = _parse_project(data, 'cmip65')
+        filt_cmip66 = _parse_project(data, 'cmip66')
+        for facet in args[-1].facets.values:
+            int_ = 2 if filt_cmip66(facet) else 1 if filt_cmip65(facet) else 0
+            ints.append(int_)
+        return ints
+    args = list(args)
+    cycle = pplt.Cycle(cycle or ['blue7', 'red7', 'yellow7', 'gray7'])
+    colors = pplt.get_colors(cycle)
+    flier = {'markersize': 2, 'marker': 'x'}
+    kw_contour = {'robust': 96, 'nozero': True, 'linewidth': pplt.rc.metawidth}
+    kw_contourf = {'robust': 98, 'levels': 20, 'extend': 'both'}
+    kws_contour = []
+    kws_contour.append({'color': 'gray8', 'linestyle': None, **kw_contour})
+    kws_contour.append({'color': 'gray3', 'linestyle': ':', **kw_contour})
+    kw_bar = {'linewidth': pplt.rc.metawidth, 'edgecolor': 'black', 'width': 1.0}
+    kw_line = {'linestyle': '-', 'linewidth': 1.5 * pplt.rc.metawidth}
+    kw_scatter = {'color': 'gray7', 'linewidth': 1.5 * pplt.rc.metawidth}
+    kw_scatter.update({'marker': 'x', 'markersize': 0.1 * pplt.rc.fontsize ** 2})
+    kw_box = {'means': True, 'whis': (5, 95), 'widths': 0.33, 'flierprops': flier}
+    sizes = args[-1].sizes.keys() - {'facets', 'version', 'period'}
+
+    # Infer commands
+    # TODO: Support hist and hist2d perlots in addition to scatter and barh plots
+    # (or just hist since, hist2d usually looks ugly with so little data)
+    num = num or 0
+    offset = offset or 0
+    defaults = {}
+    if len(sizes) == 2:
+        if 'hatches' in kwargs:
+            command = 'contourf'
+        elif num == 0:
+            command = 'pcolormesh' if pcolor else 'contourf'
+            defaults = kw_contourf.copy()
+        else:
+            command = 'contour'
+            defaults = {'labels': True, **kws_contour[num - 1]}
+    elif len(sizes) == 1:
+        if 'plev' in sizes:
+            command = 'linex'
+            color0 = colors[max(num - 1, 0) % len(colors)]
+            color1 = colors[num % len(colors)]
+            defaults = {'color': color1, **kw_line}
+            if alternate:  # TODO: handle parent axis color inside plot_bulk()
+                ax.format(xcolor=color0)
+                ax = ax.altx(color=color1)
+        else:
+            command = 'line'
+            color0 = colors[max(num - 1, 0) % len(colors)]
+            color1 = colors[num % len(colors)]
+            defaults = {'color': color1, **kw_line}
+            if alternate:  # TODO: handle parent axis color inside plot_bulk()
+                ax.format(ycolor=color0)
+                ax = ax.alty(color=color1)
+    elif len(sizes) == 0 and multiple:
+        if len(args) == 2:  # TODO: stack regression coefficient and r-squared values
+            command = 'barh' if horizontal else 'bar'
+            project = args[0].project.values[0]
+            (slope,), *_ = _apply_method(*args, method='slope')
+            short_prefix = project
+            if hasattr(args[0], 'short_prefix') and hasattr(args[1], 'short_prefix'):
+                short_prefix += f' {args[1].short_prefix} vs. {args[0].short_prefix}'
+            slope.attrs['short_prefix'] = short_prefix
+            args = (np.array([num - offset]), slope)  # TODO: add error bars
+            color = colors[num % len(colors)]
+            defaults = {'color': color, **kw_bar}
+        else:  # compare distributions
+            # command = 'violinh' if horizontal else 'violin'
+            command = 'boxh' if horizontal else 'box'
+            args = (np.array([num - offset]), args[-1].expand_dims('num', axis=1))
+            color = colors[num % len(colors)]
+            defaults = {'facecolor': color, **kw_box}
+        data = args[-1].copy()
+        data.attrs['units'] = ''
+        string = data.climo.short_label
+        string = _infer_newlines(string.replace('\n', ' '), 25 * pplt.rc.fontsize / 72)
+        if label:
+            if horizontal:
+                trans = ax.get_yaxis_transform()
+                align = {'ha': 'right', 'va': 'center', 'rotation': 0}
+                ax.text(-0.05, num - offset, string, transform=trans, **align)
+            else:
+                trans = ax.get_xaxis_transform()
+                align = {'ha': 'center', 'va': 'top', 'rotation': 90}
+                ax.text(num - offset, -0.05, string, transform=trans, **align)
+    elif len(sizes) == 0:
+        if len(args) == 2:  # plot correlation
+            # TODO: repair this... currently sizes will conflict
+            command = 'scatter'
+            color = kwargs.get('color', 'gray7')
+            size = (0.5 * pplt.rc['lines.markersize']) ** 2
+            defaults = kw_scatter.copy()
+            if members:  # larger markers for institution flagships
+                ints = _ints_member(args[-1])
+                size = [(0.5 * size, 1.5 * size)[i] for i in ints]
+                defaults.update(sizes=size, absolute_size=True)
+            if projects:  # faded colors for cmip5 project
+                ints = _ints_project(args[-1])
+                color = [pplt.set_alpha('k', (0.2, 0.6, 1)[i]) for i in ints]
+                defaults.setdefault('color', color)
+        else:  # plot distribution
+            command = 'barh' if horizontal else 'bar'
+            ascending = False if horizontal else True
+            data = args[-1]
+            name = data.name
+            args.insert(0, np.arange(data.size))
+            args[-1] = data.sortby(data, ascending=ascending)
+            color = [('blue7', 'red7')[val > 0] for val in args[-1].values]
+            color = ['gray8' if name == 'ecs_rfnt' else c for c in color]
+            color = ['gray8' if name == 'erf_rfnt' else c for c in color]
+            defaults = kw_bar.copy()
+            defaults['color'] = color
+            if members:  # hatching for institution flagships
+                ints = _ints_member(args[-1])
+                hatch = [(None, '//////')[i] for i in ints]
+                defaults.update(hatch=hatch)
+            if projects:  # faded colors for cmip5 project
+                ints = _ints_project(args[-1])
+                color = [pplt.set_alpha(c, (0.2, 0.6, 1)[i]) for c, i in zip(color, ints)]  # noqa: E501
+                edgecolor = [pplt.set_alpha('k', (0.2, 0.6, 1)[i]) for i in ints]
+                linewidth = [pplt.rc.metawidth * (0.5, 1, 1)[i] for i in ints]
+                defaults.update(color=color, edgecolor=edgecolor, linewidth=linewidth)
+    else:
+        raise ValueError(f'Invalid dimension count {len(sizes)} and sizes {sizes}.')  # noqa: E501
+    for key, value in defaults.items():
+        kwargs.setdefault(key, value)
+    return ax, command, args, kwargs
+
+
+def _parse_item(dataset, spec, **kwargs):
     """
     Parse the variable name specification.
 
@@ -67,18 +478,18 @@ def _parse_dicts(dataset, spec, **kwargs):
         The variable specification. Can be a ``(name, kwargs)``, a naked ``name``,
         or a naked ``kwargs``. The name can be omitted or specified inside `kwargs`
         with the `name` dictionary, and it will be specified when intersected with
-        other specifications (i.e. the row-column framework; see `_parse_specs`).
+        other specifications (i.e. the row-column framework; see `_parse_bulk`).
     **kwargs
         Additional keyword arguments, used as defaults for the unset keys
         in the variable specifications.
 
     Returns
     -------
-    kw_red : dict
+    kw_dat : dict
         The indexers used to reduce the data variable with `.reduce`. This is
         parsed specially compared to other keywords, and its keys are restricted
         to ``'name'`` and any coordinate or multi-index names.
-    kw_all : namedtuple of dict
+    kw_plt : namedtuple of dict
         A named tuple containing keyword arguments for different plotting-related
         commands. The tuple fields are as follows:
 
@@ -87,17 +498,14 @@ def _parse_dicts(dataset, spec, **kwargs):
           * ``axes``: Passed to `.format` for cartesian or geographic formatting.
           * ``colorbar``: Passed to `.colorbar` for scalar mappable outputs.
           * ``legend``: Passed to `.legend` for other artist outputs.
-          * ``plot``: Passed to the plotting command (the default field).
+          * ``command``: Passed to the plotting command (the default field).
           * ``attrs``: Added to `.attrs` for use in resulting plot labels.
-
-        These keywords are applied at different points throughout the `plot_bulk`
-        function. The figure and gridspec ones are only passed on instantiation.
     """
     # NOTE: For subsequent processing we put the variables being combined (usually
     # just one) inside the 'name' key in kw_red (here `short` is shortened relative
     # to actual dataset names and intended for file names only). This helps when
     # merging variable specifications between row and column specifications and
-    # between tuple-style specifications (see _parse_specs).
+    # between tuple-style specifications (see _parse_bulk).
     options = list(dataset.sizes)
     options.extend(name for idx in dataset.indexes.values() for name in idx.names)
     options.extend(('area', 'volume', 'institute'))  # see _parse_institute
@@ -110,15 +518,14 @@ def _parse_dicts(dataset, spec, **kwargs):
         name, kw = None, spec
     else:  # length-2 iterable
         name, kw = spec
-    kw = kw.copy()  # critical
+    kw = {**kwargs, **kw}  # copy
     alt = kw.pop('name', None)
     name = name or alt  # see below
-    kw = {**kwargs, **kw}
-    kw_red, kw_att = {}, {}
+    kw_dat, kw_att = {}, {}
     kw_fig, kw_grd, kw_axs = {}, {}, {}
-    kw_plt, kw_cba, kw_leg = {}, {}, {}
+    kw_cmd, kw_cba, kw_leg = {}, {}, {}
     keys = ('space', 'ratio', 'group', 'equal', 'left', 'right', 'bottom', 'top')
-    att_detect = ('short', 'long', 'standard')
+    att_detect = ('short', 'long', 'standard', 'xlabel_', 'ylabel_')
     fig_detect = ('fig', 'ref', 'space', 'share', 'span', 'align')
     grd_detect = tuple(s + key for key in keys for s in ('w', 'h', ''))
     axs_detect = ('x', 'y', 'lon', 'lat', 'abc', 'title', 'coast')
@@ -126,7 +533,7 @@ def _parse_dicts(dataset, spec, **kwargs):
     leg_detect = ('ncol', 'order', 'frame', 'handle', 'border', 'column')
     for key, value in kw.items():  # NOTE: sorting performed in _parse_labels
         if key in options:
-            kw_red[key] = value  # e.g. for averaging
+            kw_dat[key] = value  # e.g. for averaging
         elif any(key.startswith(prefix) for prefix in att_detect):
             kw_att[key] = value
         elif any(key.startswith(prefix) for prefix in fig_detect):
@@ -140,14 +547,18 @@ def _parse_dicts(dataset, spec, **kwargs):
         elif any(key.startswith(prefix) for prefix in leg_detect):
             kw_leg[key] = value
         else:  # arbitrary plotting keywords
-            kw_plt[key] = value
-    kw_all = KWARGS_ALL(kw_fig, kw_grd, kw_axs, kw_cba, kw_leg, kw_plt, kw_att)
+            kw_cmd[key] = value
     if isinstance(name, str):
-        kw_red['name'] = name  # always place last for gridspec labels
-    return kw_red, kw_all
+        kw_dat['name'] = name  # always place last for gridspec labels
+    keys = ('method', 'std', 'pctile', 'invert')
+    kw_dat.update({key: kwargs.pop(key) for key in keys if key in kwargs})
+    fields = ('figure', 'gridspec', 'axes', 'command', 'attrs', 'colorbar', 'legend')
+    kwargs = collections.namedtuple('kwargs', fields)
+    kw_plt = kwargs(kw_fig, kw_grd, kw_axs, kw_cmd, kw_att, kw_cba, kw_leg)
+    return kw_dat, kw_plt
 
 
-def _parse_specs(dataset, rowspecs, colspecs, **kwargs):
+def _parse_bulk(dataset, rowspecs=None, colspecs=None, **kwargs):
     """
     Parse variable and project specifications and auto-determine row and column
     labels based on the unique names and/or keywords in the spec lists.
@@ -165,34 +576,37 @@ def _parse_specs(dataset, rowspecs, colspecs, **kwargs):
 
     Returns
     -------
-    filespecs : list of list of str
-        Strings suitable for the figure file name. See `_parse_labels`.
-    gridspecs : list of list of str
-        Strings suitable for the figure grid labels. See `_parse_labels`.
-    plotspecs : list of list of tuple
-        Specifications for plotting in subplots. Returned as list totaling the number
-        of axes with length-3 sublists containing the reduction method, a length-1
-        or length-2 list of coordinate reduction keyword arguments, and a named tuple
-        storing the shared plotting-related keyword arguments.
+    dataspecs : list of list of tuple of dict
+        The reduction keyword argument specifications.
+    plotspecs : list of list of kwargs
+        The keyword arguments used for plotting.
+    figlabel : str, optional
+        The default figure title.
+    gridlabels : list of list of str
+        The default row and column labels.
+    pathlabels : list of list of str
+        The default strings for file naming.
     """
-    # Parse variable specs per gridspec row or column and per subplot, and generate
-    # abbrviated figure labels and file names based on the first entries.
+    # Parse variable specs per gridspec row or column and per subplot
     # NOTE: This permits sharing keywords across each group with trailing dicts
     # in either the primary gridspec list or any of the subplot sub-lists.
-    # NOTE: The two data arrays required for two-argument methods can be indicated with
+    # NOTE: The two arrays required for two-argument methods can be indicated with
     # either 2-tuples in spec lists or conflicting row and column names or reductions.
-    filespecs, gridspecs, plotspecs = [], [], []
+    refwidth = None
+    dataspecs, plotspecs, gridlabels, pathlabels = [], [], [], []
     for inspecs in (rowspecs, colspecs):
-        outspecs = []  # specs containing general information
+        datspecs, pltspecs = [], []
         if not isinstance(inspecs, list):
             inspecs = [inspecs]
         for ispecs in inspecs:  # specs per figure
-            ospecs = []
+            dspecs, pspecs = [], []
             if not isinstance(ispecs, list):
                 ispecs = [ispecs]
             for ispec in ispecs:  # specs per subplot
-                ospec = []
-                if isinstance(ispec, (str, dict)):
+                dspec, pspec = [], []
+                if ispec is None:
+                    ispec = (None,)  # possibly construct from keyword args
+                elif isinstance(ispec, (str, dict)):
                     ispec = (ispec,)
                 elif len(ispec) != 2:
                     raise ValueError(f'Invalid variable specs {ispec}.')
@@ -201,44 +615,49 @@ def _parse_specs(dataset, rowspecs, colspecs, **kwargs):
                 else:
                     ispec = tuple(ispec)
                 for spec in ispec:  # specs per correlation pair
-                    kw_red, kw_all = _parse_dicts(dataset, spec, **kwargs)
-                    abbrvs, labels, kw_red = _parse_reduce(dataset, **kw_red)
-                    ospec.append((abbrvs, labels, kw_red, kw_all))
-                ospecs.append(ospec)
-            outspecs.append(ospecs)
-        fspecs, gspecs = _parse_labels(outspecs, refwidth=kwargs.get('refwidth'))
-        plotspecs.append(outspecs)
-        filespecs.append(fspecs)
-        gridspecs.append(gspecs)
+                    kw_dat, kw_plt = _parse_item(dataset, spec, **kwargs)
+                    if value := kw_plt.figure.get('refwidth', None):
+                        refwidth = value
+                    dspec.append(kw_dat)
+                    pspec.append(kw_plt)
+                dspecs.append(tuple(dspec))  # tuple to identify as correlation-pair
+                pspecs.append(tuple(pspec))
+            datspecs.append(dspecs)
+            pltspecs.append(pspecs)
+        zerospecs = [dspecs[0] if dspecs else {} for dspecs in datspecs]
+        pthlabels = _infer_abbrevs(dataset, *zerospecs, identical=False)
+        grdlabels = _infer_labels(
+            dataset,
+            *zerospecs,
+            identical=False,
+            long_names=True,
+            title_case=True,
+            refwidth=refwidth,
+        )
+        gridlabels.append(grdlabels)
+        pathlabels.append(pthlabels)
+        dataspecs.append(datspecs)
+        plotspecs.append(pltspecs)
 
     # Combine row and column specifications for plotting and file naming
-    # NOTE: More than one plotted values per subplot can be indicated in either the
+    # NOTE: Several plotted values per subplot can be indicated in either the
     # row or column list, and the specs from the other list are repeated below.
     # WARNING: Critical to make copies of dictionaries or create new ones
     # here since itertools product repeats the same spec multiple times.
-    def _to_hash(value):
-        if not isinstance(value, tuple):
-            return value
-        elif not all(isinstance(val, tuple) for val in value):
-            return value
-        else:
-            hashes = []
-            for val in value:
-                hash = []
-                for v in val:
-                    if callable(v):  # filter name
-                        h = v.__name__
-                    elif isinstance(v, xr.DataArray):  # groupby array
-                        h = v.name
-                    else:  # e.g. 'avg' string
-                        h = v
-                    hash.append(h)
-                hashes.append(tuple(hash))
-            return tuple(hashes)
-    iter_ = itertools.product(*map(enumerate, plotspecs))
-    nrows, ncols = map(len, plotspecs)
-    plotspecs = []
-    for (i, rspecs), (j, cspecs) in iter_:
+    bothspecs = [
+        [list(zip(dspecs, pspecs)) for dspecs, pspecs in zip(datspecs, pltspecs)]
+        for datspecs, pltspecs in zip(dataspecs, plotspecs)
+    ]
+    kw_infer = dict(
+        keeppairs=False,
+        identical=False,
+        skip_area=True,
+        skip_name=True,
+        long_names=False,
+        title_case=False
+    )
+    dataspecs, plotspecs = [], []
+    for (i, rspecs), (j, cspecs) in itertools.product(*map(enumerate, bothspecs)):
         if len(rspecs) == 1:
             rspecs = list(rspecs) * len(cspecs)
         if len(cspecs) == 1:
@@ -249,67 +668,90 @@ def _parse_specs(dataset, rowspecs, colspecs, **kwargs):
                 + f'\nRow specs ({len(rspecs)}): \n' + '\n'.join(map(repr, rspecs))
                 + f'\nColumn specs ({len(cspecs)}): \n' + '\n'.join(map(repr, cspecs))
             )
-        pspecs = []
+        dspecs, pspecs = [], []
         for k, (rspec, cspec) in enumerate(zip(rspecs, cspecs)):  # subplot entries
-            _, _, rkws_red, rkws_all = zip(*rspec)
-            _, _, ckws_red, ckws_all = zip(*cspec)
+            rkws_dat, rkws_plt, ckws_dat, ckws_plt = *rspec, *cspec
+            kwargs = type((rkws_plt or ckws_plt)[0])
             kws = []
-            for field in KWARGS_ALL._fields:
+            for field in kwargs._fields:
                 kw = {}  # NOTE: previously applied default values here
-                for ikws_all in (rkws_all, ckws_all):
-                    for ikw_all in ikws_all:  # correlation pairs
-                        for key, value in getattr(ikw_all, field).items():
+                for ikws_plt in (rkws_plt, ckws_plt):
+                    for ikw_plt in ikws_plt:  # correlation pairs
+                        for key, value in getattr(ikw_plt, field).items():
                             kw.setdefault(key, value)  # prefer row entries
                 kws.append(kw)
-            kw_all = KWARGS_ALL(*kws)
-            rkws_red = tuple(kw.copy() for kw in rkws_red)  # NOTE: copy is critical
-            ckws_red = tuple(kw.copy() for kw in ckws_red)
-            for ikws_red, jkws_red in ((rkws_red, ckws_red), (ckws_red, rkws_red)):
-                for key in ikws_red[0]:
-                    if key not in ikws_red[-1]:
+            kw_plt = kwargs(*kws)
+            rkws_dat = tuple(kw.copy() for kw in rkws_dat)  # NOTE: copy is critical
+            ckws_dat = tuple(kw.copy() for kw in ckws_dat)
+            for ikws_dat, jkws_dat in ((rkws_dat, ckws_dat), (ckws_dat, rkws_dat)):
+                for key in ikws_dat[0]:
+                    if key not in ikws_dat[-1]:
                         continue
-                    if _to_hash(ikws_red[0][key]) == _to_hash(ikws_red[-1][key]):
-                        for kw in jkws_red:  # possible correlation pair
-                            kw.setdefault(key, ikws_red[0][key])
-            kws_red = {}  # filter unique specifications
-            for kw_red in (*rkws_red, *ckws_red):
-                keyval = tuple(
-                    (key, _to_hash(kw_red[key])) for key in sorted(kw_red)
-                    if key not in ('method',)
-                )
-                if tuple(keyval) in kws_red:
+                    if ikws_dat[0][key] == ikws_dat[-1][key]:
+                        for kw in jkws_dat:  # possible correlation pair
+                            kw.setdefault(key, ikws_dat[0][key])
+            kws_dat = {}  # filter unique specifications
+            for kw_dat in (*rkws_dat, *ckws_dat):
+                keys = ('method', 'std', 'pctile', 'invert')
+                keys = sorted(key for key in kw_dat if key not in keys)
+                keyval = tuple((key, kw_dat[key]) for key in keys)
+                if tuple(keyval) in kws_dat:
                     continue
-                others = tuple(other for other in kws_red if set(keyval) < set(other))
+                others = tuple(other for other in kws_dat if set(keyval) < set(other))
                 if others:
                     continue
-                others = tuple(other for other in kws_red if set(other) < set(keyval))
+                others = tuple(other for other in kws_dat if set(other) < set(keyval))
                 for other in others:  # prefer more selection keywords
-                    kws_red.pop(other)
-                kws_red[tuple(keyval)] = kw_red
-            kws_red = tuple(kws_red.values())
-            if len(kws_red) > 2:
+                    kws_dat.pop(other)
+                kws_dat[tuple(keyval)] = kw_dat
+            kws_dat = tuple(kws_dat.values())  # possible correlation tuple
+            if len(kws_dat) > 2:
                 raise RuntimeError(
-                    'Expected 1-2 specs for combining with apply_method but '
-                    f'got {len(kws_red)} specs: ' + '\n'.join(map(repr, kws_red))
+                    'Expected 1-2 specs for combining with get_data but got '
+                    f'{len(kws_dat)} specs: ' + '\n'.join(map(repr, kws_dat))
                 )
-            pspecs.append((kws_red, kw_all))
+            dspecs.append(kws_dat)
+            pspecs.append(kw_plt)
+        labels = _infer_labels(dataset, *dspecs, **kw_infer)
+        xlabels = _infer_labels(dataset, *(kws[:1] for kws in dspecs), **kw_infer)
+        ylabels = _infer_labels(dataset, *(kws[1:] for kws in dspecs), **kw_infer)
+        ylabels = ylabels or [None] * len(xlabels)
+        for label, xlabel, ylabel, pspec in zip(labels, xlabels, ylabels, pspecs):
+            if label:  # use identical label as fallback
+                pspec.attrs.setdefault('short_prefix', label)
+            if xlabel:
+                pspec.attrs.setdefault('xlabel_prefix', xlabel)
+            if ylabel:
+                pspec.attrs.setdefault('ylabel_prefix', ylabel)
+        dataspecs.append(dspecs)
         plotspecs.append(pspecs)
-
-    # Return the specifications
-    both = [spec for spec in filespecs[0] if spec in filespecs[1]]
-    rows = [spec for spec in filespecs[0] if spec not in both]
-    cols = [spec for spec in filespecs[1] if spec not in both]
-    filespecs = [both, rows, cols]
-    return filespecs, gridspecs, plotspecs
+    ncols = len(colspecs) if len(colspecs) > 1 else len(rowspecs) if len(rowspecs) > 1 else 4  # noqa: E501
+    refwidth = refwidth or pplt.rc['subplots.refwidth']
+    zerospecs = [dspecs[0] if dspecs else {} for dspecs in dataspecs]
+    pthlabels = _infer_abbrevs(dataset, *zerospecs, identical=True)
+    pathlabels.insert(0, pthlabels)  # insert reductions shared across rows-columns
+    subspecs = [dspec for dspecs in dataspecs for dspec in dspecs]
+    figlabels = _infer_labels(
+        dataset,
+        *subspecs,
+        identical=True,
+        long_names=True,
+        title_case='first',  # special value
+        refwidth=2 * ncols * refwidth,  # larger value
+    )
+    figlabel = ' '.join(figlabels)
+    return dataspecs, plotspecs, figlabel, gridlabels, pathlabels
 
 
 def plot_bulk(
     dataset,
-    rowspecs,
-    colspecs,
-    maxcols=3,
+    rowspecs=None,
+    colspecs=None,
+    maxcols=None,
     argskip=None,
     figtitle=None,
+    figprefix=None,
+    figsuffix=None,
     gridskip=None,
     rowlabels=None,
     collabels=None,
@@ -319,14 +761,11 @@ def plot_bulk(
     hlegend='bottom',
     vlegend='bottom',
     dlegend='bottom',
-    horizontal=False,
     standardize=False,
     annotate=False,
     linefit=False,
     oneone=False,
-    pcolor=False,
-    cycle=None,
-    proj='kav7',
+    proj='eqearth',
     proj_kw=None,
     save=None,
     **kwargs
@@ -340,12 +779,15 @@ def plot_bulk(
         A dataset generated by `open_bulk`.
     rowspecs, colspecs : list of 2-tuple
         Tuples containing the ``(name, kwargs)`` passed to ``ClimoAccessor.get``
-        used to generate data in rows and columns. See `_parse_specs` for details.
+        used to generate data in rows and columns. See `_parse_bulk` for details.
     figtitle, rowlabels, collabels : optional
         The figure settings. The labels are determined automatically from
         the specs but can be overridden in a pinch.
+    figprefix, figsuffix : str, optional
+        Optional modifications to the default figure title determined
+        from shared reduction instructions.
     maxcols : int, optional
-        The maximum number of columns. Used only if one of the row or variable
+        The default number of columns. Used only if one of the row or variable
         specs is scalar (in which case there are no row or column labels).
     argskip : int or sequence, optional
         The axes indices to omit from auto color scaling in each group of axes
@@ -388,8 +830,10 @@ def plot_bulk(
         type plots. Default is ``{'lon_0': 180}``.
     save : path-like, optional
         The save folder base location. Stored inside a `figures` subfolder.
+    cycle, pcolor, horizontal : optional
+        Passed to `_infer_command`.
     **kw_specs
-        Passed to `_parse_specs`.
+        Passed to `_parse_bulk`.
     **kw_method
         Passed to `apply_method`.
 
@@ -407,29 +851,26 @@ def plot_bulk(
     # shadestd, shadepctile, etc. methods instead of using map. See apply_method.
     argskip = np.atleast_1d(() if argskip is None else argskip)
     gridskip = np.atleast_1d(() if gridskip is None else gridskip)
-    filespecs, gridspecs, plotspecs = _parse_specs(dataset, rowspecs, colspecs, **kwargs)  # noqa: E501
-    nrows, ncols = map(len, gridspecs)
+    dataspecs, plotspecs, figlabel, gridlabels, pathlabels = _parse_bulk(
+        dataset, rowspecs, colspecs, **kwargs
+    )
+    figtitle = figtitle or figlabel
+    nrows, ncols = map(len, gridlabels)
     nrows, ncols = max(nrows, 1), max(ncols, 1)
     titles = (None,) * nrows * ncols
+    if figsuffix:
+        figtitle = ' '.join((figtitle, figsuffix))
+    if figprefix:
+        end = figtitle if figtitle[:2].isupper() else figtitle[0].lower() + figtitle[1:]  # noqa: E501
+        start = figprefix if figprefix[:1].isupper() else figprefix[0].upper() + figprefix[1:]  # noqa: E501
+        figtitle = ' '.join((start, end))
     if nrows == 1 or ncols == 1:
         naxes = gridskip.size + max(nrows, ncols)
-        ncols = min(naxes, maxcols)
+        ncols = min(naxes, maxcols or 4)
         nrows = 1 + (naxes - 1) // ncols
-        titles = max(gridspecs, key=lambda labels: len(labels))
-        gridspecs = (None, None)
-    cycle = pplt.Cycle(cycle or ['blue7', 'red7', 'yellow7', 'gray7'])
-    colors = pplt.get_colors(cycle)
-    kw_annotate = {'fontsize': 'x-small', 'textcoords': 'offset points'}
-    kw_contour = {'robust': 96, 'nozero': True, 'linewidth': pplt.rc.metawidth}
-    kw_contourf = {'levels': 20, 'extend': 'both'}
-    kws_contour = []
-    kws_contour.append({'color': 'gray8', 'linestyle': None, **kw_contour})
-    kws_contour.append({'color': 'gray3', 'linestyle': ':', **kw_contour})
-    kw_bar = {'linewidth': pplt.rc.metawidth, 'edgecolor': 'black', 'width': 1.0}
-    kw_line = {'linestyle': '-', 'linewidth': 1.5 * pplt.rc.metawidth}
-    kw_scatter = {'color': 'gray7', 'linewidth': 1.5 * pplt.rc.metawidth}
-    kw_scatter.update({'marker': 'x', 'markersize': 0.1 * pplt.rc.fontsize ** 2})
-    kw_violin = {'means': True, 'boxmarkercolor': 'w'}
+        titles = max(gridlabels, key=lambda labels: len(labels))
+        titles = titles or (None,) * nrows * ncols
+        gridlabels = (None, None)
 
     # Iterate over axes and plots
     # NOTE: Critical to disable 'grouping' so that e.g. colorbars or legends that
@@ -438,245 +879,86 @@ def plot_bulk(
     proj = pplt.Proj(proj, **(proj_kw or {'lon_0': 180}))
     methods = []
     commands = {}
-    iterator = zip(titles, plotspecs)
+    iterator = zip(titles, dataspecs, plotspecs)
     print('Getting data...', end=' ')
     for i in range(nrows * ncols):
         if i in gridskip:
             continue
         print(f'{i + 1}/{nrows * ncols}', end=' ')
         ax = None  # restart the axes
-        cmds = []
         aunits = set()
         asizes = set()
         try:
-            title, pspecs = next(iterator)
+            title, dspecs, pspecs = next(iterator)
         except StopIteration:
             continue
-        for j, (kws_red, kw_all) in enumerate(pspecs):
-            # Group added/subtracted reduce instructions into separate dictionaries
-            # NOTE: Initial kw_red values are formatted as (('[+-]', value), ...) to
-            # permit arbitrary combinations of names and indexers (see _parse_specs).
-            kws_method = []  # each item represents a method argument
-            for kw in kws_red:
-                kw_extra, kw_reduce, scale = {}, {}, 1
-                for key, value in kw.items():
-                    filt = lambda val: isinstance(val, str) and val == '+'
-                    if isinstance(value, tuple) and isinstance(value[0], tuple):
-                        kw, count = kw_reduce, sum(filt(_) for vals in value for _ in vals)  # noqa: E501
-                    else:
-                        kw, count = kw_extra, 1  # e.g. a 'std' or 'pctile' keyword
-                    kw[key] = value
-                    scale *= count
-                kws_persum = []
-                for values in itertools.product(*kw_reduce.values()):
-                    signs, values = zip(*values)
-                    sign = -1 if signs.count('-') % 2 else +1
-                    kw = dict(zip(kw_reduce, values))
-                    kw.update(kw_extra)
-                    kws_persum.append((sign, kw))
-                kws_method.append((scale, kws_persum))
-
-            # Reduce along facets dimension and carry out operation
-            # TODO: Add other possible reduction methods, e.g. covariance
-            # or regressions instead of normalized correlation.
-            scales, kws_method = zip(*kws_method)
-            if len(set(scales)) > 1:
-                raise RuntimeError(f'Mixed reduction scalings {scales}.')
-            all_membs, all_projs = True, False
-            kws_persum = zip(*kws_method)
-            datas_persum = []  # each item represents part of a summation
-            methods_persum = set()
-            for kws_reduce in kws_persum:
-                kw_method = {}
-                keys = ('std', 'pctile', 'invert', 'method')
-                datas = []
-                signs, kws_reduce = zip(*kws_reduce)
-                if len(set(signs)) > 1:
-                    raise RuntimeError(f'Mixed reduction signs {signs}.')
-                for kw_reduce in kws_reduce:  # two for e.g. 'corr', one for e.g. 'avg'
-                    for key in tuple(kw_reduce):
-                        if key in keys:
-                            kw_method.setdefault(key, kw_reduce.pop(key))
-                    institute = kw_reduce.get('institute', None)
-                    project = getattr(kw_reduce.get('project'), '__name__', None)
-                    all_membs = all_membs and institute is None
-                    all_projs = all_projs or project in ('cmip', 'cmip5665', 'cmip6556')
-                    attrs = kw_all.attrs.copy()
-                    data = apply_reduce(dataset, attrs=attrs, **kw_reduce)
-                    datas.append(data)
-                datas, method = apply_method(*datas, **kw_method)
-                if isinstance(datas[-1], dict):
-                    *datas, kw = datas
-                    for key, val in kw.items():
-                        kw_all.plot.setdefault(key, val)
-                datas_persum.append((signs[0], datas))  # plotting command arguments
-                methods_persum.add(method)
-                if len(methods_persum) > 1:
-                    raise RuntimeError(f'Mixed reduction methods {methods_persum}.')
-            args = []
-            signs, datas_persum = zip(*datas_persum)
-            for datas in zip(*datas_persum):
-                with xr.set_options(keep_attrs=True):
-                    arg = sum(sign * data for sign, data in zip(signs, datas))
-                    arg = arg / scales[0]
-                if isinstance(arg, xr.DataArray):
-                    names = (data.name for data in datas if hasattr(data, 'name'))
-                    longs = (data.long_name for data in datas if hasattr(data, 'long_name'))  # noqa: E501
-                    arg.name = '-'.join(names)
-                    arg.attrs['long_name']
-                args.append(arg)
-
-            # Instantiate and setup the figure, gridspec, axes
-            # NOTE: Here creation is delayed so we can pass arbitrary loose keyword
-            # arguments for relevant objects and parse them in _parse_dicts.
+        for j, (kws_dat, kw_plt) in enumerate(zip(dspecs, pspecs)):
+            # Generate the data arrays and plotting keyword arguments
+            # NOTE: Here `kws_dat` should be singleton tuple or several tuples
+            # for taking e.g. correlations or regressions of two quantities.
+            attrs = kw_plt.attrs.copy()
+            args, method, default = get_data(dataset, *kws_dat, attrs=attrs)
+            for key, value in default.items():
+                kw_plt.command.setdefault(key, value)
             sizes = args[-1].sizes.keys() - {'facets', 'version', 'period'}
             asizes.add(tuple(sorted(sizes)))
             sharex = True if 'lat' in sizes or 'plev' in sizes else 'labels'
             sharey = True if 'lat' in sizes or 'plev' in sizes else 'labels'
             kw_fig = {'sharex': sharex, 'sharey': sharey, 'spanx': False, 'spany': False}  # noqa: E501
             kw_axs = {'title': title}  # possibly none
-            dims = ('geo',) if sizes == {'lon', 'lat'} else sizes & {'lat', 'plev'}
-            projection = proj if sizes == {'lon', 'lat'} else 'cartesian'
-            kw_def = {key: val for dim in dims for key, val in KWARGS_DEFAULT[dim].items()}  # noqa: E501
+            defaults = ['fig']  # default kwargs
+            if sizes == {'lon', 'lat'}:
+                projection = proj
+                defaults.append('geo')
+            else:
+                projection = 'cartesian'
+                defaults.extend(sizes & {'lat', 'plev'})
+            kw_def = {key: val for k in defaults for key, val in KWARGS_DEFAULT[k].items()}  # noqa: E501
             kw_fig.update(refwidth=kw_def.pop('refwidth', None))
             kw_axs.update(kw_def)
             for key, value in kw_fig.items():
-                kw_all.figure.setdefault(key, value)
+                kw_plt.figure.setdefault(key, value)
             for key, value in kw_axs.items():
-                kw_all.axes.setdefault(key, value)
+                kw_plt.axes.setdefault(key, value)
+
+            # Instantiate objects and infer the plotting command
+            # NOTE: Delay object creation until this block so we can pass arbitrary
+            # loose keyword arguments and simply parse them in _parse_item.
             if fig is None:
-                fig = pplt.figure(**kw_all.figure)
+                fig = pplt.figure(**kw_plt.figure)
             if gs is None:
-                gs = pplt.GridSpec(nrows, ncols, **kw_all.gridspec)
+                gs = pplt.GridSpec(nrows, ncols, **kw_plt.gridspec)
             if ax is None:
-                ax = jax = fig.add_subplot(gs[i], projection=projection, **kw_all.axes)
+                ax = jax = fig.add_subplot(gs[i], projection=projection, **kw_plt.axes)
             if len(asizes) > 1:
                 raise ValueError(f'Conflicting plot types with spatial coordinates {asizes}.')  # noqa: E501
             if hasattr(ax, 'alty') != (projection == 'cartesian'):
                 raise ValueError(f'Invalid projection for spatial coordinates {sizes}.')
-            cmds.append((jax, args, method, kw_all))  # TODO: use this
-
-            # Apply default plotting command arguments
-            # NOTE: This automatically generates alternate axes depending on the
-            # units of the datas. Currently works only for 1-dimensional plots.
             nunits = len(aunits)
-            units = args[-1].attrs['units']  # avoid numpy coordinates
-            aunits.add(units)
-            if len(sizes) == 0 and len(pspecs) == 1:
-                if all_membs:
-                    _, _, filt = _parse_institute(dataset, 'flagship')
-                    bools_flags = [filt(facet) for facet in args[-1].facets.values]
-                if all_projs:
-                    _, _, filt = _parse_project(dataset, 'cmip65')
-                    bools_cmip65 = [filt(facet) for facet in args[-1].facets.values]
-                    _, _, filt = _parse_project(dataset, 'cmip66')
-                    bools_cmip66 = [filt(facet) for facet in args[-1].facets.values]
-                if len(args) == 2 and isinstance(args[0], xr.DataArray):
-                    command = 'scatter'
-                    color = kw_all.plot.get('color', 'gray7')
-                    size = (0.5 * pplt.rc['lines.markersize']) ** 2
-                    if all_projs:  # faded colors for cmip5 project
-                        color = [
-                            pplt.set_alpha('gray8', 1 if b66 else 0.6 if b65 else 0.2)
-                            for b65, b66 in zip(bools_cmip65, bools_cmip66)
-                        ]
-                        kw_all.plot.setdefault('color', color)
-                    if all_membs:  # larger markers for institution flagships
-                        size = [(0.5 * size, 1.5 * size)[b] for b in bools_flags]
-                        kw_all.plot.update(sizes=size, absolute_size=True)
-                    for key, value in kw_scatter.items():
-                        kw_all.plot.setdefault(key, value)
-                else:
-                    command = 'barh' if horizontal else 'bar'
-                    ax.format(**{'ylocator' if horizontal else 'xlocator': 'null'})
-                    color = [('blue7', 'red7')[val > 0] for val in args[-1].values]
-                    color = ['gray8' if units == 'W m^-2' else c for c in color]
-                    color = ['gray8' if units == 'K' else c for c in color]
-                    kw_all.plot.setdefault('color', color)
-                    if all_projs:  # faded colors for cmip5 project
-                        color = [
-                            pplt.set_alpha(c, 1 if b66 else 0.6 if b65 else 0.2)
-                            for c, b65, b66 in zip(color, bools_cmip65, bools_cmip66)
-                        ]
-                        edgecolor = [
-                            pplt.set_alpha('k', 1 if b66 else 0.6 if b65 else 0.2)
-                            for c, b65, b66 in zip(color, bools_cmip65, bools_cmip66)
-                        ]
-                        linewidth = [
-                            pplt.rc.metawidth * (1 if b66 else 1 if b65 else 0.4)
-                            for b65, b66 in zip(bools_cmip65, bools_cmip66)
-                        ]
-                        kw_all.plot.update(color=color, edgecolor=edgecolor, linewidth=linewidth)  # noqa: E501
-                    if all_membs:  # hatching for institution flagships
-                        hatch = [(None, '//////')[b] for b in bools_flags]
-                        kw_all.plot.update(hatch=hatch)
-                    for key, value in kw_bar.items():
-                        kw_all.plot.setdefault(key, value)
-            elif len(sizes) == 0 and len(pspecs) > 1:
-                if len(args) == 1 or not isinstance(args[0], xr.DataArray):
-                    command = 'violinh' if horizontal else 'violin'
-                    color = colors[j % len(colors)]
-                    args = (j, args[-1:])
-                    for key, value in kw_violin.items():
-                        kw_all.plot.setdefault(key, value)
-                else:  # comparison of correlations or r-squared values
-                    command = 'barh' if horizontal else 'bar'
-                    cov, std1, std2 = apply_variance(*args, both=True)
-                    corr = cov / (std1 * std2)
-                    err = (1 - corr ** 2) / np.sqrt(args[0].size - 2)
-                    args = (j, corr)  # TODO: add labels
-                    kw_all.plot.setdefault('barstd', err)
-                    for key, value in kw_bar.items():
-                        kw_all.plot.setdefault(key, value)
-            elif len(sizes) == 1:
-                if 'plev' in sizes:
-                    command = 'linex'
-                    color = colors[j % len(colors)]
-                    jax = ax
-                    if nunits and nunits != len(aunits):
-                        jax = ax.altx(color=color)  # noqa: E501
-                    else:
-                        jax = ax
-                    kw_all.plot.setdefault('color', color)
-                    for key, value in kw_line.items():
-                        kw_all.plot.setdefault(key, value)
-                else:
-                    command = 'line'
-                    color = colors[j % len(colors)]
-                    jax = ax
-                    if nunits and nunits != len(aunits):
-                        jax = ax.alty(color=color)
-                    else:
-                        jax = ax
-                    kw_all.plot.setdefault('color', color)
-            elif len(sizes) == 2:
-                if 'hatches' in kw_all.plot:
-                    command = 'contourf'
-                elif j == 0:
-                    command = 'pcolormesh' if pcolor else 'contourf'
-                    kw_all.plot.setdefault('robust', 98)
-                    for key, value in kw_contourf.items():
-                        kw_all.plot.setdefault(key, value)
-                else:
-                    command = 'contour'
-                    kw_all.plot.setdefault('labels', True)
-                    for key, value in kws_contour[j - 1].items():
-                        kw_all.plot.setdefault(key, value)
-            else:
-                raise ValueError(f'Invalid dimension count {len(sizes)} and sizes {sizes}.')  # noqa: E501
+            aunits.add(args[-1].attrs['units'])
+            kw = kw_plt.command.copy()
+            horizontal = kw.get('horizontal', False)
+            kw['alternate'] = nunits and nunits != len(aunits)
+            kw['multiple'] = len(pspecs) > 1
+            kw['label'] = i % ncols == 0 if horizontal else i >= (nrows - 1) * ncols
+            jax, command, args, kw = _infer_command(*args, num=j, ax=ax, **kw)
+            kw_plt.command.clear()
+            kw_plt.command.update(kw)
 
             # Queue the plotting command
             # NOTE: This will automatically allocate separate colorbars for
             # variables with different declared level-restricting arguments.
             args = tuple(args)
-            name = '-'.join(arg.name for arg in args if isinstance(arg, xr.DataArray))
-            cmap = kw_all.plot.get('cmap', None)
+            name = '_'.join(arg.name for arg in args if isinstance(arg, xr.DataArray))
+            cmap = kw_plt.command.get('cmap', None)
             cmap = tuple(cmap) if isinstance(cmap, list) else cmap
-            color = kw_all.plot.get('color', None)
+            color = kw_plt.command.get('color', None)
             color = tuple(color) if isinstance(color, list) else color
-            key = (name, method, command, cmap, color)
+            size = kw_plt.command.get('sizes', None)
+            size = tuple(size) if isinstance(size, list) else size
+            key = (name, method, command, cmap, color, size)
             values = commands.setdefault(key, [])
-            values.append((jax, args, kw_all))
+            values.append((jax, args, kw_plt))
             if method not in methods:
                 methods.append(method)
 
@@ -691,24 +973,25 @@ def plot_bulk(
         # NOTE: Here 'argskip' is isued to skip arguments with vastly different
         # ranges when generating levels that annotate multiple different subplots.
         print(f'{k + 1}/{len(commands)}', end=' ')
-        name, method, command, cmap, color = key
-        axs, args, kw_all = zip(*values)
-        kw_cba, kw_leg, kw_plt = {}, {}, {}
-        for kw in kw_all:
-            kw_cba.update(kw.colorbar)
-            kw_leg.update(kw.legend)
-            kw_plt.update(kw.plot)
+        name, method, command, cmap, color, *_ = key
+        axs, args, kws_plt = zip(*values)
+        kw_cba = {key: val for kw_plt in kws_plt for key, val in kw_plt.colorbar.items()}  # noqa: E501
+        kw_leg = {key: val for kw_plt in kws_plt for key, val in kw_plt.legend.items()}  # noqa: E501
+        kws_cmd = [kw_plt.command.copy() for kw_plt in kws_plt]
+        hatches = any('hatches' in kw for kw in kws_cmd)
         if command in ('contour', 'contourf', 'pcolormesh'):
             xy = (args[0][-1].coords[dim] for dim in args[0][-1].dims)
             zs = (a for l, arg in enumerate(args) for a in arg if l % ncols not in argskip)  # noqa: E501
-            kw_add = {key: kw_plt[key] for key in ('extend',) if key in kw_plt}
-            levels, *_, kw_plt = axs[0]._parse_level_vals(*xy, *zs, norm_kw={}, **kw_plt)  # noqa: E501
-            kw_plt.update({**kw_add, 'levels': levels})
-            kw_plt.pop('robust', None)
-        if command in ('contourf', 'pcolormesh') and 'hatches' not in kw_plt:
+            kw = {key: val for kw_plt in kws_plt for key, val in kw_plt.command.items()}
+            keep = {key: kw[key] for key in ('extend',) if key in kw}
+            levels, *_, kw = axs[0]._parse_level_vals(*xy, *zs, norm_kw={}, **kw)  # noqa: E501
+            kw.update({**keep, 'levels': levels})
+            kw.pop('robust', None)
+            kws_cmd = [kw] * len(args)
+        if not hatches and command in ('contourf', 'pcolormesh'):
             guide, kw_guide = 'colorbar', kw_cba
             label = args[0][-1].climo.short_label
-            label = re.sub(r' \(', '\n(', label)
+            label = _infer_newlines(label, refwidth=ax.figure._refwidth, scale=0.8)
             locator = pplt.DiscreteLocator(levels, nbins=7)
             minorlocator = pplt.DiscreteLocator(levels, nbins=7, minor=True)
             kw_guide.setdefault('locator', locator)
@@ -716,167 +999,50 @@ def plot_bulk(
             kw_guide.setdefault('extendsize', 1.2 + 0.6 * (ax._name != 'cartesian'))
         else:  # TODO: permit short *or* long
             guide, kw_guide = 'legend', kw_leg
-            accessor = args[0][-1].climo
-            label = accessor.short_label if command == 'contour' else accessor.long_name
-            label = None if 'hatches' in kw_plt else label
-            keys = ('robust', 'symmetric', 'diverging', 'levels', 'locator', 'extend')
-            keys = () if 'contour' in command or 'pcolor' in command else keys
-            keys += ('cmap', 'norm', 'norm_kw')
-            kw_plt = {key: val for key, val in kw_plt.items() if key not in keys}
+            variable = args[0][-1].climo.cfvariable
+            label = variable.short_label if command == 'contour' else variable.short_name  # noqa: E501
+            label = None if hatches else label
+            keys = ['cmap', 'norm', 'norm_kw']
+            if 'contour' not in command and 'pcolor' not in command:
+                keys.extend(('robust', 'symmetric', 'diverging', 'levels', 'locator', 'extend'))  # noqa: E501
             kw_guide.setdefault('ncols', 1)
             kw_guide.setdefault('frame', False)
+            kws_cmd, kws = [], kws_cmd
+            for kw in kws:
+                kws_cmd.append({key: val for key, val in kw.items() if key not in keys})
 
-        # Iterate over axes and arguments
-        obj = result = None
-        for l, (ax, arg) in enumerate(zip(axs, args)):
-            # Add plotted content and formatting
-            # NOTE: Bar plots support 'list of' hatch arguments alongside linewidth,
-            # edgecolor, and color, even though it is not listed in documentation.
-            # TODO: Support hist and hist2d plots in addition to scatter and barh plots
-            # (or just hist since, hist2d usually looks ugly with so little data)
-            if ax._name == 'cartesian':  # x-axis formatting
-                if command in ('bar',):
-                    x = None
-                elif command in ('barh',):
-                    x = arg[-1]
-                elif command in ('linex', 'scatter'):
-                    x = arg[0]
-                else:
-                    x = arg[-1].coords[arg[-1].dims[-1]]  # e.g. contour() is y by x
-                units = getattr(x, 'units', None)
-                axes = axs_units.setdefault(('x', units), [])
-                axes.append(ax)
-                xlabel = x.climo.short_label if 'units' in getattr(x, 'attrs', {}) else None  # noqa: E501
-                if not ax.get_xlabel():
-                    rows = ax._get_topmost_axes()._range_subplotspec('y')
-                    if ax == ax._get_topmost_axes() or max(rows) == nrows - 1:
-                        ax.set_xlabel(xlabel)
-            if ax._name == 'cartesian':  # y-axis formatting
-                if command in ('barh',):
-                    y = None
-                elif command in ('bar', 'line', 'scatter'):
-                    y = arg[-1]
-                else:
-                    y = arg[-1].coords[arg[-1].dims[0]]
-                units = getattr(y, 'units', None)
-                axes = axs_units.setdefault(('y', units), [])
-                axes.append(ax)
-                ylabel = y.climo.short_label if 'units' in getattr(y, 'attrs', {}) else None  # noqa: E501
-                if not ax.get_ylabel():
-                    cols = ax._get_topmost_axes()._range_subplotspec('x')
-                    if ax == ax._get_topmost_axes() or max(cols) == ncols - 1:
-                        ax.set_ylabel(ylabel)
-            with warnings.catch_warnings():  # ignore 'masked to nan'
-                warnings.simplefilter('ignore', UserWarning)
-                result = getattr(ax, command)(*arg, **kw_plt)
-                if 'line' in command:  # silent list or tuple
-                    obj = result[0][1] if isinstance(result[0], tuple) else result[0]
-                elif command == 'contour' and result.collections:
-                    obj = result.collections[-1]
-                elif command in ('contourf', 'pcolormesh'):
-                    obj = result
-                else:  # e.g. bar, violin, scatter
-                    pass
-
-            # Add other content
-            # NOTE: Want to disable autoscaling based on zero line but not currently
-            # possible with convenience functions axvline and axhline. Instead use
-            # manual plot(). See: https://github.com/matplotlib/matplotlib/issues/14651
-            # NOTE: Using set_in_layout False significantly improves appearance since
-            # generally don't mind overlapping with tick labels for scatter plots and
-            # improves draw time since tight bounding box calculation is expensive.
-            if ax == ax._get_topmost_axes() and ('bar' in command or 'line' in command):
-                kw = {
-                    'color': 'black',
-                    'scalex': False,
-                    'scaley': False,
-                    'linestyle': '-',
-                    'linewidth': 1.25 * pplt.rc.metawidth,
-                }
-                if command in ('bar', 'line', 'vlines'):
-                    transform = ax.get_yaxis_transform()
-                    ax.plot([0, 1], [0, 0], transform=transform, **kw)
-                else:
-                    transform = ax.get_xaxis_transform()
-                    ax.plot([0, 0], [0, 1], transform=transform, **kw)
-            if command == 'scatter':
-                if annotate:
-                    xlim, ylim = ax.get_xlim(), ax.get_ylim()
-                    width, _ = ax._get_size_inches()
-                    diff = (pplt.rc.fontsize / 72) * (max(xlim) - min(xlim)) / width
-                    xmax = xlim[1] + 5 * diff if ax.get_autoscalex_on() else None
-                    ymin = ylim[0] - 1 * diff if ax.get_autoscaley_on() else None
-                    ax.format(xmax=xmax, ymin=ymin)  # skip if overridden by user
-                    for x, y in zip(*arg):  # iterate over scalar arrays
-                        kw = {'ha': 'left', 'va': 'top', **kw_annotate}
-                        tup = x.facets.item()  # multi-index is destroyed
-                        model = tup[1] if 'CMIP' in tup[0] else tup[0]
-                        res = ax.annotate(model, (x.item(), y.item()), (2, -2), **kw)
-                        res.set_in_layout(False)
-                if oneone:
-                    lim = (*ax.get_xlim(), *ax.get_ylim())
-                    lim = (min(lim), max(lim))
-                    avg = 0.5 * (lim[0] + lim[1])
-                    span = lim[1] - lim[0]
-                    ones = (avg - 1e3 * span, avg + 1e3 * span)
-                    ax.format(xlim=lim, ylim=lim)  # autoscale disabled
-                    ax.plot(ones, ones, ls='--', lw=1.5 * pplt.rc.metawidth, color='k')
-                if linefit:  # https://en.wikipedia.org/wiki/Simple_linear_regression
-                    idx = np.argsort(arg[0].values)
-                    x, y = arg[0].values[idx], arg[1].values[idx]
-                    slope, stderr, rsquare, fit, lower, upper = var.linefit(x, y, adjust=False)  # noqa: E501
-                    rsquare = ureg.Quantity(rsquare.item(), '').to('percent')
-                    ax.format(ultitle=rf'$R^2 = {rsquare:~L.1f}$'.replace('%', r'\%'))
-                    ax.plot(x, fit, color='r', ls='-', lw=1.5 * pplt.rc.metawidth)
-                    ax.area(x, lower, upper, color='r', alpha=0.5 ** 2, lw=0)
-            if 'bar' in command or 'lines' in command:
-                for container in result:
-                    container = container if np.iterable(container) else (container,)
-                    for artist in container:
-                        artist.sticky_edges.x.clear()
-                        artist.sticky_edges.y.clear()
-                if annotate:
-                    xlim, ylim = ax.get_xlim(), ax.get_ylim()
-                    if command == 'bar':
-                        height, _ = ax._get_size_inches()
-                        diff = (pplt.rc.fontsize / 72) * (max(ylim) - min(ylim)) / height  # noqa: E501
-                        along, across = 5 * diff, 0.5 * diff
-                        ymin = ylim[0] - along * np.any(arg[-1] < 0)
-                        ymax = ylim[1] + along * np.any(arg[-1] > 0)
-                        xmin, xmax = xlim[0] - across, xlim[1] + across
-                    else:
-                        width, _ = ax._get_size_inches()
-                        diff = (pplt.rc.fontsize / 72) * (max(xlim) - min(xlim)) / width
-                        along, across = 5 * diff, 0.5 * diff
-                        xmin = xlim[0] - along * np.any(arg[-1] < 0)
-                        xmax = xlim[1] + along * np.any(arg[-1] > 0)
-                        ymin, ymax = ylim[0] - across, ylim[1] + across
-                    xlim = (xmin, xmax) if ax.get_autoscalex_on() else None
-                    ylim = (ymin, ymax) if ax.get_autoscaley_on() else None
-                    ax.format(xlim=xlim, ylim=ylim)  # skip if overridden by user
-                    for i, a in enumerate(arg[-1]):  # iterate over scalar arrays
-                        if command == 'bar':
-                            va = 'bottom' if a > 0 else 'top'
-                            kw = {'ha': 'center', 'va': va, 'rotation': 90, **kw_annotate}  # noqa: E501
-                            xy = (i, a.item())
-                            xytext = (0, 2 if a > 0 else -2)
-                        else:
-                            ha = 'left' if a > 0 else 'right'
-                            kw = {'ha': ha, 'va': 'center', **kw_annotate}
-                            xy = (a.item(), i)
-                            xytext = (2 if a > 0 else -2, 0)
-                        tup = a.facets.item()  # multi-index is destroyed
-                        model = tup[1] if 'CMIP' in tup[0] else tup[0]
-                        res = ax.annotate(model, xy, xytext, **kw)
-                        res.set_in_layout(False)
-
-        # Update legend and colorbar queues
+        # Add plotted content and queue guide instructions
         # NOTE: Commands are grouped so that levels can be synchronized between axes
         # and referenced with a single colorbar... but for contour and other legend
         # entries only the unique labels and handle properties matter. So re-group
         # here into objects with unique labels by the rows and columns they span.
         # WARNING: Must record rows and columns here instead of during iteration
         # over legends and colorbars because hidden panels will change index.
+        obj = result = None
+        for l, (ax, dats, kw_cmd) in enumerate(zip(axs, args, kws_cmd)):
+            cmd = getattr(ax, command)
+            vals = dats
+            if command in ('bar', 'barh', 'box', 'boxh', 'violin', 'violinh'):
+                vals = [da.values if isinstance(da, xr.DataArray) else da for da in dats]  # noqa: E501
+            with warnings.catch_warnings():  # ignore 'masked to nan'
+                warnings.simplefilter('ignore', UserWarning)
+                result = cmd(*vals, **kw_cmd)
+            if 'line' in command:  # silent list or tuple
+                obj = result[0][1] if isinstance(result[0], tuple) else result[0]
+            elif command == 'contour' and result.collections:
+                obj = result.collections[-1]
+            elif command in ('contourf', 'pcolormesh'):
+                obj = result
+            if ax._name == 'cartesian':
+                xunits, yunits = _adjust_format(ax, command, *dats)
+                axs_units.setdefault(('x', xunits), []).append(ax)
+                axs_units.setdefault(('y', yunits), []).append(ax)
+            if 'bar' in command or 'lines' in command:
+                kw = dict(horizontal=(command == 'barh'), annotate=annotate)
+                _adjust_bars(ax, dats[1], result, **kw)
+            if command == 'scatter':
+                kw = dict(annotate=annotate, oneone=oneone, linefit=linefit)
+                _adjust_points(ax, *dats, **kw)
         if not obj or not label:
             continue
         if command in ('contourf', 'pcolormesh'):
@@ -892,6 +1058,7 @@ def plot_bulk(
     # TODO: Should support colorbars spanning multiple columns or rows in the
     # center of the gridspec in addition to figure edges.
     print('\nAdding guides...')
+    handles = {}
     for key, objs in axs_objs.items():
         *_, guide, label = key
         axs, rows, cols, objs, kws_guide = zip(*objs)
@@ -939,14 +1106,18 @@ def plot_bulk(
         if guide == 'colorbar':
             result = src.colorbar(objs[0], label=label, loc=loc, **kw_guide)
         else:
-            result = src.legend(objs[0], label, loc=loc, queue=True, **kw_guide)
+            handles.setdefault(src, []).append((objs[0], label, loc, kw_guide))
+    for src, tups in handles.items():  # support 'queue' for figure legends
+        objs, labels, locs, kws = zip(*tups)
+        kw = {key: val for kw in kws for key, val in kw.items()}
+        src.legend(list(objs), list(labels), loc=locs[0], **kw)
 
     # Format the axes and optionally save
     # NOTE: Here default labels are overwritten with non-none 'rowlabels' or
     # 'collabels', and the file name can be overwritten with 'save'.
     kw = {}
     custom = {'rowlabels': rowlabels, 'collabels': collabels}
-    default = dict(zip(('rowlabels', 'collabels'), gridspecs))
+    default = {'rowlabels': gridlabels[0], 'collabels': gridlabels[1]}
     for (key, clabels), (_, dlabels) in zip(custom.items(), default.items()):
         nlabels = nrows if key == 'rowlabels' else ncols
         clabels = clabels or [None] * nlabels
@@ -972,12 +1143,16 @@ def plot_bulk(
             for ax, lim in zip(axes, lims):
                 getattr(ax, f'set_{axis}lim')(lim)
     if save:
-        path = Path(save).expanduser()
+        if save is True:
+            path = Path()  # current directory
+        else:
+            path = Path(save).expanduser()
         if '.pdf' not in path.name:
-            name = '-'.join(methods) + '_'
-            name += '_'.join('-'.join(specs) for specs in filespecs if specs)
+            path = path / 'figures'
             path.mkdir(exist_ok=True)
-            path = path / 'figures' / f'{name}.pdf'
+            name = '-'.join(methods) + '_'
+            name += '_'.join('-'.join(labs) for labs in pathlabels if labs)
+            path = path / f'{name}.pdf'
         print(f'Saving {path.parent}/{path.name}...')
         fig.save(path)
     return fig, fig.subplotgrid

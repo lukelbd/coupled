@@ -2,8 +2,6 @@
 """
 Templates for figures detailing coupled model output.
 """
-import collections
-import itertools
 import warnings
 from pathlib import Path
 
@@ -13,11 +11,11 @@ from icecream import ic  # noqa: F401
 
 import proplot as pplt
 from climopy import decode_units, format_units, ureg, var, vreg  # noqa: F401
-from .internals import _apply_method, _parse_institute, _parse_project, get_data
-from .internals import _infer_abbrevs, _infer_labels, _infer_newlines
+from .process import _apply_method, _parse_institute, _parse_project, get_data
+from .internals import _wrap_label, parse_specs
 
+__all__ = ['breakdown_feedbacks', 'breakdown_transport', 'plot_general']
 
-# Figure and axes default keyword arguments
 KWARGS_DEFAULT = {
     'fig': {
         'refwidth': 1.5,
@@ -189,7 +187,9 @@ def _adjust_format(ax, command, *args, refwidth=None):
     top = ax._get_topmost_axes()
     args = list(args)
     nrows, ncols, *_ = top.get_subplotspec()._get_geometry()  # custom geometry function
-    refwidth = 1.5 * ax.figure._refwidth  # permit overlap
+    cartesian = ax._name == 'cartesian'
+    refwidth = ax.figure._refwidth
+    refscale = 1.3 if cartesian else 0.8  # applied for y-axis labels only
     kw_zero = {
         'color': 'black',
         'scalex': False,
@@ -225,14 +225,18 @@ def _adjust_format(ax, command, *args, refwidth=None):
         #     ax.format(xgrid=False, xlocator=1, xtickminor=False, xformatter='null')
     else:
         x = x.copy()
-        x.attrs.pop('short_prefix', None)  # ignore legend indicators
+        xlabel = ''
         xunits = x.attrs.get('units', None)
-        xprefix = x.attrs.get('xlabel_prefix', None)  # keep scatter prefix
-        if command == 'scatter' and len(xprefix) < 20:  # see _parse_bulk
+        xprefix = x.attrs.get('xlabel_prefix', '')
+        x.attrs.pop('short_prefix', None)  # ignore legend indicators
+        if command == 'scatter' and len(xprefix) < 20:
             x.attrs['short_prefix'] = xprefix
-        xlabel = x.climo.short_label if xunits is not None else None
+        if 'short_name' not in x.attrs:
+            x.attrs['short_name'] = ''
+        if xunits is not None:
+            xlabel = x.climo.short_label
         if ncols > 1:
-            xlabel = _infer_newlines(xlabel, refwidth=refwidth)
+            xlabel = _wrap_label(xlabel, refwidth=refwidth)
         if not ax.get_xlabel():
             rows = top._range_subplotspec('y')
             if ax == top or not ax.figure._sharex or min(rows) == 0:  # topmost axes
@@ -252,14 +256,18 @@ def _adjust_format(ax, command, *args, refwidth=None):
         #     ax.format(ygrid=False, ylocator=1, ytickminor=False, yformatter='null')
     else:
         y = y.copy()
-        y.attrs.pop('short_prefix', None)  # ignore legend indicators
+        ylabel = ''
         yunits = y.attrs.get('units', None)
-        yprefix = y.attrs.get('ylabel_prefix', None)  # keep scatter prefix
-        if command == 'scatter' and len(yprefix) < 20:  # see _parse_bulk
+        yprefix = y.attrs.get('ylabel_prefix', '')
+        y.attrs.pop('short_prefix', None)  # ignore legend indicators
+        if command == 'scatter' and len(yprefix) < 20:
             y.attrs['short_prefix'] = yprefix
-        ylabel = y.climo.short_label if yunits is not None else None
+        if 'short_name' not in y.attrs:
+            y.attrs['short_name'] = ''
+        if yunits is not None:
+            ylabel = y.climo.short_label
         if nrows > 1:
-            ylabel = _infer_newlines(ylabel, refwidth=refwidth)
+            ylabel = _wrap_label(ylabel, refwidth=refwidth, refscale=refscale)
         if not ax.get_ylabel():
             cols = top._range_subplotspec('x')
             if ax == top or not ax.figure._sharey or max(cols) == ncols - 1:
@@ -328,6 +336,24 @@ def _infer_command(
     # Initial stuff
     # NOTE: Bar plots support 'list of' hatch arguments alongside linewidth,
     # edgecolor, and color, even though it is not listed in documentation.
+    args = list(args)
+    cycle = pplt.Cycle(cycle or ['blue7', 'red7', 'yellow7', 'gray7'])
+    colors = pplt.get_colors(cycle)
+    flier = {'markersize': 2, 'marker': 'x'}
+    kw_hash = {'colors': 'none', 'edgecolor': 'k'}
+    kw_contour = {'robust': 96, 'nozero': True, 'linewidth': pplt.rc.metawidth}
+    kw_contourf = {'robust': 98, 'levels': 20, 'extend': 'both'}
+    kws_contour = []
+    kws_contour.append({'color': 'gray8', 'linestyle': None, **kw_contour})
+    kws_contour.append({'color': 'gray3', 'linestyle': ':', **kw_contour})
+    kw_bar = {'linewidth': pplt.rc.metawidth, 'edgecolor': 'black', 'width': 1.0}
+    kw_line = {'linestyle': '-', 'linewidth': 1.5 * pplt.rc.metawidth}
+    kw_scatter = {'color': 'gray7', 'linewidth': 1.5 * pplt.rc.metawidth}
+    kw_scatter.update({'marker': 'x', 'markersize': 0.1 * pplt.rc.fontsize ** 2})
+    kw_box = {'means': True, 'whis': (5, 95), 'widths': 0.7, 'flierprops': flier}
+    sizes = args[-1].sizes.keys() - {'facets', 'version', 'period'}
+
+    # Helper functions
     def _ints_member(data):
         ints = []
         filt_flag = _parse_institute(data, 'flagship')
@@ -343,21 +369,6 @@ def _infer_command(
             int_ = 2 if filt_cmip66(facet) else 1 if filt_cmip65(facet) else 0
             ints.append(int_)
         return ints
-    args = list(args)
-    cycle = pplt.Cycle(cycle or ['blue7', 'red7', 'yellow7', 'gray7'])
-    colors = pplt.get_colors(cycle)
-    flier = {'markersize': 2, 'marker': 'x'}
-    kw_contour = {'robust': 96, 'nozero': True, 'linewidth': pplt.rc.metawidth}
-    kw_contourf = {'robust': 98, 'levels': 20, 'extend': 'both'}
-    kws_contour = []
-    kws_contour.append({'color': 'gray8', 'linestyle': None, **kw_contour})
-    kws_contour.append({'color': 'gray3', 'linestyle': ':', **kw_contour})
-    kw_bar = {'linewidth': pplt.rc.metawidth, 'edgecolor': 'black', 'width': 1.0}
-    kw_line = {'linestyle': '-', 'linewidth': 1.5 * pplt.rc.metawidth}
-    kw_scatter = {'color': 'gray7', 'linewidth': 1.5 * pplt.rc.metawidth}
-    kw_scatter.update({'marker': 'x', 'markersize': 0.1 * pplt.rc.fontsize ** 2})
-    kw_box = {'means': True, 'whis': (5, 95), 'widths': 0.33, 'flierprops': flier}
-    sizes = args[-1].sizes.keys() - {'facets', 'version', 'period'}
 
     # Infer commands
     # TODO: Support hist and hist2d perlots in addition to scatter and barh plots
@@ -368,6 +379,7 @@ def _infer_command(
     if len(sizes) == 2:
         if 'hatches' in kwargs:
             command = 'contourf'
+            defaults = kw_hash.copy()
         elif num == 0:
             command = 'pcolormesh' if pcolor else 'contourf'
             defaults = kw_contourf.copy()
@@ -380,7 +392,7 @@ def _infer_command(
             color0 = colors[max(num - 1, 0) % len(colors)]
             color1 = colors[num % len(colors)]
             defaults = {'color': color1, **kw_line}
-            if alternate:  # TODO: handle parent axis color inside plot_bulk()
+            if alternate:  # TODO: handle parent axis color inside plot_general()
                 ax.format(xcolor=color0)
                 ax = ax.altx(color=color1)
         else:
@@ -388,11 +400,11 @@ def _infer_command(
             color0 = colors[max(num - 1, 0) % len(colors)]
             color1 = colors[num % len(colors)]
             defaults = {'color': color1, **kw_line}
-            if alternate:  # TODO: handle parent axis color inside plot_bulk()
+            if alternate:  # TODO: handle parent axis color inside plot_general()
                 ax.format(ycolor=color0)
                 ax = ax.alty(color=color1)
     elif len(sizes) == 0 and multiple:
-        if len(args) == 2:  # TODO: stack regression coefficient and r-squared values
+        if len(args) == 2:  # compare correlations
             command = 'barh' if horizontal else 'bar'
             project = args[0].project.values[0]
             (slope,), *_ = _apply_method(*args, method='slope')
@@ -400,31 +412,32 @@ def _infer_command(
             if hasattr(args[0], 'short_prefix') and hasattr(args[1], 'short_prefix'):
                 short_prefix += f' {args[1].short_prefix} vs. {args[0].short_prefix}'
             slope.attrs['short_prefix'] = short_prefix
-            args = (np.array([num - offset]), slope)  # TODO: add error bars
+            args = (np.array([num + offset]), slope)  # TODO: add error bars
             color = colors[num % len(colors)]
             defaults = {'color': color, **kw_bar}
         else:  # compare distributions
             # command = 'violinh' if horizontal else 'violin'
             command = 'boxh' if horizontal else 'box'
-            args = (np.array([num - offset]), args[-1].expand_dims('num', axis=1))
+            args = (np.array([num + offset]), args[-1].expand_dims('num', axis=1))
             color = colors[num % len(colors)]
             defaults = {'facecolor': color, **kw_box}
+            if 'color' in kwargs:  # only color needs to be translated (alpha works)
+                kwargs['facecolor'] = kwargs.pop('color')
         data = args[-1].copy()
         data.attrs['units'] = ''
-        string = data.climo.short_label
-        string = _infer_newlines(string.replace('\n', ' '), 25 * pplt.rc.fontsize / 72)
+        string = data.attrs.get('short_prefix', data.attrs.get('short_name', ''))
+        string = _wrap_label(string, 20 * pplt.rc.fontsize / 72, nmax=1)
         if label:
             if horizontal:
                 trans = ax.get_yaxis_transform()
                 align = {'ha': 'right', 'va': 'center', 'rotation': 0}
-                ax.text(-0.05, num - offset, string, transform=trans, **align)
+                ax.text(-0.05, num + offset, string, transform=trans, **align)
             else:
                 trans = ax.get_xaxis_transform()
                 align = {'ha': 'center', 'va': 'top', 'rotation': 90}
-                ax.text(num - offset, -0.05, string, transform=trans, **align)
-    elif len(sizes) == 0:
+                ax.text(num + offset, -0.05, string, transform=trans, **align)
+    elif len(sizes) == 0 and not multiple:
         if len(args) == 2:  # plot correlation
-            # TODO: repair this... currently sizes will conflict
             command = 'scatter'
             color = kwargs.get('color', 'gray7')
             size = (0.5 * pplt.rc['lines.markersize']) ** 2
@@ -445,8 +458,7 @@ def _infer_command(
             args.insert(0, np.arange(data.size))
             args[-1] = data.sortby(data, ascending=ascending)
             color = [('blue7', 'red7')[val > 0] for val in args[-1].values]
-            color = ['gray8' if name == 'ecs_rfnt' else c for c in color]
-            color = ['gray8' if name == 'erf_rfnt' else c for c in color]
+            color = ['gray8' if name[:3] in ('ecs', 'erf') else c for c in color]
             defaults = kw_bar.copy()
             defaults['color'] = color
             if members:  # hatching for institution flagships
@@ -466,284 +478,332 @@ def _infer_command(
     return ax, command, args, kwargs
 
 
-def _parse_item(dataset, spec, **kwargs):
+def breakdown_transport(breakdown=None, component=None, transport=None):
     """
-    Parse the variable name specification.
+    Return the names and colors associated with transport components.
 
     Parameters
     ----------
-    dataset : `xarray.Dataset`
-        The dataset.
-    spec : sequence, str, or dict
-        The variable specification. Can be a ``(name, kwargs)``, a naked ``name``,
-        or a naked ``kwargs``. The name can be omitted or specified inside `kwargs`
-        with the `name` dictionary, and it will be specified when intersected with
-        other specifications (i.e. the row-column framework; see `_parse_bulk`).
-    **kwargs
-        Additional keyword arguments, used as defaults for the unset keys
-        in the variable specifications.
+    breakdown : str, optional
+        The transport components to show.
+    transport : str, optional
+        The transport type to show.
 
     Returns
     -------
-    kw_dat : dict
-        The indexers used to reduce the data variable with `.reduce`. This is
-        parsed specially compared to other keywords, and its keys are restricted
-        to ``'name'`` and any coordinate or multi-index names.
-    kw_plt : namedtuple of dict
-        A named tuple containing keyword arguments for different plotting-related
-        commands. The tuple fields are as follows:
-
-          * ``figure``: Passed to `Figure` when the figure is instantiated.
-          * ``gridspec``: Passed to `GridSpec` when the gridfspec is instantiated.
-          * ``axes``: Passed to `.format` for cartesian or geographic formatting.
-          * ``colorbar``: Passed to `.colorbar` for scalar mappable outputs.
-          * ``legend``: Passed to `.legend` for other artist outputs.
-          * ``command``: Passed to the plotting command (the default field).
-          * ``attrs``: Added to `.attrs` for use in resulting plot labels.
+    names : list of str
+        The transport components.
+    colors : list of str
+        The associated colors to use.
     """
-    # NOTE: For subsequent processing we put the variables being combined (usually
-    # just one) inside the 'name' key in kw_red (here `short` is shortened relative
-    # to actual dataset names and intended for file names only). This helps when
-    # merging variable specifications between row and column specifications and
-    # between tuple-style specifications (see _parse_bulk).
-    options = list(dataset.sizes)
-    options.extend(name for idx in dataset.indexes.values() for name in idx.names)
-    options.extend(('area', 'volume', 'institute'))  # see _parse_institute
-    options.extend(('method', 'invert', 'pctile', 'std'))  # see apply_method
-    if spec is None:
-        name, kw = None, {}
-    elif isinstance(spec, str):
-        name, kw = spec, {}
-    elif isinstance(spec, dict):
-        name, kw = None, spec
-    else:  # length-2 iterable
-        name, kw = spec
-    kw = {**kwargs, **kw}  # copy
-    alt = kw.pop('name', None)
-    name = name or alt  # see below
-    kw_dat, kw_att = {}, {}
-    kw_fig, kw_grd, kw_axs = {}, {}, {}
-    kw_cmd, kw_cba, kw_leg = {}, {}, {}
-    keys = ('space', 'ratio', 'group', 'equal', 'left', 'right', 'bottom', 'top')
-    att_detect = ('short', 'long', 'standard', 'xlabel_', 'ylabel_')
-    fig_detect = ('fig', 'ref', 'space', 'share', 'span', 'align')
-    grd_detect = tuple(s + key for key in keys for s in ('w', 'h', ''))
-    axs_detect = ('x', 'y', 'lon', 'lat', 'abc', 'title', 'coast')
-    bar_detect = ('extend', 'tick', 'locator', 'formatter', 'minor', 'label')
-    leg_detect = ('ncol', 'order', 'frame', 'handle', 'border', 'column')
-    for key, value in kw.items():  # NOTE: sorting performed in _parse_labels
-        if key in options:
-            kw_dat[key] = value  # e.g. for averaging
-        elif any(key.startswith(prefix) for prefix in att_detect):
-            kw_att[key] = value
-        elif any(key.startswith(prefix) for prefix in fig_detect):
-            kw_fig[key] = value
-        elif any(key.startswith(prefix) for prefix in grd_detect):
-            kw_grd[key] = value
-        elif any(key.startswith(prefix) for prefix in axs_detect):
-            kw_axs[key] = value
-        elif any(key.startswith(prefix) for prefix in bar_detect):
-            kw_cba[key] = value
-        elif any(key.startswith(prefix) for prefix in leg_detect):
-            kw_leg[key] = value
-        else:  # arbitrary plotting keywords
-            kw_cmd[key] = value
-    if isinstance(name, str):
-        kw_dat['name'] = name  # always place last for gridspec labels
-    keys = ('method', 'std', 'pctile', 'invert')
-    kw_dat.update({key: kwargs.pop(key) for key in keys if key in kwargs})
-    fields = ('figure', 'gridspec', 'axes', 'command', 'attrs', 'colorbar', 'legend')
-    kwargs = collections.namedtuple('kwargs', fields)
-    kw_plt = kwargs(kw_fig, kw_grd, kw_axs, kw_cmd, kw_att, kw_cba, kw_leg)
-    return kw_dat, kw_plt
+    # TODO: Expand to support mean-stationary-eddy decompositions and whatnot. Perhaps
+    # indicate those with dashes and dots and/or with different shades. And/or allow
+    # individual components per subplot with logical arrangement as with feedbacks.
+    breakdown = breakdown or 'all'
+    shading = 7
+    colors = {
+        'total': 'gray',
+        'ocean': 'cyan',
+        'mse': 'yellow',
+        'lse': 'blue',
+        'dse': 'red'
+    }
+    if transport is None:
+        raise ValueError('Transport component must be explicitly passed.')
+    if component is not None:
+        names = (component,)
+    elif breakdown == 'all':
+        names = ('total', 'ocean', 'mse', 'lse', 'dse')
+    elif breakdown == 'total':
+        names = ('total', 'ocean', 'mse')
+    elif breakdown == 'atmos':
+        names = ('mse', 'lse', 'dse')
+    else:
+        raise RuntimeError
+    colors = [colors[name] + str(shading) for name in names]
+    names = [name + transport for name in names]
+    return names, colors
 
 
-def _parse_bulk(dataset, rowspecs=None, colspecs=None, **kwargs):
+def breakdown_feedbacks(
+    component=None,
+    breakdown=None,
+    feedbacks=True,
+    adjusts=False,
+    forcing=False,
+    sensitivity=False,
+    maxcols=None,
+):
     """
-    Parse variable and project specifications and auto-determine row and column
-    labels based on the unique names and/or keywords in the spec lists.
+    Return the feedback, forcing, and sensitivity parameter names sensibly
+    organized depending on the number of columns in the plot.
 
     Parameters
     ----------
-    dataset : xarray.Dataset
-        The source dataset.
-    rowspecs : list of name, tuple, dict, or list thereof
-        The variable specification(s) per subplot slot.
-    colspecs : list of name, tuple, dict, or list thereof
-        The variable specification(s) per subplot slot.
-    **kwargs
-        Additional options shared across all specs.
+    component : str, optional
+        The individual component to use.
+    breakdown : str, default: 'all'
+        The breakdown preset to use.
+    feedbacks, adjusts, forcing, sensitivity : bool, optional
+        Whether to include various components.
+    maxcols : int, default: 4
+        The maximum number of columns (influences order of the specs).
 
     Returns
     -------
-    dataspecs : list of list of tuple of dict
-        The reduction keyword argument specifications.
-    plotspecs : list of list of kwargs
-        The keyword arguments used for plotting.
-    figlabel : str, optional
-        The default figure title.
-    gridlabels : list of list of str
-        The default row and column labels.
-    pathlabels : list of list of str
-        The default strings for file naming.
+    specs : list of str
+        The variables.
+    maxcols : int
+        The possibly adjusted number of columns.
+    gridskip : list of int
+        The gridspec entries to skip.
     """
-    # Parse variable specs per gridspec row or column and per subplot
-    # NOTE: This permits sharing keywords across each group with trailing dicts
-    # in either the primary gridspec list or any of the subplot sub-lists.
-    # NOTE: The two arrays required for two-argument methods can be indicated with
-    # either 2-tuples in spec lists or conflicting row and column names or reductions.
-    refwidth = None
-    dataspecs, plotspecs, gridlabels, pathlabels = [], [], [], []
-    for inspecs in (rowspecs, colspecs):
-        datspecs, pltspecs = [], []
-        if not isinstance(inspecs, list):
-            inspecs = [inspecs]
-        for ispecs in inspecs:  # specs per figure
-            dspecs, pspecs = [], []
-            if not isinstance(ispecs, list):
-                ispecs = [ispecs]
-            for ispec in ispecs:  # specs per subplot
-                dspec, pspec = [], []
-                if ispec is None:
-                    ispec = (None,)  # possibly construct from keyword args
-                elif isinstance(ispec, (str, dict)):
-                    ispec = (ispec,)
-                elif len(ispec) != 2:
-                    raise ValueError(f'Invalid variable specs {ispec}.')
-                elif type(ispec[0]) != type(ispec[1]):  # noqa: E721  # i.e. (str, dict)
-                    ispec = (ispec,)
+    # Interpret keyword arguments from suffixes
+    # NOTE: Idea is to automatically remove feedbacks, filter out all-none
+    # rows and columns at the end, and then infer the 'gridskip' from them.
+    original = maxcols = maxcols or 4
+    if breakdown is None:
+        component = component or 'net'
+    if component is None:
+        breakdown = breakdown or 'all'
+    if breakdown and '_lam' in breakdown:
+        breakdown, *_ = breakdown.split('_lam')
+        feedbacks = True
+    if breakdown and '_adj' in breakdown:
+        breakdown, *_ = breakdown.split('_erf')
+        adjusts, forcing = True, False  # effective forcing *and* rapid adjustments
+    if breakdown and '_erf' in breakdown:
+        breakdown, *_ = breakdown.split('_erf')
+        forcing, adjusts = True, False  # effective forcing *without* rapid adjustments
+    if breakdown and '_ecs' in breakdown:
+        breakdown, *_ = breakdown.split('_ecs')
+        sensitivity = True
+    if not component and not feedbacks and not forcing and not sensitivity:
+        raise RuntimeError
+
+    # Three variable breakdowns
+    # NOTE: Options include 'wav', 'atm', 'alb', 'res', 'all', 'atm_wav', 'alb_wav'
+    # with the 'wav' suffixes including longwave and shortwave cloud components
+    # instead of a total cloud feedback. Strings denote successively adding atmospheric,
+    # albedo, residual, and remaining temperature/humidity feedbacks with options.
+    def _get_arrayfeedback_breakdown(cols):
+        names = np.array([[None] * cols] * 25)
+        iflat = names.flat
+        return names, iflat
+    if component is not None:
+        names, iflat = _get_array(maxcols)
+        iflat[0] = component
+        gridskip = None
+    elif breakdown in ('net', 'atm', 'cld', 'wav'):  # shortwave longwave
+        if breakdown == 'net':  # net lw/sw
+            lams = ['net', 'sw', 'lw']
+            erfs = ['erf', 'rsnt_erf', 'rlnt_erf']
+        elif breakdown == 'atm':  # net cloud, atmosphere
+            lams = ['net', 'cld', 'atm']
+            erfs = ['erf', 'cl_rfnt_erf', 'atm_rfnt_erf']
+        elif breakdown == 'cld':  # cloud lw/sw
+            lams = ['cld', 'swcld', 'lwcld']
+            erfs = ['cl_rfnt_erf', 'cl_rsnt_erf', 'cl_rlnt_erf']
+        elif breakdown == 'wav':  # cloud lw/sw
+            lams = ['net', 'swcld', 'lwcld']
+            erfs = ['erf', 'cl_rsnt_erf', 'cl_rlnt_erf']
+        else:
+            raise RuntimeError
+        if maxcols == 2:
+            names, iflat = _get_array(maxcols)
+            if sensitivity:
+                iflat[0] = 'ecs'
+            if feedbacks and adjusts:
+                names[1:4, 0] = lams
+                names[1:4, 1] = erfs
+            elif feedbacks and forcing:
+                names[1, :] = lams[:1] + erfs[:1]
+                names[2, :] = lams[1:]
+            elif feedbacks:
+                iflat[1] = lams[0]
+                names[1, :] = lams[1:]
+            elif adjusts:
+                iflat[1] = erfs[0]
+                names[1, :] = erfs[1:]
+        else:
+            offset = 0
+            maxcols = 1 if maxcols == 1 else 3
+            names, iflat = _get_array(maxcols)
+            if sensitivity:
+                iflat[offset] = 'ecs'
+            if forcing:
+                iflat[offset + 1] = 'erf'
+            if feedbacks:
+                idx = 2 * maxcols
+                iflat[idx:idx + 3] = lams
+            if adjusts:
+                idx = 3 * maxcols
+                iflat[idx:idx + 3] = erfs
+
+    # Four variable breakdowns
+    elif breakdown in ('cld_wav', 'atm_wav', 'atm_res', 'alb'):
+        if 'cld' in breakdown:  # net cloud, cloud lw/sw
+            lams = ['net', 'cld', 'swcld', 'lwcld']
+            erfs = ['erf', 'cl_rfnt_erf', 'cl_rsnt_erf', 'cl_rlnt_erf']
+        elif 'res' in breakdown:  # net cloud, residual, atmosphere
+            lams = ['net', 'cld', 'resid', 'atm']
+            erfs = ['erf', 'cl_rfnt_erf', 'resid_rfnt_erf', 'atm_rfnt_erf']  # noqa: E501
+        elif 'atm' in breakdown:  # cloud lw/sw, atmosphere
+            lams = ['net', 'swcld', 'lwcld', 'atm']
+            erfs = ['erf', 'cl_rsnt_erf', 'cl_rlnt_erf', 'atm_rfnt_erf']
+        elif breakdown == 'alb':  # net cloud, atmosphere, albedo
+            lams = ['net', 'cld', 'alb', 'atm']
+            erfs = ['erf', 'cl_rfnt_erf', 'alb_rfnt_erf', 'atm_rfnt_erf']
+        else:
+            raise RuntimeError
+        if maxcols == 2:
+            names, iflat = _get_array(maxcols)
+            if sensitivity:
+                iflat[0] = 'ecs'
+            if feedbacks and adjusts:
+                names[1:5, 0] = lams
+                names[1:5, 1] = erfs
+            elif feedbacks:
+                iflat[1] = 'erf' if forcing else None
+                names[1, :] = lams[::3]
+                names[2, :] = lams[1:3]
+            elif adjusts:
+                names[1, :] = erfs[::3]
+                names[2, :] = erfs[1:3]
+        else:
+            offset = 0 if maxcols == 1 else 1
+            maxcols = 1 if maxcols == 1 else 3
+            names, iflat = _get_array(maxcols)
+            if sensitivity:
+                iflat[-offset % 3] = 'ecs'
+            if forcing or adjusts:
+                iflat[2 - offset] = 'erf'
+            if feedbacks:
+                idx = 3
+                iflat[1 - offset] = lams[0]
+                iflat[idx:idx + 3] = lams[1:]
+            if adjusts:
+                idx = 3 + 3
+                iflat[idx:idx + 3] = erfs[1:]
+
+    # Five variable breakdowns
+    # NOTE: Currently this is the only breakdown with both clouds
+    elif breakdown in ('atm_cld', 'alb_wav', 'res', 'res_wav'):
+        if 'atm' in breakdown:  # net cloud, cloud lw/sw, atmosphere
+            lams = ['net', 'cld', 'swcld', 'lwcld', 'atm']
+            erfs = ['erf', 'cl_rfnt_erf', 'cl_rsnt_erf', 'cl_rlnt_erf', 'atm_rfnt_erf']
+        elif 'alb' in breakdown:  # cloud lw/sw, atmosphere, albedo
+            lams = ['net', 'swcld', 'lwcld', 'alb', 'atm']
+            erfs = ['erf', 'cl_rsnt_erf', 'cl_rlnt_erf', 'alb_rfnt_erf', 'atm_rfnt_erf']
+        elif breakdown == 'res':  # net cloud, atmosphere, albedo, residual
+            lams = ['net', 'cld', 'alb', 'resid', 'atm']
+            erfs = ['erf', 'cl_rfnt_erf', 'alb_rfnt_erf', 'resid_rfnt_erf', 'atm_rfnt_erf']  # noqa: E501
+        elif 'res' in breakdown:  # cloud lw/sw, atmosphere, residual
+            lams = ['net', 'swcld', 'lwcld', 'resid', 'atm']
+            erfs = ['erf', 'cs_rlnt_erf', 'cl_rlnt_erf', 'resid_rfnt_erf', 'atm_rfnt_erf']  # noqa: E501
+        else:
+            raise RuntimeError
+        if maxcols == 2:
+            names, iflat = _get_array(maxcols)
+            if sensitivity:
+                iflat[0] = 'ecs'
+            if feedbacks and adjusts:
+                names[1:5, 0] = lams
+                names[1:5, 1] = erfs  # noqa: E501
+            elif feedbacks and forcing:
+                names[1, :] = lams[:1] + erfs[:1]
+                names[2, :] = lams[1:3]
+                names[3, :] = lams[3:5]
+            elif feedbacks:
+                names[0, 1] = lams[0]
+                names[1, :] = lams[1:3]
+                names[2, :] = lams[3:5]
+            elif adjusts:
+                names[0, 1] = erfs[0]
+                names[1, :] = erfs[1:3]
+                names[2, :] = erfs[3:5]
+        else:
+            offset = 0 if maxcols == 1 else 1
+            maxcols = 1 if maxcols == 1 else 4  # disallow 3 columns
+            names, iflat = _get_array(maxcols)
+            if sensitivity:
+                iflat[-offset % 3] = 'ecs'  # either before or after net and erf
+            if forcing or adjusts:
+                iflat[2 - offset] = erfs[0]
+            if feedbacks:
+                idx = 4  # could leave empty single-column row
+                iflat[1 - offset] = lams[0]
+                iflat[idx:idx + 4] = lams[1:]
+            if adjusts:
+                idx = 4 + 4
+                iflat[idx:idx + 4] = erfs[1:]
+
+    # Full breakdown
+    elif breakdown == 'all':
+        lams = ['net', 'cld', 'swcld', 'lwcld', 'atm', 'alb', 'resid']
+        erfs = ['erf', 'cl_rfnt_erf', 'cl_rsnt_erf', 'cl_rlnt_erf', 'atm_rfnt_erf', 'alb_rfnt_erf', 'resid_rfnt_erf']  # noqa: E501
+        hums = ['wv', 'rh', 'lr', 'lr*', 'pl', 'pl*']
+        if maxcols == 2:
+            names, iflat = _get_array(maxcols)
+            if sensitivity:
+                iflat[0] = 'ecs'
+            if feedbacks and adjusts:
+                names[1:8, 0] = lams
+                names[1:8, 1] = erfs
+                iflat[16:22] = hums
+            elif feedbacks:
+                iflat[0] = lams[0]
+                iflat[1] = 'erf' if forcing else None
+                names[2, :] = lams[1:3]
+                names[3, :] = lams[3:5]
+            elif adjusts:
+                iflat[0] = erfs[0]
+                names[1, :] = erfs[1:3]
+                names[2, :] = erfs[3:5]
+        else:
+            offset = 0 if maxcols == 1 else 1
+            maxcols = 1 if maxcols == 1 else 4  # disallow 3 columns
+            names, iflat = _get_array(maxcols)
+            if sensitivity:
+                iflat[-offset % 3] = 'ecs'  # either before or after net and erf
+            if forcing or adjusts:
+                iflat[2 - offset] = erfs[0]
+            if feedbacks:
+                idx = 4  # could leave empty single-column row
+                iflat[1 - offset] = lams[0]
+                iflat[idx:idx + 4] = lams[1:5]
+                if maxcols == 1:
+                    idx = 4 + 4
+                    iflat[idx:idx + 8] = lams[5:7] + hums[:]
                 else:
-                    ispec = tuple(ispec)
-                for spec in ispec:  # specs per correlation pair
-                    kw_dat, kw_plt = _parse_item(dataset, spec, **kwargs)
-                    if value := kw_plt.figure.get('refwidth', None):
-                        refwidth = value
-                    dspec.append(kw_dat)
-                    pspec.append(kw_plt)
-                dspecs.append(tuple(dspec))  # tuple to identify as correlation-pair
-                pspecs.append(tuple(pspec))
-            datspecs.append(dspecs)
-            pltspecs.append(pspecs)
-        zerospecs = [dspecs[0] if dspecs else {} for dspecs in datspecs]
-        pthlabels = _infer_abbrevs(dataset, *zerospecs, identical=False)
-        grdlabels = _infer_labels(
-            dataset,
-            *zerospecs,
-            identical=False,
-            long_names=True,
-            title_case=True,
-            refwidth=refwidth,
-        )
-        gridlabels.append(grdlabels)
-        pathlabels.append(pthlabels)
-        dataspecs.append(datspecs)
-        plotspecs.append(pltspecs)
+                    idx = 4 + 4
+                    iflat[idx:idx + 4] = lams[5:6] + hums[0::2]
+                    idx = 4 + 2 * 4
+                    iflat[idx:idx + 4] = lams[6:7] + hums[1::2]
+            if adjusts:
+                idx = 4 + 3 * 4
+                iflat[idx:idx + 6] = erfs[1:7]
+    else:
+        raise RuntimeError(f'Invalid breakdown key {breakdown!r}.')
 
-    # Combine row and column specifications for plotting and file naming
-    # NOTE: Several plotted values per subplot can be indicated in either the
-    # row or column list, and the specs from the other list are repeated below.
-    # WARNING: Critical to make copies of dictionaries or create new ones
-    # here since itertools product repeats the same spec multiple times.
-    bothspecs = [
-        [list(zip(dspecs, pspecs)) for dspecs, pspecs in zip(datspecs, pltspecs)]
-        for datspecs, pltspecs in zip(dataspecs, plotspecs)
-    ]
-    kw_infer = dict(
-        keeppairs=False,
-        identical=False,
-        skip_area=True,
-        skip_name=True,
-        long_names=False,
-        title_case=False
-    )
-    dataspecs, plotspecs = [], []
-    for (i, rspecs), (j, cspecs) in itertools.product(*map(enumerate, bothspecs)):
-        if len(rspecs) == 1:
-            rspecs = list(rspecs) * len(cspecs)
-        if len(cspecs) == 1:
-            cspecs = list(cspecs) * len(rspecs)
-        if len(rspecs) != len(cspecs):
-            raise ValueError(
-                'Incompatible per-subplot spec count.'
-                + f'\nRow specs ({len(rspecs)}): \n' + '\n'.join(map(repr, rspecs))
-                + f'\nColumn specs ({len(cspecs)}): \n' + '\n'.join(map(repr, cspecs))
-            )
-        dspecs, pspecs = [], []
-        for k, (rspec, cspec) in enumerate(zip(rspecs, cspecs)):  # subplot entries
-            rkws_dat, rkws_plt, ckws_dat, ckws_plt = *rspec, *cspec
-            kwargs = type((rkws_plt or ckws_plt)[0])
-            kws = []
-            for field in kwargs._fields:
-                kw = {}  # NOTE: previously applied default values here
-                for ikws_plt in (rkws_plt, ckws_plt):
-                    for ikw_plt in ikws_plt:  # correlation pairs
-                        for key, value in getattr(ikw_plt, field).items():
-                            kw.setdefault(key, value)  # prefer row entries
-                kws.append(kw)
-            kw_plt = kwargs(*kws)
-            rkws_dat = tuple(kw.copy() for kw in rkws_dat)  # NOTE: copy is critical
-            ckws_dat = tuple(kw.copy() for kw in ckws_dat)
-            for ikws_dat, jkws_dat in ((rkws_dat, ckws_dat), (ckws_dat, rkws_dat)):
-                for key in ikws_dat[0]:
-                    if key not in ikws_dat[-1]:
-                        continue
-                    if ikws_dat[0][key] == ikws_dat[-1][key]:
-                        for kw in jkws_dat:  # possible correlation pair
-                            kw.setdefault(key, ikws_dat[0][key])
-            kws_dat = {}  # filter unique specifications
-            for kw_dat in (*rkws_dat, *ckws_dat):
-                keys = ('method', 'std', 'pctile', 'invert')
-                keys = sorted(key for key in kw_dat if key not in keys)
-                keyval = tuple((key, kw_dat[key]) for key in keys)
-                if tuple(keyval) in kws_dat:
-                    continue
-                others = tuple(other for other in kws_dat if set(keyval) < set(other))
-                if others:
-                    continue
-                others = tuple(other for other in kws_dat if set(other) < set(keyval))
-                for other in others:  # prefer more selection keywords
-                    kws_dat.pop(other)
-                kws_dat[tuple(keyval)] = kw_dat
-            kws_dat = tuple(kws_dat.values())  # possible correlation tuple
-            if len(kws_dat) > 2:
-                raise RuntimeError(
-                    'Expected 1-2 specs for combining with get_data but got '
-                    f'{len(kws_dat)} specs: ' + '\n'.join(map(repr, kws_dat))
-                )
-            dspecs.append(kws_dat)
-            pspecs.append(kw_plt)
-        labels = _infer_labels(dataset, *dspecs, **kw_infer)
-        xlabels = _infer_labels(dataset, *(kws[:1] for kws in dspecs), **kw_infer)
-        ylabels = _infer_labels(dataset, *(kws[1:] for kws in dspecs), **kw_infer)
-        ylabels = ylabels or [None] * len(xlabels)
-        for label, xlabel, ylabel, pspec in zip(labels, xlabels, ylabels, pspecs):
-            if label:  # use identical label as fallback
-                pspec.attrs.setdefault('short_prefix', label)
-            if xlabel:
-                pspec.attrs.setdefault('xlabel_prefix', xlabel)
-            if ylabel:
-                pspec.attrs.setdefault('ylabel_prefix', ylabel)
-        dataspecs.append(dspecs)
-        plotspecs.append(pspecs)
-    ncols = len(colspecs) if len(colspecs) > 1 else len(rowspecs) if len(rowspecs) > 1 else 4  # noqa: E501
-    refwidth = refwidth or pplt.rc['subplots.refwidth']
-    zerospecs = [dspecs[0] if dspecs else {} for dspecs in dataspecs]
-    pthlabels = _infer_abbrevs(dataset, *zerospecs, identical=True)
-    pathlabels.insert(0, pthlabels)  # insert reductions shared across rows-columns
-    subspecs = [dspec for dspecs in dataspecs for dspec in dspecs]
-    figlabels = _infer_labels(
-        dataset,
-        *subspecs,
-        identical=True,
-        long_names=True,
-        title_case='first',  # special value
-        refwidth=2 * ncols * refwidth,  # larger value
-    )
-    figlabel = ' '.join(figlabels)
-    return dataspecs, plotspecs, figlabel, gridlabels, pathlabels
+    # Remove all-none segments and determine gridskip
+    # NOTE: This also automatically flattens the arangement if there are
+    # fewer than names than the originally requested maximum column count.
+    idx, = np.where(np.any(names != None, axis=0))  # noqa: E711
+    names = np.take(names, idx, axis=1)
+    idx, = np.where(np.any(names != None, axis=1))  # noqa: E711
+    names = np.take(names, idx, axis=0)
+    idxs = np.where(names == None)  # noqa: E711
+    gridskip = np.ravel_multi_index(idxs, names.shape)
+    names = names.ravel().tolist()
+    names = [spec for spec in names if spec is not None]
+    if len(names) <= original and maxcols != 1:  # then keep it simple!
+        maxcols = len(names)
+        gridskip = np.array([])
+    return names, maxcols, gridskip
 
 
-def plot_bulk(
+def plot_general(
     dataset,
     rowspecs=None,
     colspecs=None,
@@ -756,16 +816,16 @@ def plot_bulk(
     rowlabels=None,
     collabels=None,
     hcolorbar='right',
-    vcolorbar='bottom',
-    dcolorbar='bottom',
     hlegend='bottom',
+    vcolorbar='bottom',
     vlegend='bottom',
+    dcolorbar='right',
     dlegend='bottom',
     standardize=False,
     annotate=False,
     linefit=False,
     oneone=False,
-    proj='eqearth',
+    proj='hammer',
     proj_kw=None,
     save=None,
     **kwargs
@@ -779,7 +839,7 @@ def plot_bulk(
         A dataset generated by `open_bulk`.
     rowspecs, colspecs : list of 2-tuple
         Tuples containing the ``(name, kwargs)`` passed to ``ClimoAccessor.get``
-        used to generate data in rows and columns. See `_parse_bulk` for details.
+        used to generate data in rows and columns. See `parse_specs` for details.
     figtitle, rowlabels, collabels : optional
         The figure settings. The labels are determined automatically from
         the specs but can be overridden in a pinch.
@@ -801,7 +861,7 @@ def plot_bulk(
     vcolorbar, vlegend : {'bottom', 'top', 'right', 'left'}
         The location for colorbars or legends annotating vertical columns.
         Automatically placed along the relevant axes.
-    dcolorbar : {'bottom', 'right', 'top', 'left'}
+    dcolorbar, dlegend : {'bottom', 'right', 'top', 'left'}
         The default location for colorbars or legends annotating a mix of
         axes. Placed with the figure colorbar or legend method.
     standardize : bool, optional
@@ -823,8 +883,8 @@ def plot_bulk(
         The color cycle used for line plots. Default is to iterate
         over open-color colors.
     proj : str, optional
-        The cartopy projection for longitude-latitude type plots. Default
-        is the shape-preserving projection ``'kav7'``.
+        The cartopy projection for longitude-latitude type plots. Default is the
+        area-conserving and polar distortion-minimizing ``'hammer'`` projection.
     proj_kw : dict, optional
         The cartopy projection keyword arguments for longitude-latitude
         type plots. Default is ``{'lon_0': 180}``.
@@ -833,7 +893,7 @@ def plot_bulk(
     cycle, pcolor, horizontal : optional
         Passed to `_infer_command`.
     **kw_specs
-        Passed to `_parse_bulk`.
+        Passed to `parse_specs`.
     **kw_method
         Passed to `apply_method`.
 
@@ -851,25 +911,29 @@ def plot_bulk(
     # shadestd, shadepctile, etc. methods instead of using map. See apply_method.
     argskip = np.atleast_1d(() if argskip is None else argskip)
     gridskip = np.atleast_1d(() if gridskip is None else gridskip)
-    dataspecs, plotspecs, figlabel, gridlabels, pathlabels = _parse_bulk(
+    dataspecs, plotspecs, figlabel, pathlabel, gridlabels = parse_specs(
         dataset, rowspecs, colspecs, **kwargs
     )
-    figtitle = figtitle or figlabel
     nrows, ncols = map(len, gridlabels)
     nrows, ncols = max(nrows, 1), max(ncols, 1)
     titles = (None,) * nrows * ncols
-    if figsuffix:
-        figtitle = ' '.join((figtitle, figsuffix))
+    print('All:', repr(figlabel))
+    print('Rows:', ', '.join(map(repr, gridlabels[0])))
+    print('Columns:', ', '.join(map(repr, gridlabels[1])))
+    print('Path:', pathlabel)
+    figtitle = figtitle or figlabel
+    figprefix, figsuffix = figprefix or '', figsuffix or ''
     if figprefix:
-        end = figtitle if figtitle[:2].isupper() else figtitle[0].lower() + figtitle[1:]  # noqa: E501
-        start = figprefix if figprefix[:1].isupper() else figprefix[0].upper() + figprefix[1:]  # noqa: E501
-        figtitle = ' '.join((start, end))
+        figprefix = figprefix if figprefix[:1].isupper() else figprefix[0].upper() + figprefix[1:]  # noqa: E501
+        figtitle = figtitle if figtitle[:2].isupper() else figtitle[0].lower() + figtitle[1:]  # noqa: E501
+    figparts = (figprefix, figtitle, figsuffix)
+    figtitle = ' '.join(filter(None, figparts))
     if nrows == 1 or ncols == 1:
         naxes = gridskip.size + max(nrows, ncols)
         ncols = min(naxes, maxcols or 4)
         nrows = 1 + (naxes - 1) // ncols
         titles = max(gridlabels, key=lambda labels: len(labels))
-        titles = titles or (None,) * nrows * ncols
+        titles = max(nrows, ncols) > 1 and titles or (None,) * nrows * ncols
         gridlabels = (None, None)
 
     # Iterate over axes and plots
@@ -877,8 +941,7 @@ def plot_bulk(
     # extend into other panel slots are not considered in the tight layout algorithm.
     fig = gs = None  # delay instantiation
     proj = pplt.Proj(proj, **(proj_kw or {'lon_0': 180}))
-    methods = []
-    commands = {}
+    queue, methods, commands = {}, [], []
     iterator = zip(titles, dataspecs, plotspecs)
     print('Getting data...', end=' ')
     for i in range(nrows * ncols):
@@ -916,6 +979,8 @@ def plot_bulk(
             kw_def = {key: val for k in defaults for key, val in KWARGS_DEFAULT[k].items()}  # noqa: E501
             kw_fig.update(refwidth=kw_def.pop('refwidth', None))
             kw_axs.update(kw_def)
+            if max(nrows, ncols) == 1:
+                kw_axs.pop('abc', None)
             for key, value in kw_fig.items():
                 kw_plt.figure.setdefault(key, value)
             for key, value in kw_axs.items():
@@ -957,10 +1022,12 @@ def plot_bulk(
             size = kw_plt.command.get('sizes', None)
             size = tuple(size) if isinstance(size, list) else size
             key = (name, method, command, cmap, color, size)
-            values = commands.setdefault(key, [])
-            values.append((jax, args, kw_plt))
+            tups = queue.setdefault(key, [])
+            tups.append((jax, args, kw_plt))
             if method not in methods:
                 methods.append(method)
+            if command not in commands:
+                commands.append(command)
 
     # Carry out the plotting commands
     # NOTE: Axes are always added top-to-bottom and left-to-right so leverage
@@ -968,11 +1035,11 @@ def plot_bulk(
     print('\nPlotting data...', end=' ')
     axs_objs = {}
     axs_units = {}  # axes grouped by units
-    for k, (key, values) in enumerate(commands.items()):
+    for k, (key, values) in enumerate(queue.items()):
         # Get guide and plotting arguments
         # NOTE: Here 'argskip' is isued to skip arguments with vastly different
         # ranges when generating levels that annotate multiple different subplots.
-        print(f'{k + 1}/{len(commands)}', end=' ')
+        print(f'{k + 1}/{len(queue)}', end=' ')
         name, method, command, cmap, color, *_ = key
         axs, args, kws_plt = zip(*values)
         kw_cba = {key: val for kw_plt in kws_plt for key, val in kw_plt.colorbar.items()}  # noqa: E501
@@ -989,22 +1056,27 @@ def plot_bulk(
             kw.pop('robust', None)
             kws_cmd = [kw] * len(args)
         if not hatches and command in ('contourf', 'pcolormesh'):
+            cartesian = axs[0]._name == 'cartesian'
+            refwidth = axs[0].figure._refwidth or pplt.rc['subplots.refwidth']
+            refscale = 1.3 if cartesian else 0.8  # WARNING: vertical colorbars only
+            extendsize = 1.2 if cartesian else 1.8  # WARNING: vertical colorbars only
             guide, kw_guide = 'colorbar', kw_cba
             label = args[0][-1].climo.short_label
-            label = _infer_newlines(label, refwidth=ax.figure._refwidth, scale=0.8)
+            label = _wrap_label(label, refwidth=refwidth, refscale=refscale)
             locator = pplt.DiscreteLocator(levels, nbins=7)
             minorlocator = pplt.DiscreteLocator(levels, nbins=7, minor=True)
             kw_guide.setdefault('locator', locator)
             kw_guide.setdefault('minorlocator', minorlocator)  # scaled internally
-            kw_guide.setdefault('extendsize', 1.2 + 0.6 * (ax._name != 'cartesian'))
+            kw_guide.setdefault('extendsize', extendsize)
         else:  # TODO: permit short *or* long
             guide, kw_guide = 'legend', kw_leg
             variable = args[0][-1].climo.cfvariable
             label = variable.short_label if command == 'contour' else variable.short_name  # noqa: E501
             label = None if hatches else label
             keys = ['cmap', 'norm', 'norm_kw']
+            maps = ['robust', 'symmetric', 'diverging', 'levels', 'locator', 'extend']
             if 'contour' not in command and 'pcolor' not in command:
-                keys.extend(('robust', 'symmetric', 'diverging', 'levels', 'locator', 'extend'))  # noqa: E501
+                keys.extend(maps)
             kw_guide.setdefault('ncols', 1)
             kw_guide.setdefault('frame', False)
             kws_cmd, kws = [], kws_cmd
@@ -1070,7 +1142,7 @@ def plot_bulk(
         axs = [ax for iaxs in axs for ax in iaxs]
         rows = set(n for row in rows for n in row)
         cols = set(n for col in cols for n in col)
-        if len(rows) != 1 and len(cols) != 1:
+        if not len(rows) == 1 ^ len(cols) == 1:
             src = fig
             loc = default
         elif len(rows) == 1:  # single row
@@ -1098,18 +1170,22 @@ def plot_bulk(
             else:
                 raise ValueError(f'Invalid location {loc!r}.')
         if src is not fig:
-            pass
+            span = None
         elif loc[0] in 'lr':
-            kw_guide['rows'] = (min(rows) + 1, max(rows) + 1)
+            span = (min(rows) + 1, max(rows) + 1)
         else:
-            kw_guide['cols'] = (min(cols) + 1, max(cols) + 1)
+            span = (min(cols) + 1, max(cols) + 1)
         if guide == 'colorbar':
-            result = src.colorbar(objs[0], label=label, loc=loc, **kw_guide)
+            kw_guide.update({} if span is None else {'span': span})
+            src.colorbar(objs[0], label=label, loc=loc, **kw_guide)
         else:
-            handles.setdefault(src, []).append((objs[0], label, loc, kw_guide))
-    for src, tups in handles.items():  # support 'queue' for figure legends
+            tups = handles.setdefault((src, span), [])
+            tups.append((objs[0], label, loc, kw_guide))
+    for (src, span), tups in handles.items():  # support 'queue' for figure legends
         objs, labels, locs, kws = zip(*tups)
         kw = {key: val for kw in kws for key, val in kw.items()}
+        if span is not None:  # figure row or column span
+            kw['span'] = span
         src.legend(list(objs), list(labels), loc=locs[0], **kw)
 
     # Format the axes and optionally save
@@ -1144,15 +1220,14 @@ def plot_bulk(
                 getattr(ax, f'set_{axis}lim')(lim)
     if save:
         if save is True:
-            path = Path()  # current directory
+            path = Path()
         else:
             path = Path(save).expanduser()
-        if '.pdf' not in path.name:
-            path = path / 'figures'
-            path.mkdir(exist_ok=True)
-            name = '-'.join(methods) + '_'
-            name += '_'.join('-'.join(labs) for labs in pathlabels if labs)
-            path = path / f'{name}.pdf'
+        figs = path / 'figures'
+        if figs.is_dir():
+            path = figs
+        if path.is_dir():
+            path = path / '_'.join(('-'.join(methods), '-'.join(commands), pathlabel))
         print(f'Saving {path.parent}/{path.name}...')
-        fig.save(path)
+        fig.save(path)  # optional extension
     return fig, fig.subplotgrid

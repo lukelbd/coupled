@@ -2,24 +2,19 @@
 """
 Internal helper functions for figure templates.
 """
+import collections
 import itertools
 import re
 
 import climopy as climo  # noqa: F401
 import numpy as np
-import pandas as pd
 import proplot as pplt
-import xarray as xr
 from climopy import ureg, vreg  # noqa: F401
 from icecream import ic  # noqa: F401
 
 from .output import FEEDBACK_TRANSLATIONS
-from cmip_data.internals import MODELS_INSTITUTES, INSTITUTES_ABBREVS
 
-__all__ = [
-    'get_data',
-    'get_breakdown',
-]
+__all__ = ['parse_spec', 'parse_specs']
 
 # Float detection
 REGEX_FLOAT = re.compile(  # allow exponential notation
@@ -88,8 +83,8 @@ ORDER_READABLE = (
     'name',
 )
 
-# Abbreviation constants
-TRANSLATE_ABBREVS = {
+# General translations
+TRANSLATE_PATHS = {
     ('area', 'avg'): 'avg',
     # ('area', 'avg'): None,  # TODO: consider changing back
     ('lon', 'avg'): None,
@@ -146,12 +141,26 @@ TRANSLATE_LABELS = {  # default is title-case of input
     ('experiment', 'abrupt4xco2'): r'abrupt 4$\times$CO$_2$',
     ('ensemble', 'flagship'): 'flagship-ensemble',
 }
+
+# Time translations
 TRANSLATE_LONGS = {  # default is title-case of input
     ('period', 'ann'): 'annual',
     ('period', 'djf'): 'boreal winter',
     ('period', 'mam'): 'boreal spring',
     ('period', 'jja'): 'boreal summer',
     ('period', 'son'): 'boreal autumn',
+    ('period', 'jan'): 'January',
+    ('period', 'feb'): 'February',
+    ('period', 'mar'): 'March',
+    ('period', 'apr'): 'April',
+    ('period', 'may'): 'May',
+    ('period', 'jun'): 'June',
+    ('period', 'jul'): 'July',
+    ('period', 'aug'): 'August',
+    ('period', 'sep'): 'September',
+    ('period', 'oct'): 'October',
+    ('period', 'nov'): 'November',
+    ('period', 'dec'): 'December',
     **TRANSLATE_LABELS
 }
 TRANSLATE_SHORTS = {
@@ -160,43 +169,64 @@ TRANSLATE_SHORTS = {
     ('period', 'mam'): 'MAM',
     ('period', 'jja'): 'JJA',
     ('period', 'son'): 'SON',
+    ('period', 'jan'): 'Jan',
+    ('period', 'feb'): 'Feb',
+    ('period', 'mar'): 'Mar',
+    ('period', 'apr'): 'Apr',
+    ('period', 'may'): 'May',
+    ('period', 'jun'): 'Jun',
+    ('period', 'jul'): 'Jul',
+    ('period', 'aug'): 'Aug',
+    ('period', 'sep'): 'Sep',
+    ('period', 'oct'): 'Oct',
+    ('period', 'nov'): 'Nov',
+    ('period', 'dec'): 'Dec',
     **TRANSLATE_LABELS
 }
 
 
-def _infer_newlines(string, refwidth=None, scale=None):
+def _infer_path(dataset, *kws_red):
     """
-    Replace spaces with line breaks to accommodate a subplot or figure width.
+    Convert reduction operators into path suitable for saving.
 
     Parameters
     ----------
-    string : str
-        The input string.
-    refwidth : unit-spec, optional
-        The reference maximum width.
-    scale : float, optional
-        Additional scale on the width.
+    dataset : xarray.Dataset
+        The source dataset.
+    *kws_red : dict
+        The `get_data` keywords.
+
+    Returns
+    -------
+    path : str
+        The parts joined with underscores and dashes.
     """
-    string = string or ''
-    idxs = np.array([i for i, c in enumerate(string) if c == ' '])
-    adjs = idxs.copy()
-    for m in re.finditer(r'\$[^$]+\$', string):  # ignore non-math texts
-        i, j = m.span()
-        adjs[(i <= idxs) & (idxs <= j)] = 0  # i.e. ignore since lower than thresh
-        adjs[idxs > j] -= j - i
-    scale = scale or 1.1
-    refwidth = refwidth or pplt.rc['subplots.refwidth']
-    threshs = scale * pplt.units(refwidth, 'in', 'em') * np.arange(1, 10)
-    chars = list(string)  # string to list
-    for thresh in threshs:
-        mask = adjs > thresh
-        if not mask.any():
+    # NOTE: This omits keywords that correspond to default values but always
+    # includes experiment because default is ambiguous between variables.
+    kws_red = [(kw,) if isinstance(kw, dict) else tuple(kw) for kw in kws_red]
+    labels = []
+    defaults = {'project': 'cmip', 'ensemble': 'flagship', 'period': 'ann'}
+    defaults.update({'source': 'eraint', 'statistic': 'slope', 'region': 'globe'})
+    for key in ORDER_LOGICAL:
+        seen = set()
+        parts = []
+        values = [kw[key] for kws in kws_red for kw in kws if key in kw]
+        values = [value for value in values if value not in seen and not seen.add(value)]  # noqa: E501
+        if len(values) == 1 and values[0] == defaults.get(key, None):
             continue
-        chars[np.min(idxs[mask])] = '\n'
-    return ''.join(chars)
+        for value in values:  # across all subplots and tuples
+            label = _infer_label(dataset, key, value, mode='path')
+            if not label:
+                continue
+            if label not in parts:  # e.g. 'avg' to be ignored
+                parts.append(label)
+        if parts:
+            labels.append(parts)  # do not sort these
+    result = '_'.join('-'.join(parts) for parts in labels)
+    return result
 
 
-def _infer_string(dataset, key, value, mode='abbrv'):
+def _infer_label(dataset, key, value, mode=None):
     """
     Return an arbitrary label type based on the dataset.
 
@@ -208,15 +238,21 @@ def _infer_string(dataset, key, value, mode='abbrv'):
         The reduce coordinate.
     value : str or float
         The reduce selection.
-    mode : {'abbrv', 'short', 'long'}, optional
-        The label type.
+    mode : {'path', 'short', 'long'}, optional
+        The label mode. Affects various translations.
+
+    Returns
+    -------
+    label : str
+        The final label.
     """
-    if mode not in ('abbrv', 'short', 'long'):
+    mode = mode or 'path'
+    if mode not in ('path', 'short', 'long'):
         raise ValueError(f'Invalid label mode {mode!r}.')
     alias_to_name = {alias: name for alias, (name, _) in FEEDBACK_TRANSLATIONS.items()}
     name_to_alias = {name: alias for alias, name in alias_to_name.items()}  # keep last
-    labels = []
     parts = REGEX_SPLIT.split(value) if isinstance(value, str) else (value,)
+    labels = []
     for part in parts:
         if part is None:
             continue
@@ -224,7 +260,7 @@ def _infer_string(dataset, key, value, mode='abbrv'):
             part = float(part)
         if key == 'name':
             part = alias_to_name.get(part, part)
-            if mode == 'abbrv':
+            if mode == 'path':
                 label = name_to_alias.get(part, part)
             elif mode == 'short':
                 label = dataset[part].short_name
@@ -233,9 +269,9 @@ def _infer_string(dataset, key, value, mode='abbrv'):
         elif isinstance(part, str):
             operators = {'+': 'plus', '-': 'minus', '*': 'times', '/': 'over'}
             if part in '+-*/':  # TODO: support other operations?
-                label = part if mode == 'abbrv' else operators[part]
-            elif mode == 'abbrv':
-                label = TRANSLATE_ABBREVS.get((key, part), part)
+                label = part if mode == 'path' else operators[part]
+            elif mode == 'path':
+                label = TRANSLATE_PATHS.get((key, part), part)
             elif mode == 'short':
                 label = TRANSLATE_SHORTS.get((key, part), part)
             else:
@@ -245,13 +281,13 @@ def _infer_string(dataset, key, value, mode='abbrv'):
             if not isinstance(part, ureg.Quantity):
                 part = ureg.Quantity(part, unit)
             part = part.to(unit)
-            if mode == 'abbrv':
+            if mode == 'path':
                 label = f'{part:~.0f}'
             else:
                 label = f'${part:~L.0f}$'
         if label is None:  # e.g. skip 'avg' label
             continue
-        if mode == 'abbrv':  # extra processing
+        if mode == 'path':  # extra processing
             label = label.replace('\N{DEGREE SIGN}', '')
             label = label.replace('+', '')
             label = label.replace('-', '')
@@ -261,63 +297,20 @@ def _infer_string(dataset, key, value, mode='abbrv'):
             label = label.replace(' ', '')
             label = label.lower()
         labels.append(label)
-    string = '' if mode == 'abbrv' else ' '
-    return string.join(labels)
-
-
-def _infer_abbrevs(
-    dataset,
-    *kwargs,
-    identical=False
-):
-    """
-    Convert reudction operators into
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The source dataset.
-    *kwargs : dict
-        The `get_data` keywords.
-    """
-    keys_method = ('method', 'std', 'pctile', 'invert')  # special method keywords
-    kwargs = [(kw,) if isinstance(kw, dict) else tuple(kw) for kw in kwargs]
-    order = list(ORDER_LOGICAL)
-    sorter = lambda key: order.index(key) if key in order else len(order)
-    seen = set()
-    keys = sorted((key for kws in kwargs for kw in kws for key in kw), key=sorter)
-    keys = [key for key in keys if key not in seen and not seen.add(key)]
-    labels = []
-    for key in keys:
-        if key in keys_method:
-            continue
-        values = [kw[key] for kws in kwargs for kw in kws if key in kw]
-        ident = all(value == values[0] for value in values)
-        if len(values) == 1:
-            if not identical:
-                continue
-        else:
-            if ident != identical:
-                continue
-        for value in values:
-            label = _infer_string(dataset, key, value, mode='abbrv')
-            if not label:
-                continue
-            if label not in labels:  # e.g. 'avg' to be ignored
-                labels.append(label)
-    return labels
+    result = '' if mode == 'path' else ' '
+    return result.join(labels)
 
 
 def _infer_labels(
     dataset,
-    *kwargs,
+    *kws_red,
     keeppairs=True,
     identical=False,
     title_case=False,
     long_names=False,
     skip_area=False,
     skip_name=False,
-    refwidth=None,
+    **kwargs
 ):
     """
     Convert reduction operators into human-readable labels.
@@ -326,7 +319,7 @@ def _infer_labels(
     ----------
     dataset : xarray.Dataset
         The source dataset.
-    *kwargs : tuple of dict
+    *kws_red : tuple of dict
         The reduction keyword arguments.
     keeppairs : bool, optional
         Whether to keep identical reduce operations in 'vs.' pair.
@@ -340,8 +333,13 @@ def _infer_labels(
         Whether to skip the area average indication.
     skip_name : bool, optional
         Whether to skip the 'name' key for e.g. prefix usage.
-    refwidth : float, optional
-        Passed to `_infer_newlines`.
+    **kwargs
+        Passed to `_wrap_label`.
+
+    Returns
+    -------
+    labels : list
+        The
     """
     # Reduce the label dicationaries to account for redundancies across the list,
     # either dropping them (useful for gridspec labels and legend labels) or
@@ -361,12 +359,12 @@ def _infer_labels(
     sorter = lambda key: order.index(key) if key in order else len(order)
     replace = lambda s, r: s.replace(f' {r}', '').replace(f'{r} ', '').replace('effective', 'net')  # noqa: E501
     keys_method = ('method', 'std', 'pctile', 'invert')  # special method keywords
-    kwargs = [(kw,) if isinstance(kw, dict) else tuple(kw) for kw in kwargs]
+    kws_red = [(kw,) if isinstance(kw, dict) else tuple(kw) for kw in kws_red]
     labels = []
     for i in range(2):  # indices in correlation pair
         # Infer labels from keywords
         kws = []
-        ikws = [tup[i] for tup in kwargs if i < len(tup)]
+        ikws = [tup[i] for tup in kws_red if i < len(tup)]
         for ikw in ikws:
             kw = {}
             for key in sorted(ikw, key=sorter):
@@ -377,7 +375,7 @@ def _infer_labels(
                     continue
                 if key == 'area' and value == 'avg' and skip_area:
                     continue
-                label = _infer_string(dataset, key, value, mode=mode)
+                label = _infer_label(dataset, key, value, mode=mode)
                 kw[key] = label
             kws.append(kw)
         # Combine labels across keyword list
@@ -416,7 +414,7 @@ def _infer_labels(
         label = ' vs. '.join(
             ' '.join(lab for lab in kw.values() if lab) for kw in pair if kw
         )
-        label = _infer_newlines(label, refwidth=refwidth)
+        label = _wrap_label(label, **kwargs)
         if title_case is True or title_case == 'first' and i == 0:
             if label[:1].islower():
                 label = label[:1].upper() + label[1:]
@@ -424,898 +422,323 @@ def _infer_labels(
     return labels
 
 
-def _parse_project(data, project):
+def _wrap_label(label, refwidth=None, refscale=None, nmax=None):
     """
-    Return plot labels and facet filter for the project indicator.
+    Replace spaces with newlines to accommodate a subplot or figure label.
 
     Parameters
     ----------
-    data : xarray.Dataset or xarray.DataArray
-        The data. Must contain a ``'facets'`` coordinate.
-    project : str
-        The selection. Values should start with ``'cmip'``. No integer ending indicates
-        all cmip5 and cmip6 models, ``5`` (``6``) indicates just cmip5 (cmip6) models,
-        ``56`` (``65``) indicates cmip5 (cmip6) models filtered to those from the same
-        institutes as cmip6 (cmip5), and ``55`` (``66``) indicates institutes found
-        only in cmip5 (cmip6). Note two-digit integers can be combined, e.g. ``5665``.
+    label : str
+        The input label.
+    refwidth : unit-spec, optional
+        The reference maximum width.
+    refscale : float, optional
+        Additional scale on the width.
+    nmax : int, optional
+        Optional maximum number of breaks to use.
 
     Returns
     -------
-    callable
-        A `facets` filter function.
+    label : str
+        The label with inserted newlines.
     """
-    # WARNING: Critical to assign name to filter so that _parse_specs can detect
-    # differences between row and column specs at given subplot entry.
-    project = project.lower()
-    name_to_inst = MODELS_INSTITUTES.copy()
-    name_to_inst.update(  # support facets with institutes names instead of models
-        {
-            (proj, abbrv): inst
-            for inst, abbrv in INSTITUTES_ABBREVS.items()
-            for proj in ('CMIP5', 'CMIP6')
-        }
-    )
-    if not project.startswith('cmip'):
-        raise ValueError(f'Invalid project indicator {project}. Must contain cmip.')
-    _, num = project.split('cmip')
-    imax = max(1, len(num))
-    if imax not in (1, 2, 4):
-        raise ValueError(f'Invalid project indicator {project}. 1/2/4 numbers allowed.')
-    funcs = []  # permit e.g. cmip6556 or inst6556
-    for i in range(0, imax, 2):
-        n = num[i:i + 2]
-        if not n:
-            func = lambda key: True  # noqa: U100
-        elif n in ('5', '6'):
-            func = lambda key: key[0][-1] == n
-        elif n in ('65', '66', '56', '55'):
-            b = True if len(set(n)) == 2 else False
-            o = '6' if n[0] == '5' else '5'
-            func = lambda key, boo=b, num=n, opp=o: (
-                num[0] == key[0][-1]
-                and boo == any(
-                    name_to_inst.get((key[0], key[1]), object())
-                    == name_to_inst.get((other[0], other[1]), object())
-                    for other in data.facets.values if opp == other[0][-1]
-                )
-            )
-        else:
-            raise ValueError(f'Invalid project number {n!r}.')
-        funcs.append(func)
-    func = lambda key: any(func(key) for func in funcs)
-    func.name = project  # WARNING: critical for get_data() detection of 'all_projs'
-    return func
+    label = label or ''
+    label = label.replace('\n', ' ')  # remove previous wrapping
+    idxs = np.array([i for i, c in enumerate(label) if c == ' '])
+    adjs = idxs.astype(float)
+    for m in re.finditer(r'\$[^$]+\$', label):  # ignore all latex-math components
+        i, j = m.span()
+        adjs[(i <= idxs) & (idxs <= j)] = 0  # ignore by making lower than thresh
+        adjs[idxs > j] -= 0.9 * (j - i)  # try to account for actual space
+    refscale = refscale or 1.1
+    refwidth = refwidth or pplt.rc['subplots.refwidth']
+    threshs = refscale * pplt.units(refwidth, 'in', 'em') * np.arange(1, 10)
+    label = list(label)  # convert string to list
+    count = 0
+    for thresh in threshs:
+        if not any(adjs > thresh):  # including empty adjs
+            continue
+        if nmax and count >= nmax:
+            continue
+        idx = np.argmin(np.abs(adjs - thresh))
+        count += 1  # add to newline count
+        threshs += (adjs[idx] - thresh)  # adjust next thresholds
+        label[idxs[idx]] = '\n'
+    label = ''.join(label)
+    return label
 
 
-def _parse_institute(data, institute):
+def parse_spec(dataset, spec, **kwargs):
     """
-    Return plot labels and facet filter for the institute indicator.
+    Parse the variable name specification.
 
     Parameters
     ----------
-    data : xarray.Dataset or xarray.DataArray
-        The data. Must contain a ``'facets'`` coordinate.
-    institute : str
-        The selection. Can be ``'avg'`` to perform an institute-wise `groupby` average
-        and replace the model ids in the multi-index with curated institute ids, the
-        name of an institute to select only its associated models, or the special
-        key ``'flagship'`` to select "flagship" models from unique institutes (i.e.
-        the final models in the `cmip_data.internals` dictionary).
-
-    Returns
-    -------
-    callable or xarray.DataArray
-        A `facets` filter function or `groupby` array.
-    """
-    # NOTE: Averages across a given institution can be accomplished using the default
-    # method='avg' along with e.g. institute='GFDL'. The special institute='avg' is
-    # supported for special weighted facet-averages and bar or scatter plots.
-    inst_to_abbrv = INSTITUTES_ABBREVS.copy()  # see also _parse_constraints
-    model_to_inst = MODELS_INSTITUTES.copy()
-    if institute == 'avg':
-        insts = [
-            model_to_inst.get((key[0], key[1]), 'U')
-            for key in data.facets.values
-        ]
-        facets = [
-            (key[0], inst_to_abbrv.get(inst, inst), key[2], key[3])
-            for inst, key in zip(insts, data.facets.values)
-        ]
-        filt = xr.DataArray(  # WARNING: critical fro groupby() to name this 'facets'
-            pd.MultiIndex.from_tuples(facets, names=data.indexes['facets'].names),
-            attrs=data.facets.attrs,
-            dims='facets',
-            name='facets',
-        )
-    elif institute == 'flagship':  # flagship from either cmip5 or cmip6 series
-        inst_to_model = {
-            (proj, inst): model for (proj, model), inst in model_to_inst.items()
-        }
-        filt = lambda key: (
-            key[1]
-            == inst_to_model.get((key[0], model_to_inst.get((key[0], key[1]))))
-        )
-        filt.name = institute  # unnecessary but why not
-    else:
-        abbrv_to_inst = {
-            abbrv: inst for inst, abbrv in inst_to_abbrv.items()
-        }
-        filt = lambda key: (
-            abbrv_to_inst.get(institute, institute)
-            == model_to_inst.get((key[0], key[1]))
-        )
-        filt.name = institute  # unnecessary but why not
-    return filt
-
-
-def _parts_composite(data0, data1, pctile=None):  # noqa: E301
-    """
-    Return low and high composite components of `data1` based on `data0`.
-
-    Parameters
-    ----------
-    data0 : xarray.DataArray
-        The data used to build the composite.
-    data1 : xarray.DataArray
-        The data being composited.
-    pctile : float, optional
-        The percentile threshold.
-
-    Returns
-    -------
-    data_lo, data_hi : xarray.DataArray
-        The composite components.
-    """
-    thresh = 33 if pctile is None else pctile
-    data0, data1 = xr.broadcast(data0, data1)
-    comp_lo = np.nanpercentile(data0, thresh)
-    comp_hi = np.nanpercentile(data0, 100 - thresh)
-    mask_lo, = np.where(data0 <= comp_lo)
-    mask_hi, = np.where(data0 >= comp_hi)
-    data_hi = data1.isel(facets=mask_hi)
-    data_lo = data1.isel(facets=mask_lo)
-    with np.errstate(all='ignore'):
-        data_hi = data_hi.mean('facets', keep_attrs=True)
-        data_lo = data_lo.mean('facets', keep_attrs=True)
-    data_hi = data_hi.climo.quantify()
-    data_lo = data_lo.climo.quantify()
-    return data_lo, data_hi
-
-
-def _parts_covariance(data0, data1, both=True):
-    """
-    Return covariance and standard deviations of `data0` and optionally `data1`.
-
-    Parameters
-    ----------
-    data0 : xarray.DataArray
-        The first data. Standard deviation is always returned.
-    data1 : xarray.DataArray
-        The second data. Standard deviation is optionally returned.
-    both : bool, optional
-        Whether to also return standard deviation of `data0`.
-
-    Returns
-    -------
-    covar, std0, std1 : xarray.DataArray
-        The covariance and standard deviation components.
-    """
-    # NOTE: Currently masked arrays are used in climopy 'covar' and might also have
-    # overhead from metadata stripping stuff and permuting. So go manual here.
-    data0, data1 = xr.broadcast(data0, data1)
-    data0 = data0.climo.quantify()
-    data1 = data1.climo.quantify()
-    skipna = True
-    with np.errstate(all='ignore'):
-        mean0 = data0.mean(dim='facets', skipna=skipna)
-        mean1 = data1.mean(dim='facets', skipna=skipna)
-        anom0 = data0 - mean0
-        anom1 = data1 - mean1
-        covar = (anom0 * anom1).sum(dim='facets', skipna=skipna)
-        std0 = (anom0 ** 2).sum(dim='facets', skipna=skipna)
-        std0 = np.sqrt(std0)
-        if both:
-            std1 = (anom1 ** 2).sum(dim='facets', skipna=skipna)
-            std1 = np.sqrt(std1)
-    return (covar, std0, std1) if both else (covar, std0)
-
-
-def _apply_reduce(data, attrs=None, **kwargs):
-    """
-    Carry out arbitrary reduction of the given dataset variables.
-
-    Parameters
-    ----------
-    data : xarray.DataArray
+    dataset : `xarray.Dataset`
         The dataset.
-    attrs : dict, optional
-        The optional attribute overrides.
+    spec : sequence, str, or dict
+        The variable specification. Can be a ``(name, kwargs)``, a naked ``name``,
+        or a naked ``kwargs``. The name can be omitted or specified inside `kwargs`
+        with the `name` dictionary, and it will be specified when intersected with
+        other specifications (i.e. the row-column framework; see `parse_specs`).
     **kwargs
-        The reduction selections. Requires a `name`.
+        Additional keyword arguments, used as defaults for the unset keys
+        in the variable specifications.
 
     Returns
     -------
-    data : xarray.DataArray
-        The data array.
+    kw_dat : dict
+        The indexers used to reduce the data variable with `.reduce`. This is
+        parsed specially compared to other keywords, and its keys are restricted
+        to ``'name'`` and any coordinate or multi-index names.
+    kw_plt : namedtuple of dict
+        A named tuple containing keyword arguments for different plotting-related
+        commands. The tuple fields are as follows:
+
+          * ``figure``: Passed to `Figure` when the figure is instantiated.
+          * ``gridspec``: Passed to `GridSpec` when the gridfspec is instantiated.
+          * ``axes``: Passed to `.format` for cartesian or geographic formatting.
+          * ``colorbar``: Passed to `.colorbar` for scalar mappable outputs.
+          * ``legend``: Passed to `.legend` for other artist outputs.
+          * ``command``: Passed to the plotting command (the default field).
+          * ``attrs``: Added to `.attrs` for use in resulting plot labels.
     """
-    # Apply special reductions
-    # TODO: Might consider adding 'institute' multi-index so e.g. grouby('institute')
-    # is possible... then again would not reduce complexity because would now need to
-    # load files in special non-alphabetical order to enable selecting 'flaghip' models
-    # with e.g. something like .sel(institute=-1)... so don't bother for now.
-    project = kwargs.pop('project', None)
-    if project is not None:  # see _parse_project
-        if callable(project):
-            facets = list(filter(project, data.facets.values))
-            data = data.sel(facets=facets)
-        else:
-            raise RuntimeError(f'Unsupported project {project!r}.')
-    institute = kwargs.pop('institute', None)
-    if institute is not None:  # ignore dummy None
-        if callable(institute):  # facets filter function
-            facets = list(filter(institute, data.facets.values))
-            data = data.sel(facets=facets)
-        elif isinstance(institute, xr.DataArray):  # groupby multi-index data array
-            if project:  # filter works with both models and institutes
-                bools = list(map(project, institute.facets.values))
-                institute = institute[{'facets': bools}]
-            data = data.groupby(institute).mean(skipna=False, keep_attrs=True)
-            facets = data.indexes['facets']  # xarray bug causes dropped level names
-            facets.names = institute.indexes['facets'].names
-            facets = xr.DataArray(
-                facets,
-                name='facets',
-                dims='facets',
-                attrs=institute.facets.attrs  # WARNING: avoid overwriting input kwarg
-            )
-            data = data.assign_coords(facets=facets)
-        else:
-            raise RuntimeError(f'Unsupported institute {institute!r}.')
-
-    # Apply defaults and iterate over options
-    # NOTE: This silently skips dummy selections (e.g. area=None) that may be required
-    # to prevent _parse_specs from merging e.g. average and non-average selections.
-    # WARNING: Sometimes multi-index reductions can eliminate previously valid coords,
-    # so critical to iterate one-by-one and validate selections each time.
-    name = data.name
-    attrs = attrs or {}
-    attrs = attrs.copy()  # WARNING: critical
-    defaults = {'period': 'ann', 'ensemble': 'flagship', 'experiment': 'picontrol'}
-    versions = {'source': 'eraint', 'statistic': 'slope', 'region': 'globe'}
-    if 'version' in data.coords:
-        defaults.update({'experiment': 'abrupt4xco2', **versions})
-    for key, value in defaults.items():
-        kwargs.setdefault(key, value)
-    for key, value in data.attrs.items():
-        attrs.setdefault(key, value)
-    order = list(ORDER_LOGICAL)
-    sorter = lambda key: order.index(key) if key in order else len(order)
-    for key in sorted(kwargs, key=sorter):
-        value = kwargs[key]
-        options = list(data.sizes)
-        options.extend(name for idx in data.indexes.values() for name in idx.names)
-        options.extend(('area', 'volume'))
-        if value is None:
-            continue
-        if key not in options:
-            continue
-        if key == 'volume':  # auto-skip if coordinates not available
-            if not data.sizes.keys() & {'lon', 'lat', 'plev'}:
-                continue
-        if key == 'area':  # auto-skip if coordinates not available
-            region = AREA_REGIONS.get(value, None)
-            if not data.sizes.keys() & {'lon', 'lat'}:
-                continue
-            elif region is not None:
-                data, value = data.climo.truncate(region), 'avg'
-            elif value != 'avg':
-                raise ValueError(f'Unknown averaging region {value!r}.')
-        data = data.climo.reduce(**{key: value})
-        data = data.squeeze()
-    data.name = name
-    data.attrs.update(attrs)
-    return data
+    # NOTE: For subsequent processing we put the variables being combined (usually
+    # just one) inside the 'name' key in kw_red (here `short` is shortened relative
+    # to actual dataset names and intended for file names only). This helps when
+    # merging variable specifications between row and column specifications and
+    # between tuple-style specifications (see parse_specs).
+    options = list(dataset.sizes)
+    options.extend(name for idx in dataset.indexes.values() for name in idx.names)
+    options.extend(('area', 'volume', 'institute'))  # see _parse_institute
+    options.extend(('method', 'invert', 'pctile', 'std'))  # see apply_method
+    if spec is None:
+        name, kw = None, {}
+    elif isinstance(spec, str):
+        name, kw = spec, {}
+    elif isinstance(spec, dict):
+        name, kw = None, spec
+    else:  # length-2 iterable
+        name, kw = spec
+    kw = {**kwargs, **kw}  # copy
+    alt = kw.pop('name', None)
+    name = name or alt  # see below
+    kw_dat, kw_att = {}, {}
+    kw_fig, kw_grd, kw_axs = {}, {}, {}
+    kw_cmd, kw_cba, kw_leg = {}, {}, {}
+    keys = ('space', 'ratio', 'group', 'equal', 'left', 'right', 'bottom', 'top')
+    att_detect = ('short', 'long', 'standard', 'xlabel_', 'ylabel_')
+    fig_detect = ('fig', 'ref', 'space', 'share', 'span', 'align')
+    grd_detect = tuple(s + key for key in keys for s in ('w', 'h', ''))
+    axs_detect = ('x', 'y', 'lon', 'lat', 'abc', 'title', 'coast')
+    bar_detect = ('extend', 'tick', 'locator', 'formatter', 'minor', 'label', 'length', 'shrink')  # noqa: E501
+    leg_detect = ('ncol', 'order', 'frame', 'handle', 'border', 'column')
+    for key, value in kw.items():  # NOTE: sorting performed in _parse_labels
+        if key in options:
+            kw_dat[key] = value  # e.g. for averaging
+        elif any(key.startswith(prefix) for prefix in att_detect):
+            kw_att[key] = value
+        elif any(key.startswith(prefix) for prefix in fig_detect):
+            kw_fig[key] = value
+        elif any(key.startswith(prefix) for prefix in grd_detect):
+            kw_grd[key] = value
+        elif any(key.startswith(prefix) for prefix in axs_detect):
+            kw_axs[key] = value
+        elif any(key.startswith(prefix) for prefix in bar_detect):
+            kw_cba[key] = value
+        elif any(key.startswith(prefix) for prefix in leg_detect):
+            kw_leg[key] = value
+        else:  # arbitrary plotting keywords
+            kw_cmd[key] = value
+    if isinstance(name, str):
+        kw_dat['name'] = name  # always place last for gridspec labels
+    keys = ('method', 'std', 'pctile', 'invert')
+    kw_dat.update({key: kwargs.pop(key) for key in keys if key in kwargs})
+    fields = ('figure', 'gridspec', 'axes', 'command', 'attrs', 'colorbar', 'legend')
+    kwargs = collections.namedtuple('kwargs', fields)
+    kw_plt = kwargs(kw_fig, kw_grd, kw_axs, kw_cmd, kw_att, kw_cba, kw_leg)
+    return kw_dat, kw_plt
 
 
-def _apply_method(
-    *datas, method=None, std=None, pctile=None, invert=False, verbose=False
-):
+def parse_specs(dataset, rowspecs=None, colspecs=None, **kwargs):
     """
-    Reduce along the facets coordinate using an arbitrary method.
-
-    Parameters
-    ----------
-    *datas : xarray.DataArray
-        The data array(s).
-    method : str, optional
-        The method. ``dist``, ``dstd``, and ``dpctile`` retain the facets dimension
-        before plotting. ``avg``, ``std``, and ``pctile`` reduce the facets dimension
-        for a single input argument. ``corr``, ``diff``, ``proj``, and ``slope``
-        reduce the facets dimension for two input arguments. See below for dtails.
-    pctile : float or sequence, optional
-        The percentile thresholds for related methods. The default is ``33``
-        for `diff`, ``25`` for `pctile`, and `90` for `dpctile`.
-    std : float or sequence, optional
-        The standard deviation multiple for related methods. The default is
-        ``1`` for `std` and ``3`` for `dstd`.
-    invert : bool, optional
-        Whether to invert the direction of composites, projections, and regressions so
-        that the first variable is the predictor instead of the second variable.
-
-    Returns
-    -------
-    args : tuple
-        The output plotting arrays.
-    method : str
-        The resulting method used.
-    kwargs : dict
-        The plotting and `_infer_command` keyword arguments.
-    """
-    # Combine one array along facets dimension
-    # NOTE: Here `pctile` is shared between inter-model percentile differences and
-    # composites of a second array based on values in the first array.
-    # NOTE: Currently proplot will automatically apply xarray tuple multi-index
-    # coordinates to bar plot then error out so apply numpy array coords for now.
-    defaults = {}
-    datas = tuple(data.copy() for data in datas)
-    ndims = tuple(data.ndim for data in datas)
-    args = name = long = short = None
-    if invert:
-        datas = datas[::-1]
-    if max(ndims) == 1:
-        method = method or 'dist'  # only possibility
-    elif len(datas) == 1:
-        method = method or 'avg'
-    else:
-        method = method or 'rsq'
-    if len(datas) == 1:
-        data, = datas
-        name = data.name
-        if method == 'avg':
-            data = data.mean('facets', skipna=True, keep_attrs=True)
-        elif method == 'med':
-            data = data.median('facets', skipna=True, keep_attrs=True)
-        elif method == 'std':
-            std = 1.0 if std is None else std
-            with xr.set_options(keep_attrs=True):  # note name is already kept
-                data = std * data.std('facets', skipna=True)
-            short = f'{data.short_name} standard deviation'
-            long = f'{data.long_name} standard deviation'
-        elif method == 'pctile':
-            pctile = 25.0 if pctile is None else pctile
-            with xr.set_options(keep_attrs=True):  # note name is already kept
-                hi = data.quantile(1 - 0.01 * pctile, dim='facets', skipna=True)
-                lo = data.quantile(0.01 * pctile, dim='facets', skipna=True)
-                data = hi - lo
-            short = f'{data.short_name} percentile range'
-            long = f'{data.long_name} percentile range'
-        elif method == 'dstd':
-            assert max(ndims) == 2
-            shade = 3.0 if std is None else 3.0
-            defaults.update({'means': True, 'shadestds': shade})
-        elif method == 'dpctile':
-            assert max(ndims) == 2
-            shade = 90.0 if pctile is None else pctile
-            defaults.update({'medians': True, 'shadepctiles': shade})
-        elif method == 'dist':  # horizontal lines
-            assert max(ndims) == 1
-            data = data[~data.isnull()]
-            args = (data,)
-        else:
-            raise ValueError(f'Invalid single-variable method {method}.')
-
-    # Combine two arrays along facets dimension
-    # NOTE: The idea for 'diff' reductions is to build the feedback-based composite
-    # difference defined ``data[feedback > 100 - pctile] - data[feedback < pctile]``.
-    elif len(datas) == 2:
-        data0, data1 = datas
-        name = f'{data0.name}-{data1.name}'
-        if method == 'rsq':  # correlation coefficient
-            cov, std0, std1 = _parts_covariance(*datas, both=True)
-            data = (cov / (std0 * std1)) ** 2
-            data = data.climo.to_units('percent').climo.dequantify()
-            short = f'{data1.short_name} variance explained'
-            long = f'{data0.long_name}-{data1.long_name} variance explained'
-        elif method == 'corr':  # correlation coefficient
-            cov, std0, std1 = _parts_covariance(*datas, both=True)
-            data = cov / (std0 * std1)
-            data = data.climo.to_units('dimensionless').climo.dequantify()
-            short = f'{data1.short_name} correlation'
-            long = f'{data0.long_name}-{data1.long_name} correlation coefficient'  # noqa: E501
-        elif method == 'proj':  # projection onto x
-            cov, std = _parts_covariance(*datas, both=False)
-            data = cov / std
-            data = data.climo.dequantify()
-            short = f'{data1.short_name} projection'
-            long = f'{data1.long_name} vs. {data0.long_name}'
-        elif method == 'slope':  # regression coefficient
-            cov, std = _parts_covariance(*datas, both=False)
-            data = cov / std ** 2
-            data = data.climo.dequantify()
-            short = f'{data1.short_name} regression coefficient'
-            long = f'{data1.long_name} vs. {data0.long_name} regression coefficient'
-        elif method == 'diff':  # composite difference along first arrays
-            data_lo, data_hi = _parts_composite(*datas)
-            data = data_hi - data_lo
-            data = data.climo.dequantify()
-            short = f'{data1.short_name} composite difference'
-            long = f'{data0.long_name}-composite {data1.long_name} difference'  # noqa: E501
-        elif method == 'dist':  # scatter points
-            assert max(ndims) == 1
-            data0, data1 = data0[~data0.isnull()], data1[~data1.isnull()]
-            data0, data1 = xr.align(data0, data1)  # intersection-style broadcast
-            args = (data0, data1)
-            name = None
-        else:
-            raise ValueError(f'Invalid double-variable method {method}')
-    else:
-        raise ValueError(f'Unexpected argument count {len(datas)}.')
-
-    # Standardize the result and print information
-    # NOTE: This modifies
-    args = args or (data,)
-    args = list(args)
-    if name:
-        args[-1].name = name
-    if long:
-        args[-1].attrs['long_name'] = long
-    if short:
-        args[-1].attrs['short_name'] = short
-    keys = ('facets', 'time', 'plev', 'lat', 'lon')  # sorting order
-    args = [arg.transpose(..., *(key for key in keys if key in arg.sizes)) for arg in args]  # noqa: E501
-    if verbose:
-        masks = [(~arg.isnull()).any(arg.sizes.keys() - {'facets'}) for arg in args]
-        valid = invalid = ''
-        if len(masks) == 2:  # show individual and their intersection
-            mask = masks[0] & masks[1]
-            valid, invalid = f' ({np.sum(mask).item()})', f' ({np.sum(~mask).item()})'
-        for mask, data in zip(masks, args[len(args) - len(masks):]):
-            min_, max_, mean = data.min().item(), data.mean().item(), data.max().item()
-            print(format(f'{data.name} {method}:', ' <20s'), end=' ')
-            print(f'min {min_: <+7.2f} max {max_: <+7.2f} mean {mean: <+7.2f}', end=' ')
-            print(f'valid {np.sum(mask).item()}{valid}', end=' ')
-            print(f'invalid {np.sum(~mask).item()}{invalid}', end='\n')
-    return args, method, defaults
-
-
-def get_data(dataset, *kws_dat, attrs=None):
-    """
-    Combine the data based on input reduce dictionaries.
+    Parse variable and project specifications and auto-determine row and column
+    labels based on the unique names and/or keywords in the spec lists.
 
     Parameters
     ----------
     dataset : xarray.Dataset
         The source dataset.
-    *kws_dat : dict
-        The reduction keyword dictionaries.
-    attrs : dict, optional
-        The attribute dictionaries.
+    rowspecs : list of name, tuple, dict, or list thereof
+        The variable specification(s) per subplot slot.
+    colspecs : list of name, tuple, dict, or list thereof
+        The variable specification(s) per subplot slot.
+    **kwargs
+        Additional options shared across all specs.
 
     Returns
     -------
-    args : tuple
-        The output plotting arrays.
-    method : str
-        The resulting method used.
-    kwargs : dict
-        The plotting and `_infer_command` keyword arguments.
+    dataspecs : list of list of tuple of dict
+        The reduction keyword argument specifications.
+    plotspecs : list of list of kwargs
+        The keyword arguments used for plotting.
+    figlabel : str, optional
+        The default figure title center.
+    pathlabel : list of list of str
+        The default figure path center.
+    gridlabels : list of list of str
+        The default row and column labels.
     """
-    # Group added/subtracted reduce instructions into separate dictionaries
-    # NOTE: Initial kw_red values are formatted as (('[+-]', value), ...) to
-    # permit arbitrary combinations of names and indexers (see _parse_specs).
-    alias_to_name = {
-        alias: name for alias, (name, _) in FEEDBACK_TRANSLATIONS.items()
-    }
-    if 'control' in dataset.experiment:
-        alias_to_name.update({'picontrol': 'control', 'abrupt4xco2': 'response'})
-    else:
-        alias_to_name.update({'control': 'picontrol', 'response': 'abrupt4xco2'})
-    kws_method = []  # each item represents a method argument
-    keys_method = ('method', 'std', 'pctile', 'invert')  # special method keywords
-    for kw_dat in kws_dat:
-        scale = 1
-        kw_reduce = {}
-        kw_method = {key: kw_dat.pop(key) for key in keys_method if key in kw_dat}
-        for key, value in kw_dat.items():
-            sels = ['+']
-            parts = REGEX_SPLIT.split(value) if isinstance(value, str) else (value,)
-            for i, part in enumerate(parts):
-                if isinstance(part, str) and REGEX_FLOAT.match(part):  # e.g. 850-250hPa
-                    part = float(part)
-                if part in (None, '+', '-', '*', '/'):  # dummy coordinate or operator
-                    sel = part
-                elif key == 'project':
-                    sel = _parse_project(dataset, part)
-                elif key == 'institute':
-                    sel = _parse_institute(dataset, part)
-                elif isinstance(part, str):
-                    sel = alias_to_name.get(part, part)
+    # Parse variable specs per gridspec row or column and per subplot
+    # NOTE: This permits sharing keywords across each group with trailing dicts
+    # in either the primary gridspec list or any of the subplot sub-lists.
+    # NOTE: The two arrays required for two-argument methods can be indicated with
+    # either 2-tuples in spec lists or conflicting row and column names or reductions.
+    refwidth = refscale = None
+    dataspecs, plotspecs, gridlabels = [], [], []
+    for n, inspecs in enumerate((rowspecs, colspecs)):
+        datspecs, pltspecs = [], []
+        if not isinstance(inspecs, list):
+            inspecs = [inspecs]
+        for ispecs in inspecs:  # specs per figure
+            dspecs, pspecs = [], []
+            if not isinstance(ispecs, list):
+                ispecs = [ispecs]
+            for ispec in ispecs:  # specs per subplot
+                dspec, pspec = [], []
+                if ispec is None:
+                    ispec = (None,)  # possibly construct from keyword args
+                elif isinstance(ispec, (str, dict)):
+                    ispec = (ispec,)
+                elif len(ispec) != 2:
+                    raise ValueError(f'Invalid variable specs {ispec}.')
+                elif type(ispec[0]) != type(ispec[1]):  # noqa: E721  # i.e. (str, dict)
+                    ispec = (ispec,)
                 else:
-                    unit = dataset[key].climo.units
-                    if not isinstance(part, ureg.Quantity):
-                        part = ureg.Quantity(part, unit)
-                    sel = part.to(unit)
-                sels.append(sel)
-            signs, values = sels[0::2], sels[1::2]
-            scale *= sum(sign == '+' for sign in signs)
-            kw_reduce[key] = tuple(zip(signs, values))
-        kws_reduce = []
-        for values in itertools.product(*kw_reduce.values()):
-            signs, values = zip(*values)
-            sign = -1 if signs.count('-') % 2 else +1
-            kw = dict(zip(kw_reduce, values))
-            kw.update(kw_method)
-            kws_reduce.append((sign, kw))
-        kws_method.append((scale, kws_reduce))
+                    ispec = tuple(ispec)
+                for spec in ispec:  # specs per correlation pair
+                    kw_dat, kw_plt = parse_spec(dataset, spec, **kwargs)
+                    if value := kw_plt.figure.get('refwidth', None):
+                        refwidth = value
+                    if not any(kw_dat.get(key, None) for key in ('lon', 'lat', 'area')):
+                        refscale = 0.7 if n == 0 else None
+                    dspec.append(kw_dat)
+                    pspec.append(kw_plt)
+                dspecs.append(tuple(dspec))  # tuple to identify as correlation-pair
+                pspecs.append(tuple(pspec))
+            datspecs.append(dspecs)
+            pltspecs.append(pspecs)
+        zerospecs = [dspecs[0] if dspecs else {} for dspecs in datspecs]
+        grdlabels = _infer_labels(
+            dataset,
+            *zerospecs,
+            identical=False,
+            long_names=True,
+            title_case=True,
+            refwidth=refwidth,
+            refscale=refscale,
+        )
+        gridlabels.append(grdlabels)
+        dataspecs.append(datspecs)
+        plotspecs.append(pltspecs)
 
-    # Reduce along facets dimension and carry out operation
-    # TODO: Add other possible reduction methods, e.g. covariance
-    # or regressions instead of normalized correlation.
-    # NOTE: Here 'skip' prevents subtracting or averaging identical selections
-    # from identical selections (i.e. all-zero array generation).
-    scales, kws_method = zip(*kws_method)
-    if len(set(scales)) > 1:
-        raise RuntimeError(f'Mixed reduction scalings {scales}.')
-    all_membs = all_projs = True
-    kws_method = list(kws_method)
-    skip = None
-    if len(kws_method) == 2 and len(kws_method[0]) == 1 and len(kws_method[1]) != 1:
-        skip = 0
-        kws_method[0] = kws_method[0] * len(kws_method[1])
-    if len(kws_method) == 2 and len(kws_method[1]) == 1 and len(kws_method[0]) != 1:
-        skip = 1
-        kws_method[1] = kws_method[1] * len(kws_method[0])
-    kws_persum = zip(*kws_method)
-    kwargs = {}
-    datas_persum = []  # each item part of a summation
-    methods_persum = set()
-    for kws_reduce in kws_persum:
-        kw_method = {}
-        keys = ('std', 'pctile', 'invert', 'method')
-        datas = []
-        signs, kws_reduce = zip(*kws_reduce)
-        if skip is not None:  # ignore scalar indices
-            signs = (signs[1 - skip],)
-        if len(set(signs)) > 1:
-            raise RuntimeError(f'Mixed reduction signs {signs}.')
-        for kw in kws_reduce:  # two for e.g. 'corr', one for e.g. 'avg'
-            kw_reduce = kw.copy()
-            for key in tuple(kw_reduce):
-                if key in keys:
-                    kw_method.setdefault(key, kw_reduce.pop(key))
-            institute = kw_reduce.get('institute', None)
-            project = getattr(kw_reduce.get('project'), 'name', '')
-            all_membs = all_membs and institute is None
-            all_projs = all_projs and len(project) not in (5, 6)
-            data = dataset[kw_reduce.pop('name')]
-            data = _apply_reduce(data, attrs=attrs, **kw_reduce)
-            datas.append(data)
-        datas, method, default = _apply_method(*datas, **kw_method)
-        for key, value in default.items():
-            kwargs.setdefault(key, value)
-        datas_persum.append((signs[0], datas))  # plotting command arguments
-        methods_persum.add(method)
-        if len(methods_persum) > 1:
-            raise RuntimeError(f'Mixed reduction methods {methods_persum}.')
-
-    # Combine arrays specified with reduction '+' and '-' keywords
-    # NOTE: The default inferred prefixes associated with reductions are passed
-    # here with 'attrs' so only need to possibly modify the suffix.
-    # NOTE: The additions below are scaled as *averages* so e.g. project='cmip5+cmip6'
-    # gives the average across cmip5 and cmip6 inter-model averages.
-    # NOTE: The operations below use a dummy 'cmip' project before acting to support
-    # specific case of e.g. project='cmip6-cmip5' with institute='avg'.
-    def _replace_project(data, project=None):  # temporarily replace project
-        project = project or 'CMIP'
-        projects = data.project.values if hasattr(data, 'project') else np.array([])
-        original = projects[0] if len(projects) > 0 else None
-        if len(projects) > 1 and all(proj == original for proj in projects):
-            facets = [(project, *key[1:]) for key in data.facets.values]
-            facets = xr.DataArray(
-                pd.MultiIndex.from_tuples(facets, names=data.indexes['facets'].names),
-                attrs=data.facets.attrs,
-                dims='facets',
-                name='facets',
+    # Combine row and column specifications for plotting and file naming
+    # NOTE: Several plotted values per subplot can be indicated in either the
+    # row or column list, and the specs from the other list are repeated below.
+    # WARNING: Critical to make copies of dictionaries or create new ones
+    # here since itertools product repeats the same spec multiple times.
+    bothspecs = [
+        [list(zip(dspecs, pspecs)) for dspecs, pspecs in zip(datspecs, pltspecs)]
+        for datspecs, pltspecs in zip(dataspecs, plotspecs)
+    ]
+    kw_infer = dict(
+        keeppairs=False,
+        identical=False,
+        skip_area=True,
+        skip_name=True,
+        long_names=False,
+        title_case=False
+    )
+    dataspecs, plotspecs = [], []
+    for (i, rspecs), (j, cspecs) in itertools.product(*map(enumerate, bothspecs)):
+        if len(rspecs) == 1:
+            rspecs = list(rspecs) * len(cspecs)
+        if len(cspecs) == 1:
+            cspecs = list(cspecs) * len(rspecs)
+        if len(rspecs) != len(cspecs):
+            raise ValueError(
+                'Incompatible per-subplot spec count.'
+                + f'\nRow specs ({len(rspecs)}): \n' + '\n'.join(map(repr, rspecs))
+                + f'\nColumn specs ({len(cspecs)}): \n' + '\n'.join(map(repr, cspecs))
             )
-            data = data.assign_coords(facets=facets)
-        return data, original
-    args = []
-    signs, datas_persum = zip(*datas_persum)
-    kwargs.update({'projects': all_projs, 'members': all_membs})
-    for s, datas in enumerate(zip(*datas_persum)):
-        if s == skip and method == 'dist':
-            data = datas[0]
-        else:
-            datas, projs = zip(*map(_replace_project, datas))
-            datas = xr.align(*datas)
-            if 'facets' in datas[0].coords and not datas[0].facets.size:
+        dspecs, pspecs = [], []
+        for k, (rspec, cspec) in enumerate(zip(rspecs, cspecs)):  # subplot entries
+            rkws_dat, rkws_plt, ckws_dat, ckws_plt = *rspec, *cspec
+            kwargs = type((rkws_plt or ckws_plt)[0])
+            kws = []
+            for field in kwargs._fields:
+                kw = {}  # NOTE: previously applied default values here
+                for ikws_plt in (rkws_plt, ckws_plt):
+                    for ikw_plt in ikws_plt:  # correlation pairs
+                        for key, value in getattr(ikw_plt, field).items():
+                            kw.setdefault(key, value)  # prefer row entries
+                kws.append(kw)
+            kw_plt = kwargs(*kws)
+            rkws_dat = tuple(kw.copy() for kw in rkws_dat)  # NOTE: copy is critical
+            ckws_dat = tuple(kw.copy() for kw in ckws_dat)
+            for ikws_dat, jkws_dat in ((rkws_dat, ckws_dat), (ckws_dat, rkws_dat)):
+                for key in ikws_dat[0]:
+                    if key not in ikws_dat[-1]:
+                        continue
+                    if ikws_dat[0][key] == ikws_dat[-1][key]:
+                        for kw in jkws_dat:  # possible correlation pair
+                            kw.setdefault(key, ikws_dat[0][key])
+            kws_dat = {}  # filter unique specifications
+            for kw_dat in (*rkws_dat, *ckws_dat):
+                keys = ('method', 'std', 'pctile', 'invert')
+                keys = sorted(key for key in kw_dat if key not in keys)
+                keyval = tuple((key, kw_dat[key]) for key in keys)
+                if tuple(keyval) in kws_dat:
+                    continue
+                others = tuple(other for other in kws_dat if set(keyval) < set(other))
+                if others:
+                    continue
+                others = tuple(other for other in kws_dat if set(other) < set(keyval))
+                for other in others:  # prefer more selection keywords
+                    kws_dat.pop(other)
+                kws_dat[tuple(keyval)] = kw_dat
+            kws_dat = tuple(kws_dat.values())  # possible correlation tuple
+            if len(kws_dat) > 2:
                 raise RuntimeError(
-                    'Empty facets dimension. This is most likely due to an '
-                    'operation across projects without an institute average.'
+                    'Expected 1-2 specs for combining with get_data but got '
+                    f'{len(kws_dat)} specs: ' + '\n'.join(map(repr, kws_dat))
                 )
-            with xr.set_options(keep_attrs=True):
-                data = sum(sign * sdata for sign, sdata in zip(signs, datas))
-                data = data / scales[0]
-            proj = 'CMIP6' if len(set(projs)) > 1 else projs[0]
-            data, _ = _replace_project(data, proj)
-            if any(sign == -1 for sign in signs):
-                data.attrs['long_suffix'] = 'anomaly'
-                data.attrs['short_suffix'] = 'anomaly'
-        args.append(data)
-    args = xr.align(*args)  # re-align after summation
-    return args, method, kwargs
-
-
-def get_breakdown(
-    component=None,
-    breakdown=None,
-    feedbacks=True,
-    adjusts=False,
-    forcing=False,
-    sensitivity=False,
-    maxcols=None,
-):
-    """
-    Return the feedback, forcing, and sensitivity parameter specs sensibly
-    organized depending on the number of columns in the plot.
-
-    Parameters
-    ----------
-    component : str, optional
-        The individual component to use.
-    breakdown : str, default: 'all'
-        The breakdown preset to use.
-    feedbacks, adjusts, forcing, sensitivity : bool, optional
-        Whether to include various components.
-    maxcols : int, default: 4
-        The maximum number of columns (influences order of the specs).
-
-    Returns
-    -------
-    specs : list of str
-        The variables.
-    maxcols : int
-        The possibly adjusted number of columns.
-    gridskip : list of int
-        The gridspec entries to skip.
-    """
-    # Interpret keyword arguments from suffixes
-    # NOTE: Idea is to automatically remove feedbacks, filter out all-none
-    # rows and columns at the end, and then infer the 'gridskip' from them.
-    original = maxcols = maxcols or 4
-    if breakdown is None:
-        component = component or 'net'
-    if component is None:
-        breakdown = breakdown or 'all'
-    if breakdown and '_lam' in breakdown:
-        breakdown, *_ = breakdown.split('_lam')
-        feedbacks = True
-    if breakdown and '_adj' in breakdown:
-        breakdown, *_ = breakdown.split('_erf')
-        adjusts, forcing = True, False  # effective forcing *and* rapid adjustments
-    if breakdown and '_erf' in breakdown:
-        breakdown, *_ = breakdown.split('_erf')
-        forcing, adjusts = True, False  # effective forcing *without* rapid adjustments
-    if breakdown and '_ecs' in breakdown:
-        breakdown, *_ = breakdown.split('_ecs')
-        sensitivity = True
-    if not component and not feedbacks and not forcing and not sensitivity:
-        raise RuntimeError
-
-    # Three variable breakdowns
-    # NOTE: Options include 'wav', 'atm', 'alb', 'res', 'all', 'atm_wav', 'alb_wav'
-    # with the 'wav' suffixes including longwave and shortwave cloud components
-    # instead of a total cloud feedback. Strings denote successively adding atmospheric,
-    # albedo, residual, and remaining temperature/humidity feedbacks with options.
-    def _get_array(cols):
-        names = np.array([[None] * cols] * 25)
-        iflat = names.flat
-        return names, iflat
-    if component is not None:
-        names, iflat = _get_array(maxcols)
-        iflat[0] = component
-        gridskip = None
-    elif breakdown in ('net', 'wav', 'atm'):  # shortwave longwave
-        if breakdown == 'net':  # net lw/sw
-            lams = ['net', 'sw', 'lw']
-            erfs = ['erf', 'rsnt_erf', 'rlnt_erf']
-        elif breakdown == 'wav':  # cloud lw/sw
-            lams = ['net', 'swcld', 'lwcld']
-            erfs = ['erf', 'cl_rsnt_erf', 'cl_rlnt_erf']
-        elif breakdown == 'atm':  # net cloud, atmosphere
-            lams = ['net', 'cld', 'atm']
-            erfs = ['erf', 'cl_rfnt_erf', 'atm_rfnt_erf']
-        else:
-            raise RuntimeError
-        if maxcols == 2:
-            names, iflat = _get_array(maxcols)
-            if sensitivity:
-                iflat[0] = 'ecs'
-            if feedbacks and adjusts:
-                names[1:4, 0] = lams
-                names[1:4, 1] = erfs
-            elif feedbacks and forcing:
-                names[1, :] = lams[:1] + erfs[:1]
-                names[2, :] = lams[1:]
-            elif feedbacks:
-                iflat[1] = lams[0]
-                names[1, :] = lams[1:]
-            elif adjusts:
-                iflat[1] = erfs[0]
-                names[1, :] = erfs[1:]
-        else:
-            offset = 0
-            maxcols = 1 if maxcols == 1 else 3
-            names, iflat = _get_array(maxcols)
-            if sensitivity:
-                iflat[offset] = 'ecs'
-            if forcing:
-                iflat[offset + 1] = 'erf'
-            if feedbacks:
-                idx = 2 * maxcols
-                iflat[idx:idx + 3] = lams
-            if adjusts:
-                idx = 3 * maxcols
-                iflat[idx:idx + 3] = erfs
-
-    # Four variable breakdowns
-    elif breakdown in ('cld_wav', 'atm_wav', 'atm_res', 'alb'):
-        if 'cld' in breakdown:  # net cloud, cloud lw/sw
-            lams = ['net', 'cld', 'swcld', 'lwcld']
-            erfs = ['erf', 'cl_rfnt_erf', 'cl_rsnt_erf', 'cl_rlnt_erf']
-        elif 'res' in breakdown:  # net cloud, residual, atmosphere
-            lams = ['net', 'cld', 'resid', 'atm']
-            erfs = ['erf', 'cl_rfnt_erf', 'resid_rfnt_erf', 'atm_rfnt_erf']  # noqa: E501
-        elif 'atm' in breakdown:  # cloud lw/sw, atmosphere
-            lams = ['net', 'swcld', 'lwcld', 'atm']
-            erfs = ['erf', 'cl_rsnt_erf', 'cl_rlnt_erf', 'atm_rfnt_erf']
-        elif breakdown == 'alb':  # net cloud, atmosphere, albedo
-            lams = ['net', 'cld', 'alb', 'atm']
-            erfs = ['erf', 'cl_rfnt_erf', 'alb_rfnt_erf', 'atm_rfnt_erf']
-        else:
-            raise RuntimeError
-        if maxcols == 2:
-            names, iflat = _get_array(maxcols)
-            if sensitivity:
-                iflat[0] = 'ecs'
-            if feedbacks and adjusts:
-                names[1:5, 0] = lams
-                names[1:5, 1] = erfs
-            elif feedbacks:
-                iflat[1] = 'erf' if forcing else None
-                names[1, :] = lams[::3]
-                names[2, :] = lams[1:3]
-            elif adjusts:
-                names[1, :] = erfs[::3]
-                names[2, :] = erfs[1:3]
-        else:
-            offset = 0 if maxcols == 1 else 1
-            maxcols = 1 if maxcols == 1 else 3
-            names, iflat = _get_array(maxcols)
-            if sensitivity:
-                iflat[-offset % 3] = 'ecs'
-            if forcing or adjusts:
-                iflat[2 - offset] = 'erf'
-            if feedbacks:
-                idx = 3
-                iflat[1 - offset] = lams[0]
-                iflat[idx:idx + 3] = lams[1:]
-            if adjusts:
-                idx = 3 + 3
-                iflat[idx:idx + 3] = erfs[1:]
-
-    # Five variable breakdowns
-    # NOTE: Currently this is the only breakdown with both clouds
-    elif breakdown in ('atm_cld', 'alb_wav', 'res', 'res_wav'):
-        if 'atm' in breakdown:  # net cloud, cloud lw/sw, atmosphere
-            lams = ['net', 'cld', 'swcld', 'lwcld', 'atm']
-            erfs = ['erf', 'cl_rfnt_erf', 'cl_rsnt_erf', 'cl_rlnt_erf', 'atm_rfnt_erf']
-        elif 'alb' in breakdown:  # cloud lw/sw, atmosphere, albedo
-            lams = ['net', 'swcld', 'lwcld', 'alb', 'atm']
-            erfs = ['erf', 'cl_rsnt_erf', 'cl_rlnt_erf', 'alb_rfnt_erf', 'atm_rfnt_erf']
-        elif breakdown == 'res':  # net cloud, atmosphere, albedo, residual
-            lams = ['net', 'cld', 'alb', 'resid', 'atm']
-            erfs = ['erf', 'cl_rfnt_erf', 'alb_rfnt_erf', 'resid_rfnt_erf', 'atm_rfnt_erf']  # noqa: E501
-        elif 'res' in breakdown:  # cloud lw/sw, atmosphere, residual
-            lams = ['net', 'swcld', 'lwcld', 'resid', 'atm']
-            erfs = ['erf', 'cs_rlnt_erf', 'cl_rlnt_erf', 'resid_rfnt_erf', 'atm_rfnt_erf']  # noqa: E501
-        else:
-            raise RuntimeError
-        if maxcols == 2:
-            names, iflat = _get_array(maxcols)
-            if sensitivity:
-                iflat[0] = 'ecs'
-            if feedbacks and adjusts:
-                names[1:5, 0] = lams
-                names[1:5, 1] = erfs  # noqa: E501
-            elif feedbacks and forcing:
-                names[1, :] = lams[:1] + erfs[:1]
-                names[2, :] = lams[1:3]
-                names[3, :] = lams[3:5]
-            elif feedbacks:
-                names[0, 1] = lams[0]
-                names[1, :] = lams[1:3]
-                names[2, :] = lams[3:5]
-            elif adjusts:
-                names[0, 1] = erfs[0]
-                names[1, :] = erfs[1:3]
-                names[2, :] = erfs[3:5]
-        else:
-            offset = 0 if maxcols == 1 else 1
-            maxcols = 1 if maxcols == 1 else 4  # disallow 3 columns
-            names, iflat = _get_array(maxcols)
-            if sensitivity:
-                iflat[-offset % 3] = 'ecs'  # either before or after net and erf
-            if forcing or adjusts:
-                iflat[2 - offset] = erfs[0]
-            if feedbacks:
-                idx = 4  # could leave empty single-column row
-                iflat[1 - offset] = lams[0]
-                iflat[idx:idx + 4] = lams[1:]
-            if adjusts:
-                idx = 4 + 4
-                iflat[idx:idx + 4] = erfs[1:]
-
-    # Full breakdown
-    elif breakdown == 'all':
-        lams = ['net', 'cld', 'swcld', 'lwcld', 'atm', 'alb', 'resid']
-        erfs = ['erf', 'cl_rfnt_erf', 'cl_rsnt_erf', 'cl_rlnt_erf', 'atm_rfnt_erf', 'alb_rfnt_erf', 'resid_rfnt_erf']  # noqa: E501
-        hums = ['wv', 'rh', 'lr', 'lr*', 'pl', 'pl*']
-        if maxcols == 2:
-            names, iflat = _get_array(maxcols)
-            if sensitivity:
-                iflat[0] = 'ecs'
-            if feedbacks and adjusts:
-                names[1:8, 0] = lams
-                names[1:8, 1] = erfs
-                iflat[16:22] = hums
-            elif feedbacks:
-                iflat[0] = lams[0]
-                iflat[1] = 'erf' if forcing else None
-                names[2, :] = lams[1:3]
-                names[3, :] = lams[3:5]
-            elif adjusts:
-                iflat[0] = erfs[0]
-                names[1, :] = erfs[1:3]
-                names[2, :] = erfs[3:5]
-        else:
-            offset = 0 if maxcols == 1 else 1
-            maxcols = 1 if maxcols == 1 else 4  # disallow 3 columns
-            names, iflat = _get_array(maxcols)
-            if sensitivity:
-                iflat[-offset % 3] = 'ecs'  # either before or after net and erf
-            if forcing or adjusts:
-                iflat[2 - offset] = erfs[0]
-            if feedbacks:
-                idx = 4  # could leave empty single-column row
-                iflat[1 - offset] = lams[0]
-                iflat[idx:idx + 4] = lams[1:5]
-                if maxcols == 1:
-                    idx = 4 + 4
-                    iflat[idx:idx + 8] = lams[5:7] + hums[:]
-                else:
-                    idx = 4 + 4
-                    iflat[idx:idx + 4] = lams[5:6] + hums[0::2]
-                    idx = 4 + 2 * 4
-                    iflat[idx:idx + 4] = lams[6:7] + hums[1::2]
-            if adjusts:
-                idx = 4 + 3 * 4
-                iflat[idx:idx + 6] = erfs[1:7]
-    else:
-        raise RuntimeError(f'Invalid breakdown key {breakdown!r}.')
-
-    # Remove all-none segments and determine gridskip
-    # NOTE: This also automatically flattens the arangement if there are
-    # fewer than names than the originally requested maximum column count.
-    idx, = np.where(np.any(names != None, axis=0))  # noqa: E711
-    names = np.take(names, idx, axis=1)
-    idx, = np.where(np.any(names != None, axis=1))  # noqa: E711
-    names = np.take(names, idx, axis=0)
-    idxs = np.where(names == None)  # noqa: E711
-    gridskip = np.ravel_multi_index(idxs, names.shape)
-    names = names.ravel().tolist()
-    names = [spec for spec in names if spec is not None]
-    if len(names) <= original and maxcols != 1:  # then keep it simple!
-        maxcols = len(names)
-        gridskip = np.array([])
-    return names, maxcols, gridskip
+            dspecs.append(kws_dat)
+            pspecs.append(kw_plt)
+        labels = _infer_labels(dataset, *dspecs, **kw_infer)
+        xlabels = _infer_labels(dataset, *(kws[:1] for kws in dspecs), **kw_infer)
+        ylabels = _infer_labels(dataset, *(kws[1:] for kws in dspecs), **kw_infer)
+        ylabels = ylabels or [None] * len(xlabels)
+        for label, xlabel, ylabel, pspec in zip(labels, xlabels, ylabels, pspecs):
+            if label:  # use identical label as fallback
+                pspec.attrs.setdefault('short_prefix', label)
+            if xlabel:
+                pspec.attrs.setdefault('xlabel_prefix', xlabel)
+            if ylabel:
+                pspec.attrs.setdefault('ylabel_prefix', ylabel)
+        dataspecs.append(dspecs)
+        plotspecs.append(pspecs)
+    ncols = len(colspecs) if len(colspecs) > 1 else len(rowspecs) if len(rowspecs) > 1 else 4  # noqa: E501
+    refwidth = refwidth or pplt.rc['subplots.refwidth']
+    subspecs = [dspec for dspecs in dataspecs for dspec in dspecs]
+    figlabel = ' '.join(_infer_labels(
+        dataset,
+        *subspecs,
+        identical=True,
+        long_names=True,
+        title_case='first',  # special value
+        refwidth=2 * ncols * refwidth,  # larger value
+    ))
+    zerospecs = [dspecs[0] if dspecs else {} for dspecs in dataspecs]
+    pathlabel = _infer_path(dataset, *zerospecs)
+    return dataspecs, plotspecs, figlabel, pathlabel, gridlabels

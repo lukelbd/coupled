@@ -11,28 +11,41 @@ import climopy as climo  # noqa: F401  # add accessor
 import numpy as np
 import pandas as pd
 import xarray as xr
+import metpy.calc as mcalc
+import metpy.units as munits
 from climopy import diff, const, ureg
 from icecream import ic  # noqa: F401
-from metpy import calc, units
 
 from cmip_data.feedbacks import FEEDBACK_DESCRIPTIONS
 from cmip_data.internals import ENSEMBLES_FLAGSHIP
 from cmip_data.internals import Database, glob_files, _item_dates, _parse_constraints
-from cmip_data.utils import average_periods, open_file
+from cmip_data.utils import average_periods, load_file
 
 __all__ = [
-    'open_bulk',
-    'open_climate',
-    'open_feedbacks',
-    'open_feedbacks_json',
-    'open_feedbacks_text',
+    'open_dataset',
+    'climate_datasets',
+    'feedback_datasets',
+    'feedback_datasets_json',
+    'feedback_datasets_text',
 ]
+
+# Names for the feedback version multi-index. Start and stop correspond to the initial
+# and final year used in each Gregory regression (for pattern effect estimates).
+# NOTE: Currently 'ratio' type feedbacks always specify the years of the abrupt 4xCO2
+# climate used in the regression; the pre-industrial is always full 150-year record.
+VERSION_NAMES = (
+    'source',
+    'statistic',
+    'region',
+    'start',
+    'stop',
+)
 
 # Facets for the MultiIndex coordinate named 'facets'.
 # NOTE: Previously renamed piControl and abrupt-4xCO2 to 'control' and 'response'
 # but this was confusing as 'response' sounds like a perturbation (also considered
 # 'unperturbed' and 'perturbed'). Now simply use 'picontrol' and 'abrupt4xco2'.
-FACETS_CONCAT = (
+FACETS_NAMES = (
     'project',
     'model',
     'experiment',
@@ -170,6 +183,20 @@ ENERGETICS_COMPONENTS = {
     'albedo': ('rsds', 'rsus'),  # full name to differentiate from 'alb' feedback
 }
 
+# Moisture-related constants
+# NOTE: Here the %s is filled in with water, liquid, or ice depending
+# on the component of the particular variable category.
+MOISTURE_DEPENDENCIES = {
+    'hur': ('plev', 'ta', 'hus'),
+    'hurs': ('ps', 'ts', 'huss'),
+}
+MOISTURE_COMPONENTS = [
+    ('ev', 'evl', 'evi', 'evp', '%s evaporation'),
+    ('pr', 'prl', 'pri', 'prp', '%s precipitation'),
+    ('clw', 'cll', 'cli', 'clp', 'mass fraction cloud %s'),
+    ('clwvi', 'cllvi', 'clivi', 'clpvi', 'condensed %s water path'),
+]
+
 # Transport constants
 # NOTE: See Donohoe et al. (2020) for details on transport terms. Precipitation appears
 # in the dry static energy formula because unlike surface evaporation, it deposits heat
@@ -216,20 +243,6 @@ TRANSPORT_INTEGRATED = {
     'lse': (const.Lv, 'intuaw', 'intvaw'),
 }
 
-# Water cycle constants
-# NOTE: Here the %s is filled in with water, liquid, or ice depending
-# on the component of the particular variable category.
-WATER_DEPENDENCIES = {
-    'hur': ('plev', 'ta', 'hus'),
-    'hurs': ('ps', 'ts', 'huss'),
-}
-WATER_COMPONENTS = [
-    ('ev', 'evl', 'evi', 'evp', '%s evaporation'),
-    ('pr', 'prl', 'pri', 'prp', '%s precipitation'),
-    ('clw', 'cll', 'cli', 'clp', 'mass fraction cloud %s'),
-    ('clwvi', 'cllvi', 'clivi', 'clpvi', 'condensed %s water path'),
-]
-
 
 def _standardize_order(dataset):
     """
@@ -244,7 +257,7 @@ def _standardize_order(dataset):
     names = ['ta', 'ts', 'zg', 'ps', 'psl', 'pbot', 'ptop']
     names += ['ua', 'va', 'uas', 'vas', 'tauu', 'tauv']
     names += ['hus', 'hur', 'huss', 'hurs', 'prw', 'cl', 'clt', 'cct']
-    names += [name for names in WATER_COMPONENTS for name in names[:4]]
+    names += [name for names in MOISTURE_COMPONENTS for name in names[:4]]
     # Feedback order
     iter_ = itertools.product('fls', 'tsa', ('', 'cs', 'ce'))
     fluxes = ['hfls', 'hfss', 'albedo']
@@ -477,6 +490,71 @@ def _update_climate_energetics(dataset, clear=False, drop_components=True):
     return dataset
 
 
+def _update_climate_moisture(dataset, ratio=True, liquid=False):
+    """
+    Add relative humidity and ice and liquid water terms and standardize
+    the insertion order for the resulting dataset variables.
+
+    Parameters
+    ----------
+    dataset : xarray.Dataset
+        The dataset.
+    ratio : bool, default: True
+        Whether to add ice-liquid ratio estimate.
+    liquid : bool, default: False
+        Whether to add liquid components.
+    """
+    # Add humidity terms
+    # NOTE: Generally forego downloading relative humidity variables... true that
+    # operation is non-linear so relative humidity of climate is not climate of
+    # relative humiditiy, but we already use this approach with feedback kernels.
+    for name, keys in MOISTURE_DEPENDENCIES.items():
+        if any(key not in dataset for key in keys):
+            continue
+        datas = []
+        for key, unit in zip(keys, ('Pa', 'K', '')):
+            src = dataset.climo.coords if key == 'plev' else dataset.climo.vars
+            data = src[key].climo.to_units(unit)  # climopy units
+            data.data = data.data.magnitude * munits.units(unit)  # metpy units
+            datas.append(data)
+        descrip = 'near-surface ' if name[-1] == 's' else ''
+        data = mcalc.relative_humidity_from_specific_humidity(*datas)
+        data = data.climo.dequantify()  # works with metpy registry
+        data = data.climo.to_units('%').clip(0, 100)
+        data.attrs['long_name'] = f'{descrip}relative humidity'
+        dataset[name] = data
+
+    # Add cloud terms
+    # NOTE: Unlike related variables (including, confusingly, clwvi), 'clw' includes
+    # only liquid component rather than combined liquid plus ice. Adjust it to match
+    # convention from other variables and add other component terms.
+    if 'clw' in dataset:
+        if 'cli' not in dataset:
+            dataset = dataset.rename_vars(clw='cll')
+        else:
+            with xr.set_options(keep_attrs=True):
+                dataset['clw'] = dataset['cli'] + dataset['clw']
+    for both, liq, ice, rat, descrip in MOISTURE_COMPONENTS:
+        if not liquid and liq in dataset:
+            dataset = dataset.drop_vars(liq)
+        if liquid and both in dataset and ice in dataset:
+            da = dataset[both] - dataset[ice]
+            da.attrs = {'units': dataset[both].units, 'long_name': descrip % 'liquid'}
+            dataset[liq] = da
+        if ratio and both in dataset and ice in dataset:
+            da = (100 * dataset[ice] / dataset[both]).clip(0, 100)
+            da.attrs = {'units': '%', 'long_name': descrip % 'ice' + ' ratio'}
+            dataset[rat] = da
+    for both, liq, ice, _, descrip in MOISTURE_COMPONENTS:
+        for name, string in zip((ice, both, liq), ('ice', 'water', 'liquid')):
+            if name not in dataset:
+                continue
+            data = dataset[name]
+            if string not in data.long_name:
+                data.attrs['long_name'] = descrip % string
+    return dataset
+
+
 def _update_climate_transport(
     dataset, fluxes=False, drop_implicit=True, drop_explicit=True
 ):
@@ -625,71 +703,6 @@ def _update_climate_transport(
     return dataset
 
 
-def _update_climate_water(dataset, ratio=True, liquid=False):
-    """
-    Add relative humidity and ice and liquid water terms and standardize
-    the insertion order for the resulting dataset variables.
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The dataset.
-    ratio : bool, default: True
-        Whether to add ice-liquid ratio estimate.
-    liquid : bool, default: False
-        Whether to add liquid components.
-    """
-    # Add humidity terms
-    # NOTE: Generally forego downloading relative humidity variables... true that
-    # operation is non-linear so relative humidity of climate is not climate of
-    # relative humiditiy, but we already use this approach with feedback kernels.
-    for name, keys in WATER_DEPENDENCIES.items():
-        if any(key not in dataset for key in keys):
-            continue
-        datas = []
-        for key, unit in zip(keys, ('Pa', 'K', '')):
-            src = dataset.climo.coords if key == 'plev' else dataset.climo.vars
-            data = src[key].climo.to_units(unit)  # climopy units
-            data.data = data.data.magnitude * units.units(unit)  # metpy units
-            datas.append(data)
-        descrip = 'near-surface ' if name[-1] == 's' else ''
-        data = calc.relative_humidity_from_specific_humidity(*datas)
-        data = data.climo.dequantify()  # works with metpy registry
-        data = data.climo.to_units('%').clip(0, 100)
-        data.attrs['long_name'] = f'{descrip}relative humidity'
-        dataset[name] = data
-
-    # Add cloud terms
-    # NOTE: Unlike related variables (including, confusingly, clwvi), 'clw' includes
-    # only liquid component rather than combined liquid plus ice. Adjust it to match
-    # convention from other variables and add other component terms.
-    if 'clw' in dataset:
-        if 'cli' not in dataset:
-            dataset = dataset.rename_vars(clw='cll')
-        else:
-            with xr.set_options(keep_attrs=True):
-                dataset['clw'] = dataset['cli'] + dataset['clw']
-    for both, liq, ice, rat, descrip in WATER_COMPONENTS:
-        if not liquid and liq in dataset:
-            dataset = dataset.drop_vars(liq)
-        if liquid and both in dataset and ice in dataset:
-            da = dataset[both] - dataset[ice]
-            da.attrs = {'units': dataset[both].units, 'long_name': descrip % 'liquid'}
-            dataset[liq] = da
-        if ratio and both in dataset and ice in dataset:
-            da = (100 * dataset[ice] / dataset[both]).clip(0, 100)
-            da.attrs = {'units': '%', 'long_name': descrip % 'ice' + ' ratio'}
-            dataset[rat] = da
-    for both, liq, ice, _, descrip in WATER_COMPONENTS:
-        for name, string in zip((ice, both, liq), ('ice', 'water', 'liquid')):
-            if name not in dataset:
-                continue
-            data = dataset[name]
-            if string not in data.long_name:
-                data.attrs['long_name'] = descrip % string
-    return dataset
-
-
 def _update_feedback_info(
     dataset,
     boundary=None,
@@ -713,10 +726,10 @@ def _update_feedback_info(
         Whether to label climate sensitivity assuming doubled or quadrupled CO$_2$.
     """
     # Flux metadata repairs
-    # NOTE: This also drops pre-loaded climate sensitivity parameters, and only
-    # keeps the boundary indicator if more than one boundary was requested.
     # NOTE: Scaling of forcing or climate sensitivity terms for doubled or quadrupled
     # CO2 is handled by individual loading functions. Here just add a label indication.
+    # NOTE: This drops pre-loaded climate sensitivity parameters, and only
+    # keeps the boundary indicator if more than one boundary was requested.
     options = set(boundary or 't')
     wavelengths = ('full', 'longwave', 'shortwave')
     boundaries = ('surface', 'TOA')
@@ -754,7 +767,7 @@ def _update_feedback_info(
                 dataset = dataset.drop_vars(name)
 
     # Other metadata repairs
-    # NOTE: This mimics the behavior of average_periods in open_climate
+    # NOTE: This mimics the behavior of average_periods in climate_datasets
     # by optionally skipping unneeded periods to save space.
     components = [
         ('pbot', 'plev_bot', 'lower', 'surface'),
@@ -769,7 +782,7 @@ def _update_feedback_info(
             dataset[name].attrs['standard_units'] = 'hPa'
             dataset[name].attrs.setdefault('units', 'Pa')
             dataset[name].attrs.setdefault('long_name', f'{boundary} pressure')
-    if 'period' in dataset:  # this is for consistency with open_climate
+    if 'period' in dataset:  # this is for consistency with climate_datasets
         drop = []
         time = pd.date_range('2000-01-01', '2000-12-01', freq='MS')
         if not annual:
@@ -838,7 +851,7 @@ def _update_feedback_terms(
             atm = regex.sub(r'\1\2\3\4a\6', key)
             sfc = regex.sub(r'\1\2\3\4s\6', key)
             if sfc in dataset and 'a' in boundary:
-                with xr.set_options(keep_attrs=True):
+                with xr.set_options(keep_attrs=True):  # keep units and short_name
                     dataset[atm] = dataset[key] + dataset[sfc]
                 long_name = dataset[key].attrs['long_name']
                 long_name = long_name.replace('TOA', 'atmospheric')
@@ -853,7 +866,7 @@ def _update_feedback_terms(
             hus = regex.sub(r'hus\2\3\4\5\6', key)
             lr = regex.sub(r'lr\2\3\4\5\6', key)
             if lr in dataset and hus in dataset:
-                with xr.set_options(keep_attrs=True):
+                with xr.set_options(keep_attrs=True):  # keep units and short_name
                     dataset[atm] = dataset[key] + dataset[hus] + dataset[lr]
                 long_name = dataset[key].attrs.get('long_name', '')
                 long_name = long_name.replace('Planck', 'temperature + humidity')
@@ -867,7 +880,7 @@ def _update_feedback_terms(
             ce = regex.sub(r'\1\2\3\4\5ce', key)
             cs = regex.sub(r'\1\2\3\4\5cs', key)
             if cs in dataset:
-                with xr.set_options(keep_attrs=True):
+                with xr.set_options(keep_attrs=True):  # keep units and short_name
                     dataset[ce] = dataset[key] - dataset[cs]
                 long_name = dataset[cs].attrs.get('long_name', '')
                 long_name = long_name.replace('clear-sky', 'cloud')
@@ -885,6 +898,7 @@ def _update_feedback_terms(
             denom = dataset.rfnt_lam.climo.add_cell_measures()
             data = -1 * numer.climo.average('area') / denom.climo.average('area')
             data.attrs['units'] = 'K'
+            data.attrs['short_name'] = 'temperature'
             data.attrs['long_name'] = label
             dataset['rfnt_ecs'] = data
     keys = ['pbot', 'ptop', 'rfnt_ecs', *(key for key, _ in _iter_dataset(dataset))]
@@ -892,7 +906,7 @@ def _update_feedback_terms(
     return dataset
 
 
-def open_climate(
+def climate_datasets(
     *paths, years=None, nodrift=False, standardize=True, **constraints
 ):
     """
@@ -912,23 +926,28 @@ def open_climate(
         Optional indexers.
     **constraints
         Passed to `Database`.
+
+    Returns
+    -------
+    datasets : dict
+        A dictionary of datasets.
     """
     # NOTE: Non-flagship simulations can be added with flagship_translate=True
     # as with other processing functions. Ensembles are added in a MultiIndex
     # NOTE: This loads all available variables by default, but can be
     # restricted to a few with e.g. variable=['ts', 'ta'].
+    keys_periods = ('annual', 'seasonal', 'monthly')
     keys_energetics = ('clear', 'drop_components')
     keys_transport = ('fluxes', 'drop_explicit', 'drop_implicit')
     keys_water = ('liquid', 'ratio')
-    keys_times = ('annual', 'seasonal', 'monthly')
     kw_energetics = {key: constraints.pop(key) for key in keys_energetics if key in constraints}  # noqa: E501
     kw_transport = {key: constraints.pop(key) for key in keys_transport if key in constraints}  # noqa: E501
     kw_water = {key: constraints.pop(key) for key in keys_water if key in constraints}
-    kw_times = {key: constraints.pop(key, True) for key in keys_times}
+    kw_periods = {key: constraints.pop(key) for key in keys_periods if key in constraints}  # noqa: E501
     files, *_ = glob_files(*paths, project=constraints.get('project', None))
     constraints.setdefault('table', ['Amon', 'Emon'])
     constraints.setdefault('experiment', ['piControl', 'abrupt4xCO2'])
-    database = Database(files, FACETS_CONCAT, flagship_translate=True, **constraints)
+    database = Database(files, FACETS_NAMES, flagship_translate=True, **constraints)
     database.filter(always_exclude={'variable': ['pfull']})  # skip dependencies
     nodrift = nodrift and '-nodrift' or ''
     datasets = {}
@@ -937,10 +956,7 @@ def open_climate(
     if database:
         print('Model:', end=' ')
     for group, data in database.items():
-        # Load the data
-        # NOTE: Critical to overwrite the time coordinates after loading or else xarray
-        # coordinate matching will apply all-NaN values for climatolgoies with different
-        # base years (e.g. due to control data availability or response calendar diffs).
+        # Initial stuff
         if not data:
             continue
         for sub, replace in FACETS_RENAME.items():
@@ -956,6 +972,11 @@ def open_climate(
         att = {'axis': 'T', 'standard_name': 'time'}
         time = pd.date_range('2000-01-01', '2000-12-01', freq='MS')
         time = xr.DataArray(time, name='time', dims='time', attrs=att)
+
+        # Load the data
+        # NOTE: Critical to overwrite the time coordinates after loading or else xarray
+        # coordinate matching will apply all-NaN values for climatolgoies with different
+        # base years (e.g. due to control data availability or response calendar diffs).
         dataset = xr.Dataset()
         for key, paths in data.items():
             variable = key[database.key.index('variable')]
@@ -965,7 +986,7 @@ def open_climate(
             if len(paths) > 1:
                 print(f'Warning: Skipping ambiguous duplicate paths {list(map(str, paths))}.', end=' ')  # noqa: E501
                 continue
-            array = open_file(paths[0], variable, project=database.project)
+            array = load_file(paths[0], variable, project=database.project)
             if array.time.size != 12:
                 print(f'Warning: Skipping path {paths[0]} with time length {array.time.size}.', end=' ')  # noqa: E501
                 continue
@@ -993,10 +1014,10 @@ def open_climate(
         dataset = dataset.climo.add_cell_measures(surface=('ps' in dataset))
         dataset = _update_climate_energetics(dataset, **kw_energetics)  # must come first  # noqa: E501
         dataset = _update_climate_transport(dataset, **kw_transport)
-        dataset = _update_climate_water(dataset, **kw_water)
+        dataset = _update_climate_moisture(dataset, **kw_water)
         dataset = _update_climate_units(dataset)  # must come after transport
         if 'time' in dataset:
-            dataset = average_periods(dataset, **kw_times)
+            dataset = average_periods(dataset, **kw_periods)
         if standardize:
             dataset = _standardize_order(dataset)
         if 'plev' in dataset:
@@ -1012,7 +1033,7 @@ def open_climate(
     return datasets
 
 
-def open_feedbacks(
+def feedback_datasets(
     *paths,
     source=None,
     nodrift=False,
@@ -1039,19 +1060,24 @@ def open_feedbacks(
         Passed to `_update_feedback_terms`.
     **constraints
         Passed to `Database`.
+
+    Returns
+    -------
+    datasets : dict
+        A dictionary of datasets.
     """
     # NOTE: To reduce the number of variables this filters out
     # unneeded boundaries and effective forcings automatically.
+    keys_periods = ('annual', 'seasonal', 'monthly')
     keys_shared = ('boundary',)
     keys_terms = ('erfextra', 'wavextra')
-    keys_times = ('annual', 'seasonal', 'monthly')
     kw_shared = {key: constraints.pop(key) for key in keys_shared if key in constraints}
     kw_terms = {key: constraints.pop(key) for key in keys_terms if key in constraints}
-    kw_times = {key: constraints.pop(key, True) for key in keys_times}
-    kw_terms['quadruple'] = kw_times['quadruple'] = quadruple
+    kw_periods = {key: constraints.pop(key) for key in keys_periods if key in constraints}  # noqa: E501
+    kw_terms['quadruple'] = kw_periods['quadruple'] = quadruple
     files, *_ = glob_files(*paths, project=constraints.get('project', None))
-    constraints['variable'] = 'feedbacks'  # TODO: similar technique for open_climate
-    database = Database(files, FACETS_CONCAT, flagship_translate=True, **constraints)
+    constraints['variable'] = 'feedbacks'  # TODO: similar for climate_datasets
+    database = Database(files, FACETS_NAMES, flagship_translate=True, **constraints)
     sources = (source,) if isinstance(source, str) else tuple(source or ())
     nodrift = nodrift and '-nodrift' or ''
     factor = 2.0 if quadruple else 1.0  # TODO: possibly change conventions
@@ -1063,7 +1089,6 @@ def open_feedbacks(
     for group, data in database.items():
         # Filter the files
         bnds, parts, versions = {}, {}, {}
-        names = ('source', 'statistic', 'region')
         for sub, replace in FACETS_RENAME.items():
             group = tuple(s.replace(sub, replace) for s in group)
         paths = tuple(
@@ -1076,16 +1101,17 @@ def open_feedbacks(
         # Load the data
         # NOTE: This accounts for files with dedicated regions indicated in the name,
         # files with numerator and denominator multi-index coordinates, and files with
-        # just a denominator region coordinate. Note open_file builds the multi-index.
+        # just a denominator region coordinate. Note load_file builds the multi-index.
         print(f'{group[1]}_{group[2]}', end=' ')
         for path in paths:
             *_, indicator, suffix = path.stem.split('_')
-            source, statistic, *_ = suffix.split('-')
+            start, stop, source, statistic, *_ = suffix.split('-')  # ignore -nodrift
+            start, stop = map(int, (start, stop))
             if sources and source not in sources:
                 continue
-            dataset = open_file(path, project=database.project, validate=False)
+            dataset = load_file(path, project=database.project, validate=False)
             if outdated := 'local' in indicator or 'global' in indicator:
-                if indicator.split('-')[0] != 'local':
+                if indicator.split('-')[0] != 'local':  # ignore local vs. global
                     continue
             if 'pbot' in dataset:
                 bnds['pbot'] = dataset['pbot']
@@ -1097,18 +1123,18 @@ def open_feedbacks(
                     array *= factor  # NOTE: array.data *= fails for unloaded data
             if outdated:
                 region = 'point' if indicator.split('-')[1] == 'local' else 'globe'
-                versions[source, statistic, region] = dataset
+                versions[source, statistic, region, start, stop] = dataset
             else:
                 for region in dataset.region.values:
                     sel = dataset.sel(region=region, drop=True)
-                    versions[source, statistic, region] = sel
+                    versions[source, statistic, region, start, stop] = sel
 
         # Concatenate the data
         # NOTE: Concatenation automatically broadcasts global feedbacks across lons and
         # lats. Also critical to use 'override' for combine_attrs in case conventions
         # changed between running feedback calculations on different models.
         for key, dataset in versions.items():
-            dataset = _update_feedback_info(dataset, **kw_shared, **kw_times)
+            dataset = _update_feedback_info(dataset, **kw_shared, **kw_periods)
             dataset = _update_feedback_terms(dataset, **kw_shared, **kw_terms)
             if 'pbot' in dataset:
                 bnds['pbot'] = dataset['pbot']
@@ -1117,7 +1143,7 @@ def open_feedbacks(
             dataset = dataset.drop_vars({'pbot', 'ptop'} & dataset.keys())
             parts[key] = dataset
         index = xr.DataArray(
-            pd.MultiIndex.from_tuples(parts, names=names),
+            pd.MultiIndex.from_tuples(parts, names=VERSION_NAMES),
             dims='version',
             name='version',
             attrs={'long_name': 'feedback version'},
@@ -1140,7 +1166,7 @@ def open_feedbacks(
     return datasets
 
 
-def open_feedbacks_json(
+def feedback_datasets_json(
     path='~/data/cmip-tables',
     boundary=None,
     standardize=True,
@@ -1162,8 +1188,13 @@ def open_feedbacks_json(
         Whether to adjust parameters to correspond to quadrupled CO$_2$.
     **constraints
         Passed to `_parse_constraints`.
+
+    Returns
+    -------
+    datasets : dict
+        A dictionary of datasets.
     """
-    # NOTE: When combinining with 'open_bulk' the non-descriptive long names
+    # NOTE: When combinining with 'open_dataset' the non-descriptive long names
     # here should be overwritten by long names from custom feedbacks.
     path = Path(path).expanduser()
     boundary = boundary or 't'
@@ -1173,12 +1204,11 @@ def open_feedbacks_json(
     if 't' not in boundary:  # only top-of-atmosphere feedbacks available
         return datasets
     for file in sorted(path.glob('cmip*.json')):
-        print(f'External file: {file.name}')
         source = file.stem.split('_')[1]
-        names = ('source', 'statistic', 'region')
-        index = (source, 'slope', 'globe')
+        print(f'External file: {file.name}')
+        index = (source, 'slope', 'globe', 0, 150)
         index = xr.DataArray(
-            pd.MultiIndex.from_tuples([index], names=names),
+            pd.MultiIndex.from_tuples([index], names=VERSION_NAMES),
             dims='version',
             name='version',
             attrs={'long_name': 'feedback version'},
@@ -1219,7 +1249,7 @@ def open_feedbacks_json(
     return datasets
 
 
-def open_feedbacks_text(
+def feedback_datasets_text(
     path='~/data/cmip-tables',
     boundary=None,
     standardize=True,
@@ -1241,6 +1271,11 @@ def open_feedbacks_text(
         Whether to adjust parameters to correspond to quadrupled CO$_2$.
     **constraints
         Passed to `_parse_constraints`.
+
+    Returns
+    -------
+    datasets : dict
+        A dictionary of datasets.
     """
     # NOTE: The Zelinka, Geoffry, and Forster papers and sources only specify a
     # CO2 multiple of '2x' or '4x' in the forcing entry and just say 'ecs' for the
@@ -1256,10 +1291,9 @@ def open_feedbacks_text(
         if source == 'zelinka':
             continue
         print(f'External file: {file.name}')
-        names = ('source', 'statistic', 'region')
-        index = (source, 'slope', 'globe')
+        index = (source, 'slope', 'globe', 0, 150)
         index = xr.DataArray(
-            pd.MultiIndex.from_tuples([index], names=names),
+            pd.MultiIndex.from_tuples([index], names=VERSION_NAMES),
             dims='version',
             name='version',
             attrs={'long_name': 'feedback version'},
@@ -1308,12 +1342,12 @@ def open_feedbacks_text(
     return datasets
 
 
-def open_bulk(
+def open_dataset(
     project=None,
     climate=True,
     feedbacks=True,
-    feedbacks_json=True,
-    feedbacks_text=True,
+    feedback_datasets_json=True,
+    feedback_datasets_text=True,
     standardize=True,
     **constraints,
 ):
@@ -1328,7 +1362,7 @@ def open_bulk(
         Whether to load processed climate data. Default path is ``~/data``.
     feedbacks : bool or path-like, optional
         Whether to load processed feedback files. Default path is ``~/data``.
-    feedbacks_json, feedbacks_text : bool or path-like, optional
+    feedback_datasets_json, feedback_datasets_text : bool or path-like, optional
         Whether to load external feedback files. Default path is ``~/data/cmip-tables``.
     standardize : bool, optional
         Whether to standardize the resulting order.
@@ -1363,10 +1397,10 @@ def open_bulk(
     for project in map(str.upper, projects):
         print(f'Project: {project}')
         for b, function, folder, kw in (
-            (climate, open_climate, 'cmip-climate', {**kw_climate, **kw_both}),
-            (feedbacks, open_feedbacks, 'cmip-feedbacks', {**kw_feedbacks, **kw_joint, **kw_both}),  # noqa: E501
-            (feedbacks_json, open_feedbacks_json, 'cmip-tables', {**kw_joint}),
-            (feedbacks_text, open_feedbacks_text, 'cmip-tables', {**kw_joint}),
+            (climate, climate_datasets, 'cmip-climate', {**kw_climate, **kw_both}),
+            (feedbacks, feedback_datasets, 'cmip-feedbacks', {**kw_feedbacks, **kw_joint, **kw_both}),  # noqa: E501
+            (feedback_datasets_json, feedback_datasets_json, 'cmip-tables', {**kw_joint}),
+            (feedback_datasets_text, feedback_datasets_text, 'cmip-tables', {**kw_joint}),
         ):
             if not b:
                 continue
@@ -1404,7 +1438,7 @@ def open_bulk(
     print()
     print('Concatenating datasets.')
     index = xr.DataArray(
-        pd.MultiIndex.from_tuples(datasets, names=FACETS_CONCAT),
+        pd.MultiIndex.from_tuples(datasets, names=FACETS_NAMES),
         dims='facets',
         name='facets',
         attrs={'long_name': 'source facets'},

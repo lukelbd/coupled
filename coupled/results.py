@@ -29,23 +29,22 @@ __all__ = [
     'feedback_datasets_text',
 ]
 
-# Names for the feedback version multi-index. Start and stop correspond to the initial
-# and final year used in each Gregory regression (for pattern effect estimates).
-# NOTE: Currently 'ratio' type feedbacks always specify the years of the abrupt 4xCO2
-# climate used in the regression; the pre-industrial is always full 150-year record.
-VERSION_NAMES = (
+# Levels for the MultiIndex feedback version coordinate
+# NOTE: Currently years for 'ratio' type feedbacks always correspond to the abrupt4xCO2
+# climate average; the pre-industrial climate average is always over the full 150 years.
+VERSION_LEVELS = (
     'source',
     'statistic',
     'region',
-    'start',
-    'stop',
+    'start',  # iniital year of regression or 'forced' climate average
+    'stop',  # final year of regression or 'forced' climate average
 )
 
-# Facets for the MultiIndex coordinate named 'facets'.
+# Levels for the MultiIndex coordinate 'facets'.
 # NOTE: Previously renamed piControl and abrupt-4xCO2 to 'control' and 'response'
 # but this was confusing as 'response' sounds like a perturbation (also considered
 # 'unperturbed' and 'perturbed'). Now simply use 'picontrol' and 'abrupt4xco2'.
-FACETS_NAMES = (
+FACETS_LEVELS = (
     'project',
     'model',
     'experiment',
@@ -53,6 +52,7 @@ FACETS_NAMES = (
 )
 FACETS_RENAME = {
     'piControl': 'picontrol',
+    'control-1950': 'control1950',
     'abrupt4xCO2': 'abrupt4xco2',
     'abrupt-4xCO2': 'abrupt4xco2',
 }
@@ -128,6 +128,7 @@ CLIMATE_UNITS = {
 FEEDBACK_TRANSLATIONS = {
     'ecs': ('rfnt_ecs', 'K'),  # zelinka definition
     'tcr': ('rfnt_tcr', 'K'),  # forster definition
+    'pattern': ('ts_pattern', 'K / K'),
     'erf2x': ('rfnt_erf', 'W m^-2'),  # zelinka definition
     'erf4x': ('rfnt_erf', 'W m^-2'),
     'f2x': ('rfnt_erf', 'W m^-2'),  # forster definition
@@ -703,7 +704,7 @@ def _update_climate_transport(
     return dataset
 
 
-def _update_feedback_info(
+def _update_feedback_attrs(
     dataset,
     boundary=None,
     annual=True,
@@ -743,7 +744,7 @@ def _update_feedback_info(
             ('ecs', 'ecs2x', 'climate sensitivity'),
         ):
             if wavelength == 'full':  # WARNING: do not overwrite itertools 'descrip'
-                tail = descrip if descrip else 'net' if suffix == 'lam' else 'effective'  # noqa: E501
+                tail = descrip if descrip else 'effective' if suffix == 'ecs' else 'net'
             else:
                 tail = f'{wavelength} {descrip}' if descrip else wavelength
             if component in ('', 'cs'):
@@ -821,7 +822,7 @@ def _update_feedback_terms(
         Whether to label forcing and sensitivity assuming doubled or quadrupled CO$_2$.
     """
     # Helper function
-    # TODO: Consider placing this function *after* _update_feedback_info rather
+    # TODO: Consider placing this function *after* _update_feedback_attrs rather
     # than before and having that function handle derived component labels.
     # NOTE: This is necessary so e.g. we can add atmospheric versions of combined
     # cloud effect and non-cloud feedbacks.
@@ -947,7 +948,7 @@ def climate_datasets(
     files, *_ = glob_files(*paths, project=constraints.get('project', None))
     constraints.setdefault('table', ['Amon', 'Emon'])
     constraints.setdefault('experiment', ['piControl', 'abrupt4xCO2'])
-    database = Database(files, FACETS_NAMES, flagship_translate=True, **constraints)
+    database = Database(files, FACETS_LEVELS, flagship_translate=True, **constraints)
     database.filter(always_exclude={'variable': ['pfull']})  # skip dependencies
     nodrift = nodrift and '-nodrift' or ''
     datasets = {}
@@ -1077,7 +1078,7 @@ def feedback_datasets(
     kw_terms['quadruple'] = kw_periods['quadruple'] = quadruple
     files, *_ = glob_files(*paths, project=constraints.get('project', None))
     constraints['variable'] = 'feedbacks'  # TODO: similar for climate_datasets
-    database = Database(files, FACETS_NAMES, flagship_translate=True, **constraints)
+    database = Database(files, FACETS_LEVELS, flagship_translate=True, **constraints)
     sources = (source,) if isinstance(source, str) else tuple(source or ())
     nodrift = nodrift and '-nodrift' or ''
     factor = 2.0 if quadruple else 1.0  # TODO: possibly change conventions
@@ -1113,11 +1114,6 @@ def feedback_datasets(
             if outdated := 'local' in indicator or 'global' in indicator:
                 if indicator.split('-')[0] != 'local':  # ignore local vs. global
                     continue
-            if 'pbot' in dataset:
-                bnds['pbot'] = dataset['pbot']
-            if 'ptop' in dataset:
-                bnds['ptop'] = dataset['ptop']
-            dataset = dataset.drop_vars({'pbot', 'ptop'} & dataset.keys())
             for array in dataset.data_vars.values():
                 if '_erf' in array.name or '_ecs' in array.name:
                     array *= factor  # NOTE: array.data *= fails for unloaded data
@@ -1125,7 +1121,7 @@ def feedback_datasets(
                 region = 'point' if indicator.split('-')[1] == 'local' else 'globe'
                 versions[source, statistic, region, start, stop] = dataset
             else:
-                for region in dataset.region.values:
+                for region in dataset.region.values:  # includes ts_pattern, pbot, ptop
                     sel = dataset.sel(region=region, drop=True)
                     versions[source, statistic, region, start, stop] = sel
 
@@ -1134,16 +1130,16 @@ def feedback_datasets(
         # lats. Also critical to use 'override' for combine_attrs in case conventions
         # changed between running feedback calculations on different models.
         for key, dataset in versions.items():
-            dataset = _update_feedback_info(dataset, **kw_shared, **kw_periods)
+            dataset = _update_feedback_attrs(dataset, **kw_shared, **kw_periods)
             dataset = _update_feedback_terms(dataset, **kw_shared, **kw_terms)
-            if 'pbot' in dataset:
+            if 'pbot' in dataset:  # always represents control pressure
                 bnds['pbot'] = dataset['pbot']
             if 'ptop' in dataset:
                 bnds['ptop'] = dataset['ptop']
             dataset = dataset.drop_vars({'pbot', 'ptop'} & dataset.keys())
             parts[key] = dataset
         index = xr.DataArray(
-            pd.MultiIndex.from_tuples(parts, names=VERSION_NAMES),
+            pd.MultiIndex.from_tuples(parts, names=VERSION_LEVELS),
             dims='version',
             name='version',
             attrs={'long_name': 'feedback version'},
@@ -1208,7 +1204,7 @@ def feedback_datasets_json(
         print(f'External file: {file.name}')
         index = (source, 'slope', 'globe', 0, 150)
         index = xr.DataArray(
-            pd.MultiIndex.from_tuples([index], names=VERSION_NAMES),
+            pd.MultiIndex.from_tuples([index], names=VERSION_LEVELS),
             dims='version',
             name='version',
             attrs={'long_name': 'feedback version'},
@@ -1241,7 +1237,7 @@ def feedback_datasets_json(
                     datasets[group] = dataset
     for group in tuple(datasets):
         dataset = datasets[group]
-        dataset = _update_feedback_info(dataset, boundary='t')
+        dataset = _update_feedback_attrs(dataset, boundary='t')
         dataset = _update_feedback_terms(dataset, boundary='t')
         if standardize:
             dataset = _standardize_order(dataset)
@@ -1293,7 +1289,7 @@ def feedback_datasets_text(
         print(f'External file: {file.name}')
         index = (source, 'slope', 'globe', 0, 150)
         index = xr.DataArray(
-            pd.MultiIndex.from_tuples([index], names=VERSION_NAMES),
+            pd.MultiIndex.from_tuples([index], names=VERSION_LEVELS),
             dims='version',
             name='version',
             attrs={'long_name': 'feedback version'},
@@ -1334,7 +1330,7 @@ def feedback_datasets_text(
                 datasets[group] = data
     for group in tuple(datasets):
         dataset = datasets[group]
-        dataset = _update_feedback_info(dataset, boundary='t')
+        dataset = _update_feedback_attrs(dataset, boundary='t')
         dataset = _update_feedback_terms(dataset, boundary='t')
         if standardize:
             dataset = _standardize_order(dataset)
@@ -1346,8 +1342,8 @@ def open_dataset(
     project=None,
     climate=True,
     feedbacks=True,
-    feedback_datasets_json=True,
-    feedback_datasets_text=True,
+    feedbacks_json=None,
+    feedbacks_text=None,
     standardize=True,
     **constraints,
 ):
@@ -1362,7 +1358,7 @@ def open_dataset(
         Whether to load processed climate data. Default path is ``~/data``.
     feedbacks : bool or path-like, optional
         Whether to load processed feedback files. Default path is ``~/data``.
-    feedback_datasets_json, feedback_datasets_text : bool or path-like, optional
+    feedbacks_json, feedbacks_text : bool or path-like, optional
         Whether to load external feedback files. Default path is ``~/data/cmip-tables``.
     standardize : bool, optional
         Whether to standardize the resulting order.
@@ -1394,13 +1390,17 @@ def open_dataset(
     base = Path('~/data').expanduser()
     datasets = {}
     projects = project.split(',') if isinstance(project, str) else ('cmip5', 'cmip6')
+    if feedbacks_json is None:
+        feedbacks_json = feedbacks
+    if feedbacks_text is None:
+        feedbacks_text = feedbacks
     for project in map(str.upper, projects):
         print(f'Project: {project}')
         for b, function, folder, kw in (
             (climate, climate_datasets, 'cmip-climate', {**kw_climate, **kw_both}),
             (feedbacks, feedback_datasets, 'cmip-feedbacks', {**kw_feedbacks, **kw_joint, **kw_both}),  # noqa: E501
-            (feedback_datasets_json, feedback_datasets_json, 'cmip-tables', {**kw_joint}),
-            (feedback_datasets_text, feedback_datasets_text, 'cmip-tables', {**kw_joint}),
+            (feedbacks_json, feedback_datasets_json, 'cmip-tables', {**kw_joint}),  # noqa: E501
+            (feedbacks_text, feedback_datasets_text, 'cmip-tables', {**kw_joint}),  # noqa: E501
         ):
             if not b:
                 continue
@@ -1438,7 +1438,7 @@ def open_dataset(
     print()
     print('Concatenating datasets.')
     index = xr.DataArray(
-        pd.MultiIndex.from_tuples(datasets, names=FACETS_NAMES),
+        pd.MultiIndex.from_tuples(datasets, names=FACETS_LEVELS),
         dims='facets',
         name='facets',
         attrs={'long_name': 'source facets'},

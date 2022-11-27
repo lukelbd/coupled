@@ -128,7 +128,6 @@ CLIMATE_UNITS = {
 FEEDBACK_TRANSLATIONS = {
     'ecs': ('rfnt_ecs', 'K'),  # zelinka definition
     'tcr': ('rfnt_tcr', 'K'),  # forster definition
-    'pattern': ('ts_pattern', 'K / K'),
     'erf2x': ('rfnt_erf', 'W m^-2'),  # zelinka definition
     'erf4x': ('rfnt_erf', 'W m^-2'),
     'f2x': ('rfnt_erf', 'W m^-2'),  # forster definition
@@ -255,25 +254,25 @@ def _standardize_order(dataset):
         The dataset.
     """
     # Climate order
-    names = ['ta', 'ts', 'zg', 'ps', 'psl', 'pbot', 'ptop']
-    names += ['ua', 'va', 'uas', 'vas', 'tauu', 'tauv']
+    names = ['ta', 'ts', 'tpat', 'ps', 'psl', 'pbot', 'ptop']
+    names += ['zg', 'ua', 'va', 'uas', 'vas', 'tauu', 'tauv']
     names += ['hus', 'hur', 'huss', 'hurs', 'prw', 'cl', 'clt', 'cct']
     names += [name for names in MOISTURE_COMPONENTS for name in names[:4]]
     # Feedback order
-    iter_ = itertools.product('fls', 'tsa', ('', 'cs', 'ce'))
-    fluxes = ['hfls', 'hfss', 'albedo']
-    fluxes += [f'r{wav}n{bnd}{sky}' for wav, bnd, sky in iter_]
+    iter_ = itertools.product(('f', 'l', 's'), ('t', 's', 'a'), ('', 'cs', 'ce'))
+    variables = ['albedo', 'hfls', 'hfss']
+    variables += [f'r{wav}n{bnd}{sky}' for wav, bnd, sky in iter_]  # capture fluxes too
     parameters = ['', 'lam', 'rho', 'kap', 'erf', 'ecs', 'tcr']
     components = ['', 'pl', 'pl*', 'lr', 'lr*', 'hus', 'hur', 'atm', 'alb', 'cl', 'resid']  # noqa: E501
-    iter_ = itertools.product(components, fluxes, parameters)
-    names.extend(f'{component}_{flux}_{parameter}'.strip('_') for component, flux, parameter in iter_)  # noqa: E501
+    iter_ = itertools.product(components, variables, parameters)
+    names.extend('_'.join(tup).strip('_') for tup in iter_)
     # Transport order
     prefixes = ('', 'm', 's', 't')  # total, zonal-mean, stationary, transient
     suffixes = ('t', 'f', 'c', 'r')  # transport, flux, convergence, residual
     parts = ('gse', 'hse', 'dse', 'lse', 'mse', 'ocean', 'total')
     ends = ('', '_alt', '_exp')
-    iter_ = itertools.product(parts, prefixes, suffixes, ends)
-    names.extend(f'{prefix}{part}{suffix}{end}' for part, prefix, suffix, end in iter_)
+    iter_ = itertools.product(prefixes, parts, suffixes, ends)
+    names.extend(''.join(tup) for tup in iter_)
     # Update insertion order
     unknowns = [name for name in dataset.data_vars if name not in names]
     if unknowns:
@@ -281,9 +280,6 @@ def _standardize_order(dataset):
     results = {name: dataset[name] for name in (*names, *unknowns) if name in dataset}
     dataset = xr.Dataset(results)
     return dataset
-    # dataset = dataset.drop_vars(results.keys())
-    # dataset.update(results)
-    # return dataset
 
 
 def _transport_implicit(data, descrip=None, prefix=None, adjust=True):
@@ -902,7 +898,10 @@ def _update_feedback_terms(
             data.attrs['short_name'] = 'temperature'
             data.attrs['long_name'] = label
             dataset['rfnt_ecs'] = data
-    keys = ['pbot', 'ptop', 'rfnt_ecs', *(key for key, _ in _iter_dataset(dataset))]
+    if 'ts_pattern' in dataset:
+        dataset = dataset.rename(ts_pattern='tpat')
+    keys = {'pbot', 'ptop', 'rfnt_ecs', 'tpat'}
+    keys.update(key for key, _ in _iter_dataset(dataset))
     dataset = dataset.drop_vars(dataset.data_vars.keys() - set(keys))
     return dataset
 
@@ -953,7 +952,7 @@ def climate_datasets(
     nodrift = nodrift and '-nodrift' or ''
     datasets = {}
     print(f'Climate files: <dates>-climate{nodrift}')
-    print(f'Number of climate files: {len(database)}.')
+    print(f'Number of climate file groups: {len(database)}.')
     if database:
         print('Model:', end=' ')
     for group, data in database.items():
@@ -1084,7 +1083,7 @@ def feedback_datasets(
     factor = 2.0 if quadruple else 1.0  # TODO: possibly change conventions
     datasets = {}
     print(f'Feedback files: <source>-<statistic>{nodrift}')
-    print(f'Number of feedback files: {len(database)}.')
+    print(f'Number of feedback file groups: {len(database)}.')
     if database:
         print('Model:', end=' ')
     for group, data in database.items():
@@ -1121,7 +1120,7 @@ def feedback_datasets(
                 region = 'point' if indicator.split('-')[1] == 'local' else 'globe'
                 versions[source, statistic, region, start, stop] = dataset
             else:
-                for region in dataset.region.values:  # includes ts_pattern, pbot, ptop
+                for region in dataset.region.values:  # includes pbot and ptop
                     sel = dataset.sel(region=region, drop=True)
                     versions[source, statistic, region, start, stop] = sel
 

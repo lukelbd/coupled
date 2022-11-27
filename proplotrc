@@ -1,6 +1,0 @@
-# Explicitly loaded inside templates.py
-# Low-quality backend for speed over SSH sessions!
-unitformat: '~L'
-inlineformat: png
-subplots.refwidth: 2
-hatch.linewidth: 0.3

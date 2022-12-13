@@ -254,7 +254,7 @@ def _standardize_order(dataset):
         The dataset.
     """
     # Climate order
-    names = ['ta', 'ts', 'tpat', 'ps', 'psl', 'pbot', 'ptop']
+    names = ['ta', 'ts', 'tpat', 'tabs', 'ps', 'psl', 'pbot', 'ptop']
     names += ['zg', 'ua', 'va', 'uas', 'vas', 'tauu', 'tauv']
     names += ['hus', 'hur', 'huss', 'hurs', 'prw', 'cl', 'clt', 'cct']
     names += [name for names in MOISTURE_COMPONENTS for name in names[:4]]
@@ -766,19 +766,11 @@ def _update_feedback_attrs(
     # Other metadata repairs
     # NOTE: This mimics the behavior of average_periods in climate_datasets
     # by optionally skipping unneeded periods to save space.
-    components = [
-        ('pbot', 'plev_bot', 'lower', 'surface'),
-        ('ptop', 'plev_top', 'upper', 'tropopause')
-    ]
-    for name, original, outdated, boundary in components:
-        if outdated in dataset:
-            dataset = dataset.rename({outdated: original})
-        if original in dataset:
-            dataset = dataset.rename({original: name})
-        if name in dataset:
-            dataset[name].attrs['standard_units'] = 'hPa'
-            dataset[name].attrs.setdefault('units', 'Pa')
-            dataset[name].attrs.setdefault('long_name', f'{boundary} pressure')
+    renames = {
+        'pbot': ('plev_bot', 'lower'),
+        'ptop': ('plev_top', 'upper'),
+        'tpat': ('ts_pattern',),
+    }
     if 'period' in dataset:  # this is for consistency with climate_datasets
         drop = []
         time = pd.date_range('2000-01-01', '2000-12-01', freq='MS')
@@ -790,6 +782,23 @@ def _update_feedback_attrs(
             drop.extend(time.strftime('%b').str.lower().values)
         if drop:
             dataset = dataset.drop_sel(period=drop, errors='ignore')
+    for name, options in renames.items():
+        for option in options:
+            if option in dataset:
+                dataset = dataset.rename({option: name})
+        if name in dataset:
+            data = dataset[name]
+            boundary = 'surface' if name == 'pbot' else 'tropopause'
+            if name == 'tpat':
+                data.attrs['short_name'] = 'relative warming'
+                data.attrs['long_name'] = 'relative surface warming'
+                data.attrs['standard_units'] = 'K / K'
+                data.attrs.setdefault('units', 'K / K')
+            if name in ('pbot', 'ptop'):
+                data.attrs['short_name'] = 'pressure'
+                data.attrs['long_name'] = f'{boundary} pressure'
+                data.attrs['standard_units'] = 'hPa'
+                data.attrs.setdefault('units', 'Pa')
     return dataset
 
 
@@ -888,19 +897,22 @@ def _update_feedback_terms(
     # effective forcings and feedbacks but interpretation is not useful. Now store
     # zero sensitivity components and only compute after the fact.
     if 't' in boundary and 'rfnt_lam' in dataset and 'rfnt_erf' in dataset:
+        num = 4 if quadruple else 2
         if 'rfnt_ecs' not in dataset or 'lon' in dataset['rfnt_ecs'].dims:
-            num = 4 if quadruple else 2
-            label = rf'{num}$\times$CO$_2$ effective climate sensitivity'
             numer = dataset.rfnt_erf.climo.add_cell_measures()
             denom = dataset.rfnt_lam.climo.add_cell_measures()
             data = -1 * numer.climo.average('area') / denom.climo.average('area')
             data.attrs['units'] = 'K'
-            data.attrs['short_name'] = 'temperature'
-            data.attrs['long_name'] = label
+            data.attrs['short_name'] = 'climate sensitivity'
+            data.attrs['long_name'] = rf'{num}$\times$CO$_2$ effective climate sensitivity'  # noqa: E501
             dataset['rfnt_ecs'] = data
-    if 'ts_pattern' in dataset:
-        dataset = dataset.rename(ts_pattern='tpat')
-    keys = {'pbot', 'ptop', 'rfnt_ecs', 'tpat'}
+        if 'tpat' in dataset:
+            data = dataset['tpat'] * dataset['rfnt_ecs']
+            data.attrs['units'] = 'K'
+            data.attrs['short_name'] = rf'{num}$\times$CO$_2$ warming'
+            data.attrs['long_name'] = rf'{num}$\times$CO$_2$ effective warming'
+            dataset['tabs'] = data  # absolute warming
+    keys = {'pbot', 'ptop', 'tpat', 'tabs', 'rfnt_ecs'}
     keys.update(key for key, _ in _iter_dataset(dataset))
     dataset = dataset.drop_vars(dataset.data_vars.keys() - set(keys))
     return dataset
@@ -1087,21 +1099,19 @@ def feedback_datasets(
     if database:
         print('Model:', end=' ')
     for group, data in database.items():
-        # Filter the files
-        bnds, parts, versions = {}, {}, {}
-        for sub, replace in FACETS_RENAME.items():
-            group = tuple(s.replace(sub, replace) for s in group)
-        paths = tuple(
-            path for paths in data.values() for path in paths
-            if bool(nodrift) == bool('nodrift' in path.name)
-        )
-        if not paths:
-            continue
-
         # Load the data
         # NOTE: This accounts for files with dedicated regions indicated in the name,
         # files with numerator and denominator multi-index coordinates, and files with
         # just a denominator region coordinate. Note load_file builds the multi-index.
+        for sub, replace in FACETS_RENAME.items():
+            group = tuple(s.replace(sub, replace) for s in group)
+        paths = [
+            path for paths in data.values() for path in paths
+            if bool(nodrift) == bool('nodrift' in path.name)
+        ]
+        if not paths:
+            continue
+        versions = {}
         print(f'{group[1]}_{group[2]}', end=' ')
         for path in paths:
             *_, indicator, suffix = path.stem.split('_')
@@ -1128,29 +1138,34 @@ def feedback_datasets(
         # NOTE: Concatenation automatically broadcasts global feedbacks across lons and
         # lats. Also critical to use 'override' for combine_attrs in case conventions
         # changed between running feedback calculations on different models.
+        keys = ('pbot', 'ptop')
+        concat, noncat = {}, {}
         for key, dataset in versions.items():
             dataset = _update_feedback_attrs(dataset, **kw_shared, **kw_periods)
             dataset = _update_feedback_terms(dataset, **kw_shared, **kw_terms)
-            if 'pbot' in dataset:  # always represents control pressure
-                bnds['pbot'] = dataset['pbot']
-            if 'ptop' in dataset:
-                bnds['ptop'] = dataset['ptop']
-            dataset = dataset.drop_vars({'pbot', 'ptop'} & dataset.keys())
-            parts[key] = dataset
+            for key in keys:
+                if key not in dataset:
+                    continue
+                data = dataset[key]
+                if 'plev' in data.dims:  # error in _fluxes_from_anomalies
+                    data = data.isel(plev=0, drop=True)
+                noncat[key] = data
+            dataset = dataset.drop_vars(set(keys) & dataset.keys())
+            concat[key] = dataset
         index = xr.DataArray(
-            pd.MultiIndex.from_tuples(parts, names=VERSION_LEVELS),
+            pd.MultiIndex.from_tuples(concat, names=VERSION_LEVELS),
             dims='version',
             name='version',
             attrs={'long_name': 'feedback version'},
         )
         dataset = xr.concat(
-            parts.values(),
+            concat.values(),
             dim=index,
             coords='minimal',
             compat='override',
             combine_attrs='override',
         )
-        dataset.update(bnds)
+        dataset.update(noncat)
         dataset = dataset.squeeze()
         if standardize:
             dataset = _standardize_order(dataset)

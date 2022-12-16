@@ -66,7 +66,7 @@ DETECT_COLORBAR = [
     'extend', 'locator', 'formatter', 'tick', 'minor', 'length', 'shrink',
 ]
 DETECT_LEGEND = [
-    'ncol', 'order', 'frame', 'handle', 'border', 'column',
+    'order', 'frame', 'handle', 'border', 'column',
 ]
 
 # Argument sorting constants
@@ -157,8 +157,10 @@ TRANSLATE_LABELS = {
     ('area', 'nino3'): 'East Pacific',
     ('area', 'nino4'): 'East Pacific',
     ('area', 'so'): 'Southern Ocean',
-    ('source', 'eraint'): 'Davis et al.',
-    ('source', 'zelinka'): 'Zelinka et al.',
+    ('source', 'eraint'): 'custom',
+    ('source', 'zelinka'): 'Zelinka',
+    # ('source', 'eraint'): 'Davis et al.',
+    # ('source', 'zelinka'): 'Zelinka et al.',
     ('region', 'globe'): 'global-$T$',
     ('region', 'point'): 'local-$T$',
     ('region', 'latitude'): 'zonal-$T$',

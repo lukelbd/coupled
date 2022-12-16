@@ -30,6 +30,7 @@ CONFIG_SETTINGS = {
     'inlineformat': 'retina',  # switch between png and retina
     'subplots.refwidth': 2,
     'legend.handleheight': 1.2,
+    'colorbar.extend': 1.0,
     'hatch.linewidth': 0.3,
     'axes.inbounds': False,  # ignore for proper shading bounds
     'axes.margin': 0.04,
@@ -134,6 +135,15 @@ KWARGS_ANNOTATE = {
     'alpha': 1.0,
     'textcoords': 'offset points',
 }
+KWARGS_CENTER = {  # violinplot marker
+    'color': 'w',
+    'marker': 'o',
+    'markersize': (5 * pplt.rc.metawidth) ** 2,
+    'markeredgecolor': 'k',
+    'markeredgewidth': pplt.rc.metawidth,
+    'absolute_size': True,
+    'zorder': 5,
+}
 KWARGS_ERRBAR = {
     'capsize': 0,
     'barcolor': 'gray8',
@@ -143,15 +153,6 @@ KWARGS_ERRBOX = {
     'capsize': 0,
     'boxcolor': 'gray8',
     'boxlinewidth': 3.5 * pplt.rc.metawidth,
-}
-KWARGS_MEDIAN = {  # manual violinplot
-    'color': 'w',
-    'marker': 'o',
-    'markersize': (5 * pplt.rc.metawidth) ** 2,
-    'markeredgecolor': 'k',
-    'markeredgewidth': pplt.rc.metawidth,
-    'absolute_size': True,
-    'zorder': 5,
 }
 KWARGS_ZERO = {
     'color': 'gray9',
@@ -215,12 +216,13 @@ KWARGS_SHADING = {
 KWARGS_VIOLIN = {
     'color': 'gray8',
     'inner': 'stick',  # options are None, 'stick', or 'box' for 1.5 * interquartile
-    'scale': 'area',  # options are 'width', 'count', or 'area' (default)
-    'width': 1.8,  # relative width (permit overlapping)
-    # 'scale': 'count',  # options are 'width', 'count', or 'area' (default)
-    # 'width': 1.3,  # relative width (permit overlapping)
-    'bw': 0.4,
+    # 'scale': 'area',  # options are 'width', 'count', or 'area' (default)
+    # 'width': 1.8,  # relative width (permit overlapping)
+    'scale': 'count',  # options are 'width', 'count', or 'area' (default)
+    'width': 1.3,  # relative width (permit overlapping)
+    'bw': 0.4,  # in feedback or temperature units
     'cut': 0.2,  # no more than this fraction of bandwidth (still want to see lines)
+    'saturation': 1.0,  # exactly reproduce input colors (not the default! weird!)
     'linewidth': pplt.rc.metawidth,
 }
 
@@ -574,7 +576,7 @@ def _auto_command(
     if cycle is not None:
         cycle = pplt.get_colors(cycle)
     elif multicolor:  # TODO: improve
-        cycle = ['yellow7', 'pink7', 'pink3']
+        cycle = ['cyan7', 'pink7', 'pink3']
     else:
         cycle = CYCLE_DEFAULT
     def _get_lists(values, options, default=None):  # noqa: E301
@@ -786,11 +788,6 @@ def _merge_commands(dataset, arguments, kws_collection, labels=None):
         locs.extend(ilocs)
         ticks.append(itick)
         kw_groups.append(kw_outer)  # unique keyword argument groups
-    if not locs:
-        raise RuntimeError(
-            f'Failed to infer the grouped bar/box locations from '
-            f'auto-detected outer keyword arguments {kws_outer}.'
-        )
 
     # Assign inner and outer labels
     # NOTE: This also tries to set up appropriate automatic line breaks
@@ -804,7 +801,7 @@ def _merge_commands(dataset, arguments, kws_collection, labels=None):
     key1, key2 = ('refheight', 'refwidth') if hori else ('refheight', 'refwidth')
     refwidth = kw_collection.figure.get(key1, kw_collection.figure.get(key2))
     refwidth = pplt.units(refwidth or pplt.rc['subplots.refwidth'], 'in')
-    refwidth *= 1 / (group + 1)  # scale spacing by number of groups
+    refwidth *= 1.2 / (group + 1)  # scale spacing by number of groups
     labels_inner = _infer_labels(dataset, *kws_inner, **kw_infer)
     labels_outer = _infer_labels(dataset, *kw_groups, refwidth=refwidth, **kw_infer)
     if labels is None:
@@ -813,7 +810,7 @@ def _merge_commands(dataset, arguments, kws_collection, labels=None):
         labels_outer = labels
     else:
         raise ValueError(f'Mismatch between {len(labels)} and {len(labels_outer)}.')
-    if ticks and labels_outer:
+    if labels_outer:
         print()  # end previous line
         print('Outer labels:', ', '.join(map(repr, labels_outer)), end=' ')
         kw_axes = {
@@ -828,7 +825,7 @@ def _merge_commands(dataset, arguments, kws_collection, labels=None):
 
     # Merge into ragged array or array of coefficients
     # TODO: Somehow combine regression component coordinates
-    locs = np.array(locs, dtype=float)
+    locs = np.array(locs or np.arange(len(kws_inner)), dtype=float)
     keys = ('short_prefix', 'short_suffix', 'short_name', 'units')
     attrs = {
         key: value for (*_, arg) in arguments
@@ -1144,7 +1141,7 @@ def _setup_bars(ax, *args, errdata=None, horizontal=False, annotate=False):
     locs, data = (np.arange(args[-1].size), args[-1]) if len(args) == 1 else args
     labels = data.coords.get('annotation', data.coords[data.dims[0]]).values
     labels = [' '.join(lab) if isinstance(lab, tuple) else str(lab) for lab in labels]
-    nchars = [2 if '$' in label else len(label) for label in labels]
+    nchars = [3 if '$' in label else len(label) for label in labels]
     width, height = ax._get_size_inches()
     if not horizontal:
         s, width, height, slice_ = 'y', width, height, slice(None)
@@ -1277,7 +1274,6 @@ def create_plot(
     collabels=None,
     labelbottom=False,
     labelright=False,
-    maxcols=None,
     argskip=None,
     gridskip=None,
     dcolorbar='right',
@@ -1287,8 +1283,10 @@ def create_plot(
     vcolorbar='bottom',
     vlegend='bottom',
     standardize=False,
-    relxlim=None,
-    relylim=None,
+    ncols=None,
+    nrows=None,
+    rxlim=None,
+    rylim=None,
     save=None,
     **kwargs
 ):
@@ -1311,9 +1309,6 @@ def create_plot(
     labelbottom, labelright : bool, optional
         Whether to label column labels on the bottom and row labels
         on the right. Otherwise they are on the left and top.
-    maxcols : int, optional
-        The default number of columns. Used only if one of the row or variable
-        specs is scalar (in which case there are no row or column labels).
     argskip : int or sequence, optional
         The axes indices to omit from auto color scaling in each group of axes
         that shares the same colorbar. Can be used to let columns saturate.
@@ -1332,9 +1327,12 @@ def create_plot(
     standardize : bool, optional
         Whether to standardize axis limits to span the same range for all
         plotted content with the same units.
-    relxlim, relylim : float or 2-tuple, optional
-        Relative x-limit and y-limit scaling to apply to the standardized range(s).
-        Values should lie between 0 and 1.
+    nrows, ncols : float, optional
+        The number of rows or columns to use when either of the row
+        or column plotting specifiers are singleton.
+    rxlim, rylim : float or 2-tuple, optional
+        Relative x and y axis limits to apply to groups of shared or standardized axes.
+        Values should lie between 0 and 1. Note `xlim` and `ylim` can also be used.
     save : path-like, optional
         The save folder base location. Stored inside a `figures` subfolder.
     **kw_specs
@@ -1365,9 +1363,9 @@ def create_plot(
     argskip = np.atleast_1d(() if argskip is None else argskip)
     gridskip = np.atleast_1d(() if gridskip is None else gridskip)
     kws_process, kws_collection, figlabel, pathlabel, gridlabels = parse_specs(*args, **kwargs)  # noqa: E501
-    nrows, ncols = map(len, gridlabels)
-    nrows, ncols = max(nrows, 1), max(ncols, 1)
-    titles = (None,) * nrows * ncols
+    srows, scols = map(len, gridlabels)
+    srows, scols = max(srows, 1), max(scols, 1)
+    titles = (None,) * srows * scols
     # Title overrides
     # NOTE: This supports optional selections e.g. rowlabels=[None, 'override'].
     rowkey = 'rightlabels' if labelright else 'leftlabels'
@@ -1382,18 +1380,22 @@ def create_plot(
     # Grid label overrides
     kw_gridlabels = {}
     for key, clabels, dlabels in zip((rowkey, colkey), (rowlabels, collabels), gridlabels):  # noqa: E501
-        nlabels = nrows if key == rowkey else ncols
+        nlabels = srows if key == rowkey else scols
         clabels = clabels or [None] * nlabels
         dlabels = dlabels or [None] * nlabels
         if len(dlabels) != nlabels or len(clabels) != nlabels:
             raise RuntimeError(f'Expected {nlabels} labels but got {len(dlabels)} and {len(clabels)}.')  # noqa: E501
         kw_gridlabels[key] = [clab or dlab for clab, dlab in zip(clabels, dlabels)]
-    if nrows == 1 or ncols == 1:
-        naxes = gridskip.size + max(nrows, ncols)
-        ncols = min(naxes, maxcols or 4)
-        nrows = 1 + (naxes - 1) // ncols
+    if srows == 1 or scols == 1:
+        naxes = gridskip.size + max(srows, scols)
+        if nrows is not None:
+            srows = min(naxes, nrows)
+            scols = 1 + (naxes - 1) // srows
+        else:
+            scols = min(naxes, ncols or 4)
+            srows = 1 + (naxes - 1) // scols
         titles = max(kw_gridlabels.values(), key=lambda labels: len(labels))
-        titles = max(nrows, ncols) > 1 and titles or (None,) * nrows * ncols
+        titles = max(srows, scols) > 1 and titles or (None,) * srows * scols
         kw_gridlabels = {rowkey: None, colkey: None}
     # Print message
     print('All:', repr(figlabel))
@@ -1411,12 +1413,12 @@ def create_plot(
     groups_commands = {}
     iterator = tuple(zip(titles, kws_process, kws_collection))
     print('Getting data:', end=' ')
-    for num in range(nrows * ncols):
+    for num in range(srows * scols):
         if num in gridskip:
             continue
         if count > len(iterator):
             continue
-        print(f'{num + 1}/{nrows * ncols}', end=' ')
+        print(f'{num + 1}/{srows * scols}', end=' ')
         # Retrieve data
         ititle, ikws_process, ikws_collection = iterator[(count := count + 1) - 1]
         imethods, icommands, arguments, kws_collection = [], [], [], []
@@ -1430,7 +1432,7 @@ def create_plot(
             arguments.append(args)
             kws_collection.append(kw_collection)
         # Infer commands
-        kwargs = dict(fig=fig, gs=gs, geom=(nrows, ncols, num), title=ititle)
+        kwargs = dict(fig=fig, gs=gs, geom=(srows, scols, num), title=ititle)
         fig, gs, axs, icommands, guides, arguments, kws_collection = _infer_commands(
             dataset, arguments, kws_collection, **kwargs
         )
@@ -1491,7 +1493,7 @@ def create_plot(
             # print('Args:', command, argskip, len(arguments), len(zs), zs[0].name)
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore', pplt.internals.ProplotWarning)
-                levels, *_, kw_levels = axs[0]._parse_level_vals(*xy, *zs, **kw_levels)
+                levels, *_ = axs[0]._parse_level_vals(*xy, *zs, **kw_levels)
             locator = pplt.DiscreteLocator(levels, nbins=7)
             minorlocator = pplt.DiscreteLocator(levels, nbins=7, minor=True)
             for kw_command in kws_command:
@@ -1565,8 +1567,8 @@ def create_plot(
                 scatter = 'scatterx' if 'h' in command else 'scatter'
                 with warnings.catch_warnings():
                     warnings.simplefilter('ignore', RuntimeWarning)
-                    medians = np.nanmedian(args[0], axis=0)
-                getattr(ax, scatter)(medians, **KWARGS_MEDIAN)
+                    centers = np.nanmedian(args[0], axis=0)
+                getattr(ax, scatter)(centers, **KWARGS_CENTER)
                 alphas, widths = kw_other['alpha'], kw_other['linewidth']  # noqa: E501
                 for obj, alpha, width in zip(handle, alphas, widths, strict=True):
                     obj.update({'alpha': alpha, 'linewidth': width})
@@ -1598,12 +1600,11 @@ def create_plot(
             tuples.append((axs, args[-1], handle, kw_guide, kw_command))
 
     # Queue shared legends and colorbars
-    # WARNING: Must determine spans before drawing or they are overwritten.
-    print('\nAdding guides:', end=' ')
     # NOTE: This enforces legend handles grouped only for parameters with identical
     # units e.g. separate legends for sensitivity and feedback bar plots.
     # WARNING: Critical to delay wrapping the colorbar label until content is
     # drawn or else the reference width and height cannot be known.
+    print('\nAdding guides:', end=' ')
     groups_colorbars, groups_legends = {}, {}
     for identifier, tuples in groups_handles.items():
         handles = []
@@ -1626,37 +1627,40 @@ def create_plot(
             if handle is not None and label is not None:  # e.g. scatter plots
                 if isinstance(handle, (list, mcontainer.Container)):
                     handle = handle[0]  # legend_elements list BarContainer container
-                tuples = groups.setdefault((src, loc, span), [])
+                tuples = groups.setdefault((axs[0], src, loc, span), [])
                 tuples.append((handle, label, kw_guide))
 
     # Add shared legends and colorbar
     # TODO: Should support colorbars spanning multiple columns or
     # rows in the center of the gridspec in addition to figure edges.
+    # WARNING: For some reason extendsize adjustment is still incorrect
+    # even though axes are already drawn here. Not sure why.
     for guide, groups in zip(('colorbar', 'legend'), (groups_colorbars, groups_legends)):  # noqa: E501
         print('.', end='')
-        for (src, loc, span), tuples in groups.items():
+        for (ax, src, loc, span), tuples in groups.items():
             handles, labels, kws_guide = zip(*tuples)
             kw_guide = {key: val for kw_guide in kws_guide for key, val in kw_guide.items()}  # noqa: E501
-            if span is not None:  # figure row or column span
-                kw_guide['span'] = span
-                if guide == 'colorbar' and span[1] - span[0] > 0:
-                    kw_guide['length'] = 0.66  # not full length
+            kw_guide.update({} if span is None else {'span': span})
             if guide == 'legend':
                 kw_guide.setdefault('frame', False)
                 kw_guide.setdefault('ncols', 1)
                 src.legend(list(handles), list(labels), loc=loc, **kw_guide)
             else:
-                if isinstance(src, pplt.Figure):
-                    width, height = src.get_size_inches()
-                else:
-                    width, height = ax._get_size_inches()  # all axes present by now
-                refwidth = height if loc[0] in 'lr' else width
-                label = kw_guide.pop('label', '')
-                label = _wrap_label(label, refwidth=1.5 * refwidth)
+                width, height = ax._get_size_inches()  # sample axes
+                multi = span is not None and span[1] - span[0] > 0
+                size = height if loc[0] in 'lr' else width
+                size *= span[1] - span[0] + 1 if multi else 1
+                ratio = width / height if not multi else 1.0
+                kw_guide['length'] = length = 0.66 if multi else 1.0
+                kw_guide['extendsize'] = ratio * pplt.rc['colorbar.extend'] / length
                 for handle, label in zip(handles, labels):
+                    label = _wrap_label(label, refwidth=1.5 * size)
                     src.colorbar(handle, label=label, loc=loc, **kw_guide)
 
-    # Standardize relative axes limits
+    # Standardize relative axes limits and impose relative units
+    # NOTE: Previously permitted e.g. rxlim=[(0, 1), (0, 0.5)] but these would
+    # be applied *implicitly* based on drawing order so too confusing. Use
+    # 'outer' from constraints '_build_specs()' function instead.
     print('.')
     if not standardize:  # auto-search for shared axes
         ref = fig.subplotgrid[0]
@@ -1666,25 +1670,21 @@ def create_plot(
             groups_shared = {'x': list(ref._shared_x_axes), 'y': list(ref._shared_y_axes)}  # noqa: E501
         for axis, groups in tuple(groups_shared.items()):
             for idx, axs in enumerate(groups):
-                if not all(ax in fig.subplotgrid for ax in axs):
-                    continue
-                if axis == 'x':
-                    groups_xunits[idx] = groups[idx]
-                else:
-                    groups_yunits[idx] = groups[idx]
-    for axis, rellim, groups in zip('xy', (relxlim, relylim), (groups_xunits, groups_yunits)):  # noqa: E501
+                if all(ax in fig.subplotgrid for ax in axs):
+                    if axis == 'x':
+                        groups_xunits[idx] = groups[idx]
+                    else:
+                        groups_yunits[idx] = groups[idx]
+    for axis, rlim, groups in zip('xy', (rxlim, rylim), (groups_xunits, groups_yunits)):
+        rlim = rlim or (0, 1)  # disallow *implicit* application of multiple options
         for i, (unit, axs) in enumerate(groups.items()):
             lims = [getattr(ax, f'get_{axis}lim')() for ax in axs]
             span = max((lim[1] - lim[0] for lim in lims), key=abs)  # preserve sign
-            if rellim is None:
-                rlim = [0, 1]
-            else:
-                rlim = rellim[i] if np.iterable(rellim[0]) else rellim
             for ax, lim in zip(axs, lims):
                 average = 0.5 * (lim[0] + lim[1])
-                offsets = [(-0.5 + rlim[0]) * span, (-0.5 + rlim[1]) * span]
-                lim = (average + offsets[0], average + offsets[1])
-                getattr(ax, f'set_{axis}lim')(lim)
+                min_ = average + span * (rlim[0] - 0.5)
+                max_ = average + span * (rlim[1] - 0.5)
+                getattr(ax, f'set_{axis}lim')((min_, max_))
 
     # Optionally save the figure
     # NOTE: Here default labels are overwritten with non-none 'rowlabels' or

@@ -454,14 +454,19 @@ def _apply_single(data, dim=None, method=None, pctile=None, std=None):
         The dimension.
     method : str, optional
         The reduction method (see `apply_method`).
+
+    Other Parameters
+    ----------------
     pctile : float or sequence, optional
         The percentile range or thresholds for related methods. Set to ``True`` to
         use default values of ``50`` for ``pctile`` and ``95`` for ``avg|med`` shading.
         Pass two values, e.g. ``[50, 95]``, to use both `shade` and `fade` keywords.
+        If one is provided an alpha level between `shade` and `fade` is used.
     std : float or sequence, optional
         The standard deviation multiple for related methods. Set to ``True`` to use
         default values of ``1`` for ``std`` and ``3`` for ``avg|med`` shading.
         Pass two values, e.g. ``[1, 3]``, to use both `shade` and `fade` keywords.
+        If one is provided an alpha level between `shade` and `fade` is used.
 
     Returns
     -------
@@ -482,18 +487,21 @@ def _apply_single(data, dim=None, method=None, pctile=None, std=None):
     defaults = {}
     if method == 'avg' or method == 'med':
         key = 'mean' if method == 'avg' else 'median'
+        defaults.update({'fadealpha': 0.15, 'shadealpha': 0.3})
         if std is None and pctile is None:
             assert ndim < 4
             cmd = getattr(data, key)
             data = cmd(**kw, keep_attrs=True)
         elif std is not None:
             assert ndim == 2
-            std = np.atleast_1d([1, 3] if std is True else std)
+            std = [1, 3] if std is True else std  # or [1, 3]
+            std = np.atleast_1d(std)
             shade, fade = std if std.size == 2 else (std.item(), None)
             defaults.update({key: True, 'shadestds': shade, 'fadestds': fade})
         else:
             assert ndim == 2
-            pctile = np.atleast_1d([50, 95] if pctile is True else pctile)
+            pctile = [50, 95] if pctile is True else pctile  # or [50, 95]
+            pctile = np.atleast_1d(pctile)
             shade, fade = pctile if pctile.size == 2 else (pctile.item(), None)
             defaults.update({key: True, 'shadepctiles': shade, 'fadepctiles': fade})
     elif method == 'pctile':

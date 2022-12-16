@@ -149,8 +149,11 @@ FEEDBACK_TRANSLATIONS = {
     'swcld': ('cl_rsnt_lam', 'W m^-2 K^-1'),  # zelinka definition
     'alb': ('alb_rfnt_lam', 'W m^-2 K^-1'),  # zelinka definition (full is 'albedo')
     'atm': ('atm_rfnt_lam', 'W m^-2 K^-1'),
-    'lwatm': ('atm_rlnt_lam', 'W m^-2 K^-1'),
-    'swatm': ('atm_rsnt_lam', 'W m^-2 K^-1'),
+    'lwatm': ('atm_rlnt_lam', 'W m^-2 K^-1'),  # not currently used
+    'swatm': ('atm_rsnt_lam', 'W m^-2 K^-1'),  # not currently used
+    'ncl': ('ncl_rfnt_lam', 'W m^-2 K^-1'),
+    'lwncl': ('ncl_rlnt_lam', 'W m^-2 K^-1'),  # not currently used
+    'swncl': ('ncl_rsnt_lam', 'W m^-2 K^-1'),  # not currently used
     'pl': ('pl_rfnt_lam', 'W m^-2 K^-1'),  # zelinka definition
     'pl*': ('pl*_rfnt_lam', 'W m^-2 K^-1'),  # zelinka definition
     'lr': ('lr_rfnt_lam', 'W m^-2 K^-1'),  # zelinka definition
@@ -739,10 +742,12 @@ def _update_feedback_attrs(
             ('erf', 'erf2x', 'forcing'),
             ('ecs', 'ecs2x', 'climate sensitivity'),
         ):
-            if wavelength == 'full':  # WARNING: do not overwrite itertools 'descrip'
-                tail = descrip if descrip else 'effective' if suffix == 'ecs' else 'net'
-            else:
+            if wavelength != 'full':  # WARNING: do not overwrite itertools 'descrip'
                 tail = f'{wavelength} {descrip}' if descrip else wavelength
+            elif suffix == 'lam':
+                tail = descrip if descrip else 'net'
+            else:
+                tail = descrip if descrip else 'effective'
             if component in ('', 'cs'):
                 prefix = f'{rad}{component}'
             else:
@@ -834,7 +839,7 @@ def _update_feedback_terms(
     regex = re.compile(r'(\A|[^_]*)(_?r)([lsf])([udn])([tsa])(|cs|ce)(?=_)')
     boundary = boundary or 't'
     def _iter_dataset(dataset, boundary=boundary, erfextra=erfextra, wavextra=wavextra):  # noqa: E301, E501
-        erfparts = ('', 'cl', 'alb', 'atm', 'resid')
+        erfparts = ('', 'cl', 'alb', 'atm', 'ncl', 'resid')
         wavparts = ('', 'cl')
         for key in dataset:
             if 'ecs' in key and 'lon' in dataset[key].dims:  # ignore outdated values
@@ -877,6 +882,15 @@ def _update_feedback_terms(
                 long_name = dataset[key].attrs.get('long_name', '')
                 long_name = long_name.replace('Planck', 'temperature + humidity')
                 dataset[atm].attrs['long_name'] = long_name
+        if m.group(1) == 'cl' and m.group(3) == 'f':
+            ncl = regex.sub(r'ncl\2\3\4\5\6', key)
+            net = regex.sub(r'\2\3\4\5\6', key).strip('_')
+            if net in dataset:
+                with xr.set_options(keep_attrs=True):
+                    dataset[ncl] = dataset[net] - dataset[key]
+                long_name = dataset[key].attrs.get('long_name', '')
+                long_name = long_name.replace('cloud', 'non-cloud')
+                dataset[ncl].attrs['long_name'] = long_name
 
     # Add cloud effect feedbacks
     # NOTE: Here use 'ce' for 'cloud effect' to differentiate from the loaded term
@@ -1138,19 +1152,19 @@ def feedback_datasets(
         # NOTE: Concatenation automatically broadcasts global feedbacks across lons and
         # lats. Also critical to use 'override' for combine_attrs in case conventions
         # changed between running feedback calculations on different models.
-        keys = ('pbot', 'ptop')
+        names = ('pbot', 'ptop')
         concat, noncat = {}, {}
         for key, dataset in versions.items():
             dataset = _update_feedback_attrs(dataset, **kw_shared, **kw_periods)
             dataset = _update_feedback_terms(dataset, **kw_shared, **kw_terms)
-            for key in keys:
-                if key not in dataset:
+            for name in names:
+                if name not in dataset:
                     continue
-                data = dataset[key]
+                data = dataset[name]
                 if 'plev' in data.dims:  # error in _fluxes_from_anomalies
                     data = data.isel(plev=0, drop=True)
-                noncat[key] = data
-            dataset = dataset.drop_vars(set(keys) & dataset.keys())
+                noncat[name] = data
+            dataset = dataset.drop_vars(set(names) & dataset.keys())
             concat[key] = dataset
         index = xr.DataArray(
             pd.MultiIndex.from_tuples(concat, names=VERSION_LEVELS),

@@ -12,7 +12,7 @@ from climopy.var import _get_bounds, linefit
 from climopy import ureg, vreg  # noqa: F401
 from icecream import ic  # noqa: F401
 
-from .internals import KEYS_METHOD, KEYS_SPATIAL, ORDER_LOGICAL
+from .internals import KEYS_METHOD, ORDER_LOGICAL
 from .internals import _fix_lengths, _fix_parts, _get_parts
 from .results import FACETS_LEVELS, FEEDBACK_TRANSLATIONS, VERSION_LEVELS
 from cmip_data.internals import MODELS_INSTITUTES, INSTITUTES_LABELS
@@ -35,15 +35,6 @@ VERSION_DEFAULTS = {
     'stop': 150,
 }
 
-# Selection for spatial reduction
-SPATIAL_RESTRICT = {
-    'lon': slice(120, 280),
-    'lat': slice(-30, 30),
-    # 'lat': slice(-30, 30),
-    # 'lat': slice(-20, 20),
-    # 'lat': slice(-15, 15),
-}
-
 # Reduce presets
 # See (WPG and ENSO): https://doi.org/10.1175/JCLI-D-12-00344.1
 # See (WPG and ENSO): https://doi.org/10.1038/s41598-021-99738-3
@@ -53,6 +44,7 @@ SPATIAL_RESTRICT = {
 AREA_REGIONS = {
     'so': {'lat_lim': (-60, -30)},
     'trop': {'lat_lim': (-30, 30)},
+    'tpac': {'lat_lim': (-30, 30), 'lon_lim': (120, 280)},
     'pool': {'lat_lim': (-30, 30), 'lon_lim': (50, 200)},
     'wlam': {'lat_lim': (-15, 15), 'lon_lim': (150, 170)},
     'elam': {'lat_lim': (-30, 0), 'lon_lim': (260, 280)},
@@ -322,48 +314,6 @@ def _parse_institute(data, institute=None):
     return filt
 
 
-def _apply_spatial(data, method=None, restrict=True, **kwargs):
-    """
-    Return the projection of a temperature pattern onto the pre-industrial pattern.
-
-    Parameters
-    ----------
-    method : str, optional
-        Passed to `_apply_double`.
-    restrict : bool, optional
-        Whether to restrict data to the tropics only.
-    **kwargs
-        Optional `reduce` keywords for selecting a feedback version.
-    """
-    # Apply reductions
-    # TODO: Consider adding 'spatial' key instead of ad hoc approach.
-    # spatial : str, optional
-    #     The spatial reduction method. This is typically used for finding the
-    #     correlation, projection, regression, or covariance of temperature patterns.
-    #     After this is applied `method` will still be applied.
-    # for i, method in enumerate((spatial, method)):
-    #     if len(datas) == 1:
-    #         raise ValueError('Spatial reductions require two input arguments.')
-    method = method or 'corr'  # correlation by default instead of R-squared
-    kwargs = {**kwargs, 'experiment': 'picontrol', 'area': None, 'lon': None}
-    data0 = apply_reduce(data, **kwargs)
-    kwargs = {**kwargs, 'experiment': 'abrupt4xco2', 'area': None, 'lon': None}
-    data1 = apply_reduce(data, **kwargs)
-    if any(data.sizes.keys() < {'lon', 'lat'} for data in (data0, data1)):
-        raise ValueError('Area coordinate not found for input data.')
-    if restrict:
-        data0, data1 = data0.sel(SPATIAL_RESTRICT), data1.sel(SPATIAL_RESTRICT)
-    data, defaults = _apply_double(data0, data1, dim='area', method=method)
-    short = defaults.pop('short_name', None)
-    long = defaults.pop('long_name', None)
-    short = short.replace(data1.short_name, 'warming pattern spatial')
-    long = long.replace(f'{data1.long_name}/{data0.long_name}', 'warming pattern spatial')  # noqa: E501
-    data.name = f't{method}'  # WARNING: critical for subsequent labels
-    data.attrs['short_name'] = short
-    data.attrs['long_name'] = long
-    return data
-
-
 def _apply_double(data0, data1, dim=None, method=None, invert=None):
     """
     Apply reduction method for two data arrays.
@@ -387,49 +337,54 @@ def _apply_double(data0, data1, dim=None, method=None, invert=None):
     defaults : dict
         The default attributes and command keyword args.
     """
+    data0, data1 = (data1, data0) if invert else (data0, data1)
     method = method or 'cov'
+    short = long = None
+    name = f'{data0.name}-{data1.name}'
     ndim = max(data0.ndim, data1.ndim)
     dim = dim or 'facets'
-    if invert:  # invert dependencies
-        data0, data1 = data1, data0
-    name = f'{data0.name}-{data1.name}'
-    short = long = None
+    if dim == 'area':
+        short_prefix, long_prefix = 'spatial', f'{data1.short_name} spatial'
+    elif data0.long_name == data0.long_name:
+        short_prefix, long_prefix = data1.short_name, data1.long_name
+    else:
+        short_prefix, long_prefix = data1.short_name, f'{data1.long_name}/{data0.long_name}'  # noqa: E501
     if method == 'cov':
         data, _ = _components_covariance(data0, data1, dim=dim, both=False)
         data = data.climo.dequantify()
-        short = f'{data1.short_name} covariance'
-        long = f'{data1.long_name}/{data0.long_name} covariance'
+        short = f'{short_prefix} covariance'
+        long = f'{long_prefix} covariance'
     elif method == 'slope':  # regression coefficient
         cov, std = _components_covariance(data0, data1, dim=dim, both=False)
         data = cov / std ** 2
         data = data.climo.dequantify()
-        short = f'{data1.short_name} regression coefficient'
-        long = f'{data1.long_name}/{data0.long_name} regression coefficient'
+        short = f'{short_prefix} regression coefficient'
+        long = f'{long_prefix} regression coefficient'
     elif method == 'rsq':  # correlation coefficient
         cov, std0, std1 = _components_covariance(data0, data1, dim=dim, both=True)
         data = (cov / (std0 * std1)) ** 2
         data = data.climo.to_units('percent').climo.dequantify()
-        short = f'{data1.short_name} variance explained'
-        long = f'{data1.long_name}/{data0.long_name} variance explained'
+        short = f'{short_prefix} variance explained'
+        long = f'{long_prefix} variance explained'
     elif method == 'proj':  # projection onto x
         cov, std = _components_covariance(data0, data1, dim=dim, both=False)
         data = cov / std
         data = data.climo.dequantify()
-        short = f'{data1.short_name} projection'
-        long = f'{data1.long_name}/{data0.long_name} projection'
+        short = f'{short_prefix} projection'
+        long = f'{long_prefix} projection'
     elif method == 'corr':  # correlation coefficient
         cov, std0, std1 = _components_covariance(data0, data1, dim=dim, both=True)
         data = cov / (std0 * std1)
         data = data.climo.to_units('dimensionless').climo.dequantify()
-        short = f'{data1.short_name} correlation'
-        long = f'{data1.long_name}/{data0.long_name} correlation coefficient'  # noqa: E501
+        short = f'{short_prefix} correlation'
+        long = f'{long_prefix} correlation coefficient'
     elif method == 'diff':  # composite difference along first arrays
         assert dim != 'area'
         data_lo, data_hi = _components_composite(data0, data1, dim=dim)
         data = data_hi - data_lo
         data = data.climo.dequantify()
         short = f'{data1.short_name} composite difference'
-        long = f'{data0.long_name}-composite {data1.long_name} difference'  # noqa: E501
+        long = f'{data0.long_name}-composite {data1.long_name} difference'
     elif method == 'dist':  # scatter or bars
         assert ndim == 1
         data0, data1 = data0[~data0.isnull()], data1[~data1.isnull()]
@@ -510,14 +465,14 @@ def _apply_single(data, dim=None, method=None, pctile=None, std=None):
         nums = 0.01 * pctile / 2, 1 - 0.01 * pctile / 2
         with xr.set_options(keep_attrs=True):  # note name is already kept
             data = data.quantile(nums[1], **kw) - data.quantile(nums[0], **kw)
-        short = f'{data.short_name} percentile range'
+        short = f'{data.short_name} spread'
         long = f'{data.long_name} percentile range'
     elif method == 'std':
         assert ndim < 4
         std = 1 if std is None or std is True else std
         with xr.set_options(keep_attrs=True):  # note name is already kept
             data = std * data.std(**kw)
-        short = f'{data.short_name} standard deviation'
+        short = f'{data.short_name} spread'
         long = f'{data.long_name} standard deviation'
     elif method == 'dist':  # bars or boxes
         assert ndim == 1
@@ -702,7 +657,8 @@ def apply_reduce(data, attrs=None, **kwargs):
     for key in sorted(kwargs, key=sorter):
         # Parse input instructions
         value = kwargs[key]
-        opts = [*data.sizes, 'area', 'volume']
+        print('reduce!!!', key, value)
+        opts = list((*data.sizes, 'area', 'volume', 'spatial'))
         opts.extend(name for idx in data.indexes.values() for name in idx.names)
         if value is None or key not in opts:
             continue
@@ -717,11 +673,31 @@ def apply_reduce(data, attrs=None, **kwargs):
                 data, value = data.climo.truncate(region), 'avg'
             elif value != 'avg':
                 raise ValueError(f'Unknown averaging region {value!r}.')
+
+        # Apply reduction
+        if key == 'spatial' and not data.sizes.keys() & {'facets', 'experiment'}:
+            continue  # e.g. another variable
+        if kwargs.get('spatial') and key in ('area', 'start', 'stop', 'experiment'):
+            continue
+        if key == 'spatial':  # NOTE: implicit 'area' truncation should already be done
+            kw0, kw1 = {}, {}
+            if 'version' in data.coords:
+                kw0 = {'start': 0, 'stop': 150}
+                kw1 = {'start': kwargs.get('start', 0), 'stop': kwargs.get('stop', 150)}
+            data0 = data.sel(experiment='picontrol', **kw0)
+            data1 = data.sel(experiment='abrupt4xco2', **kw1)
+            data, defaults = _apply_double(data0, data1, dim='area', method=value)
+            name = defaults.pop('name')  # see below
+            if value in ('corr', 'rsq'):  # overwrite 'tpat'
+                attrs['standard_units'] = ''
+            attrs.update({**data.attrs, **defaults})
+        else:
+            try:
+                data = data.climo.reduce(**{key: value}).squeeze()
+            except Exception:
+                raise RuntimeError(f'Failed to reduce data with {key}={value!r}.')
+
         # Apply reduction and update coords
-        try:
-            data = data.climo.reduce(**{key: value}).squeeze()
-        except Exception:
-            raise RuntimeError(f'Failed to reduce data with {key}={value!r}.')
         for multi, levels in zip(('facets', 'version'), (FACETS_LEVELS, VERSION_LEVELS)):  # noqa: E501
             if multi in data.coords or key not in levels:  # multi-index still present
                 continue
@@ -776,13 +752,16 @@ def get_data(dataset, *kws_process, attrs=None, suffix=False):
         alias_to_name.update({'control': 'picontrol', 'response': 'abrupt4xco2'})
     kws_reduce, kws_coords = [], []  # each item represents a method argument
     for kw_process in kws_process:
+        # Get reduce instructions
         scale = 1
-        kw_method = {key: kw_process.pop(key) for key in KEYS_METHOD if key in kw_process}  # noqa: E501
+        kw_method = {
+            key: kw_process.pop(key) for key in KEYS_METHOD
+            if key in kw_process
+        }
         kw_coords = {
             key: value for key, value in kw_process.items()
             if key != 'name' and value is not None
         }
-        # Get reduce instructions
         kw_reduce = {}
         kw_process = _fix_parts(kw_process)
         for key, value in kw_process.items():
@@ -847,17 +826,13 @@ def get_data(dataset, *kws_process, attrs=None, suffix=False):
         datas, kw_method = [], {}
         for kw_reduce in ikws_reduce:  # two for e.g. 'corr', one for e.g. 'avg'
             kw_reduce = kw_reduce.copy()
+            name = kw_reduce.pop('name')  # NOTE: always present
             for key in tuple(kw_reduce):
                 if key in KEYS_METHOD:
                     kw_method.setdefault(key, kw_reduce.pop(key))
-            name = kw_reduce.pop('name')
-            if name in KEYS_SPATIAL:
-                cmd, name, method = _apply_spatial, 'tpat', name[1:]
-            else:
-                cmd, name, method = apply_reduce, name, kw_reduce.pop('method', None)
             if name not in dataset:
                 raise ValueError(f'Invalid name {name}. Options are {tuple(dataset.data_vars)}.')  # noqa: E501
-            data = cmd(dataset[name], method=method, **kw_reduce)
+            data = apply_reduce(dataset[name], **kw_reduce)
             datas.append(data)
         datas, method, default = apply_method(*datas, **kw_method)
         for key, value in default.items():

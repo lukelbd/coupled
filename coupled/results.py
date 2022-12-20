@@ -266,7 +266,7 @@ def _standardize_order(dataset):
     variables = ['albedo', 'hfls', 'hfss']
     variables += [f'r{wav}n{bnd}{sky}' for wav, bnd, sky in iter_]  # capture fluxes too
     parameters = ['', 'lam', 'rho', 'kap', 'erf', 'ecs', 'tcr']
-    components = ['', 'pl', 'pl*', 'lr', 'lr*', 'hus', 'hur', 'atm', 'alb', 'cl', 'resid']  # noqa: E501
+    components = ['', 'pl', 'pl*', 'lr', 'lr*', 'hus', 'hur', 'atm', 'alb', 'cl', 'ncl', 'resid']  # noqa: E501
     iter_ = itertools.product(components, variables, parameters)
     names.extend('_'.join(tup).strip('_') for tup in iter_)
     # Transport order
@@ -797,12 +797,12 @@ def _update_feedback_attrs(
             if name == 'tpat':
                 data.attrs['short_name'] = 'relative warming'
                 data.attrs['long_name'] = 'relative surface warming'
-                data.attrs['standard_units'] = 'K / K'
+                data.attrs['standard_units'] = 'K / K'  # otherwise not used in labels
                 data.attrs.setdefault('units', 'K / K')
             if name in ('pbot', 'ptop'):
                 data.attrs['short_name'] = 'pressure'
                 data.attrs['long_name'] = f'{boundary} pressure'
-                data.attrs['standard_units'] = 'hPa'
+                data.attrs['standard_units'] = 'hPa'  # differs from units
                 data.attrs.setdefault('units', 'Pa')
     return dataset
 
@@ -920,11 +920,11 @@ def _update_feedback_terms(
             data.attrs['short_name'] = 'climate sensitivity'
             data.attrs['long_name'] = rf'{num}$\times$CO$_2$ effective climate sensitivity'  # noqa: E501
             dataset['rfnt_ecs'] = data
-        if 'tpat' in dataset:
+        if 'tpat' in dataset:  # NOTE: avoid 'abrupt 4xCO2 2xCO2' in title
             data = dataset['tpat'] * dataset['rfnt_ecs']
             data.attrs['units'] = 'K'
-            data.attrs['short_name'] = rf'{num}$\times$CO$_2$ warming'
-            data.attrs['long_name'] = rf'{num}$\times$CO$_2$ effective warming'
+            data.attrs['short_name'] = rf'{num}$\times$CO$_2$ effective warming'
+            data.attrs['long_name'] = 'effective surface warming'  # see above
             dataset['tabs'] = data  # absolute warming
     keys = {'pbot', 'ptop', 'tpat', 'tabs', 'rfnt_ecs'}
     keys.update(key for key, _ in _iter_dataset(dataset))
@@ -1147,6 +1147,7 @@ def feedback_datasets(
                 for region in dataset.region.values:  # includes pbot and ptop
                     sel = dataset.sel(region=region, drop=True)
                     versions[source, statistic, region, start, stop] = sel
+            del dataset
 
         # Concatenate the data
         # NOTE: Concatenation automatically broadcasts global feedbacks across lons and

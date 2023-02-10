@@ -13,11 +13,11 @@ from climopy import ureg, vreg  # noqa: F401
 from icecream import ic  # noqa: F401
 
 from .internals import KEYS_METHOD, ORDER_LOGICAL
-from .internals import _fix_lengths, _fix_parts, _get_parts
+from .internals import _group_parts, _ungroup_parts, _to_lists
 from .results import FACETS_LEVELS, FEEDBACK_TRANSLATIONS, VERSION_LEVELS
 from cmip_data.internals import MODELS_INSTITUTES, INSTITUTES_LABELS
 
-__all__ = ['apply_reduce', 'apply_method', 'get_data']
+__all__ = ['apply_reduce', 'apply_method', 'process_data']
 
 # Reduce defaults
 GENERAL_DEFAULTS = {
@@ -42,12 +42,20 @@ VERSION_DEFAULTS = {
 # See (feedback regions): https://doi.org/10.1175/JCLI-D-17-0087.1
 # https://climatedataguide.ucar.edu/climate-data/nino-sst-indices-nino-12-3-34-4-oni-and-tni
 AREA_REGIONS = {
-    'so': {'lat_lim': (-60, -30)},
+    'so': {'lat_lim': (-60, -30)},  # labeled 'southern ocean'
+    'se': {'lat_lim': (-60, -30)},  # labeled 'southern extratropics'
+    'ne': {'lat_lim': (30, 60)},
+    'sh': {'lat_lim': (-90, 0)},
+    'nh': {'lat_lim': (0, 90)},
     'trop': {'lat_lim': (-30, 30)},
     'tpac': {'lat_lim': (-30, 30), 'lon_lim': (120, 280)},
     'pool': {'lat_lim': (-30, 30), 'lon_lim': (50, 200)},
-    'wlam': {'lat_lim': (-15, 15), 'lon_lim': (150, 170)},
-    'elam': {'lat_lim': (-30, 0), 'lon_lim': (260, 280)},
+    'wpac': {'lat_lim': (-15, 15), 'lon_lim': (90, 150)},  # slightly reduced bounds
+    'epac': {'lat_lim': (-30, 0), 'lon_lim': (260, 290)},
+    # 'wpac': {'lat_lim': (-15, 15), 'lon_lim': (90, 150)},  # based on own feedbacks
+    # 'epac': {'lat_lim': (-30, 0), 'lon_lim': (260, 290)},
+    # 'wpac': {'lat_lim': (-15, 15), 'lon_lim': (150, 170)},  # paper based on +4K
+    # 'epac': {'lat_lim': (-30, 0), 'lon_lim': (260, 280)},
     'nina': {'lat_lim': (0, 10), 'lon_lim': (130, 150)},
     'nino': {'lat_lim': (-5, 5), 'lon_lim': (190, 240)},
     'nino3': {'lat_lim': (-5, 5), 'lon_lim': (210, 270)},
@@ -141,6 +149,50 @@ def _components_covariance(data0, data1, both=True, dim='facets'):
     return (covar, std0, std1) if both else (covar, std0)
 
 
+def _components_corr(data0, data1, dim=None, pctile=None):
+    """
+    Return components of a correlation evalutation.
+
+    Parameters
+    ----------
+    data0, data1 : xarray.DataArray
+        The coordinates to be compared.
+    dim : str, optional
+        The dimension for the correlation.
+    pctile : float, optional
+        The percentile range for the lower and upper uncertainty bounds.
+
+    Returns
+    -------
+    corr, corr_lower, corr_upper : xarray.DataArray
+        The correlation estimates with `pctile` lower and upper bounds.
+    rsquare : xarray.DataArray
+        The variance explained by the relationship.
+    """
+    # NOTE: Here use special t-test for correlation uncertainty bounds.
+    # See: https://en.wikipedia.org/wiki/Pearson_correlation_coefficient#Standard_error
+    dim = dim or data0.dims[0]
+    data0, data1 = xr.align(data0, data1)
+    pctile = 0.5 * (100 - np.atleast_1d(pctile or 95))
+    pctile = np.array([pctile, 100 - pctile])  # e.g. [90, 50] --> [[5, 25], [95, 75]]
+    anom0 = data0 - data0.mean(dim)
+    anom1 = data1 - data1.mean(dim)
+    std0 = np.sqrt((anom0 ** 2).sum(dim))
+    std1 = np.sqrt((anom1 ** 2).sum(dim))
+    corr = (anom0 * anom1).sum(dim) / (std0 * std1)  # correlation coefficient
+    ndim = data0.sizes[dim]
+    rsquare = corr ** 2  # variance explained == correlation squared
+    sigma = np.sqrt((1 - corr ** 2) / (ndim - 2))  # standard error
+    t = corr * np.sqrt((ndim - 2) / (1 - corr ** 2))  # t-statistic
+    dt_lower, dt_upper = _get_bounds(sigma, pctile, dof=data0.size - 2)
+    dt_lower = xr.DataArray(dt_lower, dims=('pctile', *sigma.dims))
+    dt_upper = xr.DataArray(dt_upper, dims=('pctile', *sigma.dims))
+    t_lower, t_upper = t + dt_lower, t + dt_upper
+    corr_lower = t_lower / np.sqrt(ndim - 2 + t_lower ** 2)
+    corr_upper = t_upper / np.sqrt(ndim - 2 + t_upper ** 2)
+    return corr, corr_lower, corr_upper, rsquare
+
+
 def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     """
     Return components of a line fit operation.
@@ -180,10 +232,10 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     slope, sigma, rsquare, fit, fit_lower, fit_upper = linefit(
         data0, data1, dim=dim, adjust=adjust, pctile=pctile,
     )
-    del_lower, del_upper = _get_bounds(sigma, pctile, dof=data0.size - 2)
-    del_lower = xr.DataArray(del_lower, dims=('pctile', *sigma.dims))
-    del_upper = xr.DataArray(del_upper, dims=('pctile', *sigma.dims))
-    slope_lower, slope_upper = slope + del_lower, slope + del_upper  # likely identical
+    dslope_lower, dslope_upper = _get_bounds(sigma, pctile, dof=data0.size - 2)
+    dslope_lower = xr.DataArray(dslope_lower, dims=('pctile', *sigma.dims))
+    dslope_upper = xr.DataArray(dslope_upper, dims=('pctile', *sigma.dims))
+    slope_lower, slope_upper = slope + dslope_lower, slope + dslope_upper
     return slope, slope_lower, slope_upper, rsquare, fit, fit_lower, fit_upper
 
 
@@ -247,7 +299,7 @@ def _parse_project(data, project=None):
             raise ValueError(f'Invalid project number {n!r}.')
         funcs.append(func)
     func = lambda key: any(func(key) for func in funcs)
-    func.name = project  # WARNING: critical for get_data() detection of 'all_projs'
+    func.name = project  # WARNING: critical for process_data() detection of 'all_projs'
     return func
 
 
@@ -340,11 +392,11 @@ def _apply_double(data0, data1, dim=None, method=None, invert=None):
     data0, data1 = (data1, data0) if invert else (data0, data1)
     method = method or 'cov'
     short = long = None
-    name = f'{data0.name}-{data1.name}'
+    name = f'{data0.name}|{data1.name}'  # NOTE: needed for _combine_commands labels
     ndim = max(data0.ndim, data1.ndim)
     dim = dim or 'facets'
     if dim == 'area':
-        short_prefix, long_prefix = 'spatial', f'{data1.short_name} spatial'
+        short_prefix, long_prefix = 'spatial', f'{data1.long_name} spatial'
     elif data0.long_name == data0.long_name:
         short_prefix, long_prefix = data1.short_name, data1.long_name
     else:
@@ -352,30 +404,35 @@ def _apply_double(data0, data1, dim=None, method=None, invert=None):
     if method == 'cov':
         data, _ = _components_covariance(data0, data1, dim=dim, both=False)
         data = data.climo.dequantify()
+        data.attrs['units'] = f'{data1.units} {data0.units}'
         short = f'{short_prefix} covariance'
         long = f'{long_prefix} covariance'
     elif method == 'slope':  # regression coefficient
         cov, std = _components_covariance(data0, data1, dim=dim, both=False)
         data = cov / std ** 2
         data = data.climo.dequantify()
+        data.attrs['units'] = f'{data1.units} / ({data0.units})'
         short = f'{short_prefix} regression coefficient'
         long = f'{long_prefix} regression coefficient'
     elif method == 'rsq':  # correlation coefficient
         cov, std0, std1 = _components_covariance(data0, data1, dim=dim, both=True)
         data = (cov / (std0 * std1)) ** 2
         data = data.climo.to_units('percent').climo.dequantify()
+        data.attrs['units'] = '%'
         short = f'{short_prefix} variance explained'
         long = f'{long_prefix} variance explained'
     elif method == 'proj':  # projection onto x
         cov, std = _components_covariance(data0, data1, dim=dim, both=False)
         data = cov / std
         data = data.climo.dequantify()
+        data.attrs['units'] = data1.units
         short = f'{short_prefix} projection'
         long = f'{long_prefix} projection'
     elif method == 'corr':  # correlation coefficient
         cov, std0, std1 = _components_covariance(data0, data1, dim=dim, both=True)
         data = cov / (std0 * std1)
         data = data.climo.to_units('dimensionless').climo.dequantify()
+        data.attrs['units'] = ''
         short = f'{short_prefix} correlation'
         long = f'{long_prefix} correlation coefficient'
     elif method == 'diff':  # composite difference along first arrays
@@ -383,6 +440,7 @@ def _apply_double(data0, data1, dim=None, method=None, invert=None):
         data_lo, data_hi = _components_composite(data0, data1, dim=dim)
         data = data_hi - data_lo
         data = data.climo.dequantify()
+        data.attrs['units'] = data1.units
         short = f'{data1.short_name} composite difference'
         long = f'{data0.long_name}-composite {data1.long_name} difference'
     elif method == 'dist':  # scatter or bars
@@ -442,20 +500,25 @@ def _apply_single(data, dim=None, method=None, pctile=None, std=None):
     defaults = {}
     if method == 'avg' or method == 'med':
         key = 'mean' if method == 'avg' else 'median'
+        descrip = 'mean' if method == 'avg' else 'median'
         defaults.update({'fadealpha': 0.15, 'shadealpha': 0.3})
         if std is None and pctile is None:
             assert ndim < 4
             cmd = getattr(data, key)
             data = cmd(**kw, keep_attrs=True)
+            short = f'{descrip} {data.short_name}'  # only if no range included
+            long = f'{descrip} {data.long_name}'
         elif std is not None:
             assert ndim == 2
-            std = [1, 3] if std is True else std  # or [1, 3]
+            # std = [1, 3] if std is True else std
+            std = 3 if std is True else std
             std = np.atleast_1d(std)
             shade, fade = std if std.size == 2 else (std.item(), None)
             defaults.update({key: True, 'shadestds': shade, 'fadestds': fade})
         else:
             assert ndim == 2
-            pctile = [50, 95] if pctile is True else pctile  # or [50, 95]
+            # pctile = [50, 95] if pctile is True else pctile
+            pctile = 80 if pctile is True else pctile
             pctile = np.atleast_1d(pctile)
             shade, fade = pctile if pctile.size == 2 else (pctile.item(), None)
             defaults.update({key: True, 'shadepctiles': shade, 'fadepctiles': fade})
@@ -474,6 +537,13 @@ def _apply_single(data, dim=None, method=None, pctile=None, std=None):
             data = std * data.std(**kw)
         short = f'{data.short_name} spread'
         long = f'{data.long_name} standard deviation'
+    elif method == 'var':
+        assert ndim < 4
+        with xr.set_options(keep_attrs=True):  # note name is already kept
+            data = data.var(**kw)
+        data.attrs['units'] = f'({data.units})^2'
+        short = f'{data.short_name} variance'
+        long = f'{data.long_name} variance'
     elif method == 'dist':  # bars or boxes
         assert ndim == 1
         data = data[~data.isnull()]
@@ -518,7 +588,6 @@ def apply_method(*datas, method=None, verbose=False, **kwargs):
     # / n - 2) where the residual resid = y - ((ymean - slope * xmean) + slope * x)
     # = (y - ymean) - slope * (x - xmean) i.e. very very simple.
     # TODO: Consider adding below to add shading to regression line plots
-    # assert max(ndims) == 2
     # dof = data0.sizes[dim] - 2
     # anom0, anom1 = data0 - data0.mean(dim), data1 - data1.mean(dim)
     # resid = anom1 - data * anom0
@@ -551,7 +620,10 @@ def apply_method(*datas, method=None, verbose=False, **kwargs):
         data, defaults = _apply_double(*datas, method=method, **kw_double)
     else:
         raise ValueError(f'Unexpected argument count {len(datas)}.')
-    # Standardize and possibly echo information
+
+    # Standardize and possibly print information
+    # NOTE: Considered re-applying coordinates here but better instead to relegate
+    # to process_data so that operators can be retained more easily.
     keys = ('facets', 'time', 'plev', 'lat', 'lon')  # coordinate sorting order
     args = tuple(data) if isinstance(data, tuple) else (data,)
     args = [arg.transpose(..., *(key for key in keys if key in arg.sizes)) for arg in args]  # noqa: E501
@@ -583,7 +655,7 @@ def apply_reduce(data, attrs=None, **kwargs):
     Parameters
     ----------
     data : xarray.DataArray
-        The dataset.
+        The data array.
     attrs : dict, optional
         The optional attribute overrides.
     **kwargs
@@ -594,12 +666,15 @@ def apply_reduce(data, attrs=None, **kwargs):
     data : xarray.DataArray
         The data array.
     """
-    # Apply special reductions
+    # Apply 'facets' reductions
     # TODO: Might consider adding 'institute' multi-index so e.g. grouby('institute')
     # is possible... then again would not reduce complexity because would now need to
     # load files in special non-alphabetical order to enable selecting 'flaghip' models
     # with e.g. something like .sel(institute=-1)... so don't bother for now.
     institute = kwargs.pop('institute', None)
+    project = kwargs.pop('project', None)
+    season = kwargs.pop('season', None)
+    month = kwargs.pop('month', None)
     if institute is not None:  # WARNING: critical this comes first
         if callable(institute):  # facets filter function
             facets = list(filter(institute, data.facets.values))
@@ -613,7 +688,6 @@ def apply_reduce(data, attrs=None, **kwargs):
             data = data.assign_coords(facets=facets)  # assign with restored level names
         else:
             raise ValueError(f'Unsupported institute {institute!r}.')
-    project = kwargs.pop('project', None)
     if project is not None:  # see _parse_project
         if callable(project):
             facets = list(filter(project, data.facets.values))
@@ -622,7 +696,32 @@ def apply_reduce(data, attrs=None, **kwargs):
         else:
             raise ValueError(f'Unsupported project {project!r}.')
 
-    # Apply default values
+    # Apply time reductions
+    # TODO: Replace 'average_periods' with this and normalize by annual temperature
+    # NOTE: The new climopy cell duration calculation will auto-detect monthly and
+    # yearly data, but not yet done, so use explicit days-per-month weights for now.
+    if season is not None or month is not None:
+        if season is not None:
+            seasons = data.time.dt.season.str.lower()
+            data = data.isel(time=(seasons == season.lower()))
+        elif isinstance(month, str):
+            months = data.time.dt.strftime('%b').str.lower()
+            data = data.isel(time=(months == month.lower()))
+        else:
+            months = data.time.dt.month
+            data = data.isel(time=(months == month))
+    if 'time' in data.coords:  # manual weighted average
+        days = data.time.dt.days_in_month
+        wgts = days.groupby('time.year') / days.groupby('time.year').sum()
+        wgts = wgts.astype(np.float32)  # preserve float32 variables
+        ones = xr.where(data.isnull(), 0, 1)
+        ones = ones.astype(np.float32)  # preserve float32 variables
+        with xr.set_options(keep_attrs=True):
+            numerator = (data * wgts).groupby('time.year').sum(dim='time')
+            denominator = (ones * wgts).groupby('time.year').sum(dim='time')
+            data = numerator / denominator
+
+    # Apply default values and possible overrides
     # NOTE: Delay application of defaults until here so that we only include default
     # selections in automatically-generated labels if user explicitly passed them.
     # NOTE: Here None is automatically replaced with default values (e.g. period=None)
@@ -630,22 +729,27 @@ def apply_reduce(data, attrs=None, **kwargs):
     name = data.name
     attrs = attrs or {}
     attrs = attrs.copy()  # WARNING: this is critical
+    attrs.update({key: val for key, val in data.attrs.items() if key not in attrs})
     defaults = GENERAL_DEFAULTS.copy()
-    if 'startstop' in kwargs:  # possibly passed from get_data()
-        kwargs['start'], kwargs['stop'] = kwargs.pop('startstop')  # possibly both None
     if 'version' in data.coords:
         defaults.update({'experiment': 'abrupt4xco2', **VERSION_DEFAULTS})
-    for key, value in data.attrs.items():
-        attrs.setdefault(key, value)
-    for key, value in defaults.items():
+    if 'startstop' in kwargs:  # possibly passed from process_data()
+        kwargs['start'], kwargs['stop'] = kwargs.pop('startstop')  # possibly both None
+    for key, value in defaults.items():  # apply default reductions
         if key in kwargs and kwargs[key] is None:
-            kwargs[key] = value  # use 'None' as default placeholder
+            kwargs[key] = value  # used 'None' as default placeholder
         else:
             kwargs.setdefault(key, value)
-    if name == 'tpat':  # all others are nan so automatically overwrite
-        kwargs['region'] = 'globe'
-    if 'version' in data.coords and kwargs['experiment'] == 'picontrol':
-        kwargs['start'], kwargs['stop'] = 0, 150  # all others undefined so overwrite
+    if 'version' in data.coords:
+        experiment, period, region = kwargs['experiment'], kwargs['period'], kwargs['region']  # noqa: E501
+        if period[0] == 'a' and period != 'ann':  # abrupt-only period
+            kwargs['period'] = 'ann' if experiment == 'picontrol' else period[1:]
+        if region[0] == 'a':  # abrupt-only region
+            kwargs['region'] = 'globe' if experiment == 'picontrol' else region[1:]
+        if name in ('tpat', 'tabs'):  # others undefined so overwrite
+            kwargs['region'] = 'globe'
+        if experiment == 'picontrol':  # others undefined so overwrite
+            kwargs['start'], kwargs['stop'] = 0, 150
 
     # Iterate over reductions
     # NOTE: This silently skips dummy selections (e.g. area=None) that may be required
@@ -654,12 +758,12 @@ def apply_reduce(data, attrs=None, **kwargs):
     # so critical to iterate one-by-one and validate selections each time.
     order = list(ORDER_LOGICAL)
     sorter = lambda key: order.index(key) if key in order else len(order)
+    spatial = kwargs.get('spatial', None)
     for key in sorted(kwargs, key=sorter):
         # Parse input instructions
         value = kwargs[key]
-        print('reduce!!!', key, value)
         opts = list((*data.sizes, 'area', 'volume', 'spatial'))
-        opts.extend(name for idx in data.indexes.values() for name in idx.names)
+        opts.extend(level for idx in data.indexes.values() for level in idx.names)
         if value is None or key not in opts:
             continue
         if key == 'volume':  # auto-skip if coordinates not available
@@ -675,12 +779,12 @@ def apply_reduce(data, attrs=None, **kwargs):
                 raise ValueError(f'Unknown averaging region {value!r}.')
 
         # Apply reduction
-        if key == 'spatial' and not data.sizes.keys() & {'facets', 'experiment'}:
-            continue  # e.g. another variable
-        if kwargs.get('spatial') and key in ('area', 'start', 'stop', 'experiment'):
+        if spatial and key in ('area', 'start', 'stop', 'experiment'):
             continue
         if key == 'spatial':  # NOTE: implicit 'area' truncation should already be done
             kw0, kw1 = {}, {}
+            if not data.sizes.keys() & {'facets', 'experiment'}:
+                continue  # e.g. another variable
             if 'version' in data.coords:
                 kw0 = {'start': 0, 'stop': 150}
                 kw1 = {'start': kwargs.get('start', 0), 'stop': kwargs.get('stop', 150)}
@@ -688,18 +792,16 @@ def apply_reduce(data, attrs=None, **kwargs):
             data1 = data.sel(experiment='abrupt4xco2', **kw1)
             data, defaults = _apply_double(data0, data1, dim='area', method=value)
             name = defaults.pop('name')  # see below
-            if value in ('corr', 'rsq'):  # overwrite 'tpat'
-                attrs['standard_units'] = ''
             attrs.update({**data.attrs, **defaults})
-        else:
+        else:  # apply simple reduction
             try:
                 data = data.climo.reduce(**{key: value}).squeeze()
             except Exception:
                 raise RuntimeError(f'Failed to reduce data with {key}={value!r}.')
 
-        # Apply reduction and update coords
+        # Update coordinates
         for multi, levels in zip(('facets', 'version'), (FACETS_LEVELS, VERSION_LEVELS)):  # noqa: E501
-            if multi in data.coords or key not in levels:  # multi-index still present
+            if multi in data.coords:  # multi-index still present
                 continue
             levels = data.sizes.keys() & set(levels)  # remaining level
             if not levels:  # no remaining levels (e.g. scalar)
@@ -708,12 +810,13 @@ def apply_reduce(data, attrs=None, **kwargs):
             index = pd.MultiIndex.from_arrays((coord.values,), names=(level,))
             data = data.rename({level: multi})
             data = data.assign_coords({multi: index})
+
     data.name = name
     data.attrs.update(attrs)
     return data
 
 
-def get_data(dataset, *kws_process, attrs=None, suffix=False):
+def process_data(dataset, *kws_process, attrs=None, suffix=True, feedback=None):
     """
     Combine the data based on input reduce dictionaries.
 
@@ -723,10 +826,12 @@ def get_data(dataset, *kws_process, attrs=None, suffix=False):
         The source dataset.
     *kws_process : dict
         The reduction keyword dictionaries.
-    suffix : bool, optional
-        Whether to add optional `anomaly` suffix.
     attrs : dict, optional
         The attribute dictionaries.
+    suffix : bool, optional
+        Whether to add optional `anomaly` suffix.
+    feedback : str, optional
+        The feedback name to use in temperature pattern regression.
 
     Returns
     -------
@@ -742,7 +847,9 @@ def get_data(dataset, *kws_process, attrs=None, suffix=False):
     # permit arbitrary combinations of names and indexers (see _parse_specs).
     # WARNING: Here 'product' can be used for e.g. cmip6-cmip5 abrupt4xco2-picontrol
     # but there are some terms that we always want to group together e.g. 'experiment'
-    # and 'startstop'. So
+    # and 'startstop'. So include some overrides below.
+    if len(kws_process) not in (1, 2):
+        raise ValueError(f'Expected two process dictionaries. Got {len(kws_process)}.')
     alias_to_name = {
         alias: name for alias, (name, _) in FEEDBACK_TRANSLATIONS.items()
     }
@@ -750,23 +857,26 @@ def get_data(dataset, *kws_process, attrs=None, suffix=False):
         alias_to_name.update({'picontrol': 'control', 'abrupt4xco2': 'response'})
     else:
         alias_to_name.update({'control': 'picontrol', 'response': 'abrupt4xco2'})
-    kws_reduce, kws_coords = [], []  # each item represents a method argument
-    for kw_process in kws_process:
-        # Get reduce instructions
-        scale = 1
+    kws_reduce, kws_input = [], []
+    for kw_process in kws_process:  # iterate method reduce arguments
+        # Initial stuff
+        # NOTE: See _group_parts comments for details
+        kw_reduce = {}
+        kw_process = kw_process.copy()
         kw_method = {
             key: kw_process.pop(key) for key in KEYS_METHOD
             if key in kw_process
         }
-        kw_coords = {
-            key: value for key, value in kw_process.items()
+        kw_input = {
+            key: getattr(value, 'name', value) for key, value in kw_process.items()
             if key != 'name' and value is not None
         }
-        kw_reduce = {}
-        kw_process = _fix_parts(kw_process)
+        kw_process = _group_parts(kw_process, keep_operators=True)
+
+        # Get reduce instructions
         for key, value in kw_process.items():
             sels = ['+']
-            for part in _get_parts(value):
+            for part in _ungroup_parts(value):
                 if part is None:
                     sel = None
                 elif np.iterable(part) and part[0] in ('+', '-', '*', '/'):
@@ -786,76 +896,90 @@ def get_data(dataset, *kws_process, attrs=None, suffix=False):
                     sel = part.to(unit)
                 sels.append(sel)
             signs, values = sels[0::2], sels[1::2]
-            scale *= sum(sign == '+' for sign in signs)
             kw_reduce[key] = tuple(zip(signs, values))
+
         # Split instructions along operators
-        # NOTE: Here product approach is similar to figures.py _create_specs
-        if 'startstop' in kw_reduce and 'experiment' in kw_reduce:
-            groups = [('startstop', 'experiment')]  # TODO: add to this?
-        else:
-            groups = []
+        # TODO: Possibly add more grouping options (similar to _build_specs)
+        startstop = 'startstop' in kw_reduce and 'experiment' in kw_reduce
+        groups = [('startstop', 'experiment')] if startstop else []
         for group in groups:
-            values = _fix_lengths(*(kw_reduce[key] for key in group))
+            values = _to_lists(*(kw_reduce[key] for key in group))
             kw_reduce.update(dict(zip(group, values)))
         groups.extend((key,) for key in kw_reduce if not any(key in group for group in groups))  # noqa: E501
         kw_product = {group: tuple(zip(*(kw_reduce[key] for key in group))) for group in groups}  # noqa: E501
         ikws_reduce = []
-        for values in itertools.product(*kw_product.values()):
+        for values in itertools.product(*kw_product.values()):  # non-grouped coords
             items = {key: val for group, vals in zip(groups, values) for key, val in zip(group, vals)}  # noqa: E501
             signs, values = zip(*items.values())
             sign = -1 if signs.count('-') % 2 else +1
             kw = dict(zip(items.keys(), values))
             kw.update(kw_method)
             ikws_reduce.append((sign, kw))
-        kws_reduce.append((scale, ikws_reduce))
-        kws_coords.append(kw_coords)
+        kws_reduce.append(ikws_reduce)
+        kws_input.append(kw_input)
 
     # Reduce along facets dimension and carry out operation
-    # TODO: Add other possible reduction methods, e.g. covariance
-    # or regressions instead of normalized correlation.
+    # WARNING: Currently impossible to perform e.g. regressions when have different
+    # number of operations in numerator and denominator. Enforce with strict below.
+    # TODO: Support operations before reductions instead of after. Should have
+    # effect on e.g. correlation, regression results.
+    # NOTE: Here 'feedback' is for figures regressing both temperature patterns and
+    # feedback patterns on themselves -- temperature patterns are only one where
+    # regressor is different from regressee. When just want to show *one* feedback
+    # can use e.g. component=('tpat', 'cld'), name=('cld', None), pairs='name'.
     print('.', end='')
-    scales, kws_reduce = zip(*kws_reduce)
-    if len(set(scales)) > 1:
-        raise RuntimeError(f'Mixed reduction scalings {scales}.')
+    feedback = alias_to_name.get(feedback, feedback or 'rfnt_lam')
     kwargs = {}
     datas_persum = []  # each item part of a summation
     methods_persum = set()
-    kws_reduce = _fix_lengths(*kws_reduce, equal=False)
-    for ikws_reduce in zip(*kws_reduce):  # ikws_reduce contains sides of correlation
+    kws_reduce = _to_lists(*kws_reduce, equal=False)
+    if any(len(kws) != len(kws_reduce[0]) for kws in kws_reduce):
+        raise ValueError('Operator count mismatch in numerator and denominator.')
+    for ikws_reduce in zip(*kws_reduce):
         isigns, ikws_reduce = zip(*ikws_reduce)
         datas, kw_method = [], {}
-        for kw_reduce in ikws_reduce:  # two for e.g. 'corr', one for e.g. 'avg'
+        for kw_reduce in ikws_reduce:  # iterate method reduce arguments
             kw_reduce = kw_reduce.copy()
             name = kw_reduce.pop('name')  # NOTE: always present
+            area = kw_reduce.get('area')
+            temps = ('tpat', 'tabs', 'rfnt_ecs')
+            experiment = kw_reduce.get('experiment')
+            if name in temps[:2] and experiment == 'picontrol':
+                name = 'tpat'  # still use rfnt_ecs for e.g. abrupt minus pre-industrial
+            if name in temps and area == 'avg' and experiment == 'picontrol' and len(ikws_reduce) == 2:  # noqa: E501
+                name = feedback  # regressions of abrupt vs. pre-industrial
+            # if name == 'ts' and experiment != 'abrupt4xco2-picontrol' and len(ikws_reduce) == 2:  # noqa: E501
+            #     experiment = 'abrupt4xco2-picontrol'
             for key in tuple(kw_reduce):
                 if key in KEYS_METHOD:
                     kw_method.setdefault(key, kw_reduce.pop(key))
             if name not in dataset:
                 raise ValueError(f'Invalid name {name}. Options are {tuple(dataset.data_vars)}.')  # noqa: E501
-            data = apply_reduce(dataset[name], **kw_reduce)
+            data = dataset[name]
+            data = apply_reduce(data, **kw_reduce)
             datas.append(data)
         datas, method, default = apply_method(*datas, **kw_method)
         for key, value in default.items():
             kwargs.setdefault(key, value)
+        if len(datas) == 1:  # e.g. regression applied
+            isigns = (min(isigns),)
         datas_persum.append((isigns, datas))  # plotting command arguments
         methods_persum.add(method)
         if len(methods_persum) > 1:
             raise RuntimeError(f'Mixed reduction methods {methods_persum}.')
 
     # Combine arrays specified with reduction '+' and '-' keywords
+    # NOTE: The additions below are scaled as *averages* so e.g. project='cmip5+cmip6'
+    # gives the average across cmip5 and cmip6 inter-model averages.
     # WARNING: Can end up with all-zero arrays if e.g. doing single scatter or multiple
     # bar regression operations and only the dependent or independent variable relies
     # on an operations between slices (e.g. area 'nino-nina' combined with experiment
     # 'abrupt4xco2-picontrol' creates 4 datas that sum to zero). Use the kludge below.
-    # NOTE: Xarray automatically drops non-matching scalar coordinates (similar to
-    # vector coordinate matching utilities) so try to restore them below.
-    # NOTE: The additions below are scaled as *averages* so e.g. project='cmip5+cmip6'
-    # gives the average across cmip5 and cmip6 inter-model averages.
     print('.', end=' ')
     args = []
     method = methods_persum.pop()
     signs_persum, datas_persum = zip(*datas_persum)
-    for kw_coords, signs, datas in zip(kws_coords, zip(*signs_persum), zip(*datas_persum)):  # noqa: E501
+    for signs, datas in zip(zip(*signs_persum), zip(*datas_persum)):  # plot arguments
         idatas = []
         for i, data in enumerate(datas):
             index = data.indexes.get('facets', None)
@@ -870,20 +994,46 @@ def get_data(dataset, *kws_process, attrs=None, suffix=False):
                 data = data.assign_coords(facets=index)
             idatas.append(data)
         isigns, idatas = signs, xr.align(*idatas)
+        sum_scale = sum(sign == 1 for sign in isigns)
         if idatas[0].sizes.get('facets', None) == 0:
             raise RuntimeError(
                 'Empty facets dimension. This is most likely due to an '
                 'operation across projects without an institute average.'
             )
         with xr.set_options(keep_attrs=True):  # keep e.g. units and short_prefix
-            data = sum(sign * sdata for sign, sdata in zip(isigns, idatas)) / scales[0]
+            data = sum(s * sdata for s, sdata in zip(isigns, idatas)) / sum_scale
+        if len(kws_process) == 1 and (name := kws_process[0].get('name')):
+            data.name = name  # e.g. 'ts' minus 'tabs'
         if method == 'dist' and len(idatas) > 1 and np.allclose(data, 0):
             data = idatas[0]
-        data.attrs.update(attrs)
-        data.coords.update(kw_coords)
         if suffix and any(sign == -1 for sign in isigns):
-            data.attrs['long_suffix'] = 'anomaly'
-            data.attrs['short_suffix'] = 'anomaly'
+            data.attrs['short_suffix'] = data.attrs['long_suffix'] = 'anomaly'
         args.append(data)
+
+    # Align and restore coordinates
+    # NOTE: Xarray automatically drops non-matching scalar coordinates (similar to
+    # vector coordinate matching utilities) so try to restore them below.
+    # NOTE: Commented code at bottom verifies that global average regressions of
+    # regional pre-industrial feedbacks onto global pre-industrial feedbacks equal 1
+    # even though there are broad positive regions with much larger magnitudes.
     args = xr.align(*args)  # re-align after summation
+    if len(args) == len(kws_input):  # one or two (e.g. scatter)
+        for arg, kw_input in zip(args, kws_input):
+            arg.attrs.update(attrs)
+            arg.coords.update(kw_input)
+    else:  # create 2-tuple coordinates
+        kw_input = {}
+        keys = sorted(set(key for kw in kws_input for key in kw))
+        for key in keys:
+            values = tuple(kw.get(key, None) for kw in kws_input)
+            value = values[0]
+            if values[0] != values[1]:
+                value = np.array(None, dtype=object)
+                value[...] = tuple(values)
+            kw_input[key] = value
+        for arg in args:  # should be singleton
+            arg.attrs.update(attrs)
+            arg.coords.update(kw_input)
+    # if args[0].sizes.keys() & {'lon', 'lat'}:
+    #     ic(kws_process, args[0].climo.average('area').item())
     return args, method, kwargs

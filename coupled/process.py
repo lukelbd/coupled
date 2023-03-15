@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Internal helper functions for figure templates.
+Processing utilities used by plotting functions.
 """
 import itertools
 
@@ -366,7 +366,7 @@ def _parse_institute(data, institute=None):
     return filt
 
 
-def _apply_double(data0, data1, dim=None, method=None, invert=None):
+def _method_double(data0, data1, dim=None, method=None, invert=None):
     """
     Apply reduction method for two data arrays.
 
@@ -389,6 +389,8 @@ def _apply_double(data0, data1, dim=None, method=None, invert=None):
     defaults : dict
         The default attributes and command keyword args.
     """
+    # NOTE: Normalization and anomalies with respect to global average
+    # are supported in `apply_method`.
     data0, data1 = (data1, data0) if invert else (data0, data1)
     method = method or 'cov'
     short = long = None
@@ -455,7 +457,7 @@ def _apply_double(data0, data1, dim=None, method=None, invert=None):
     return data, defaults
 
 
-def _apply_single(data, dim=None, method=None, pctile=None, std=None):
+def _method_single(data, dim=None, method=None, pctile=None, std=None):
     """
     Apply reduction method for single data array.
 
@@ -490,8 +492,6 @@ def _apply_single(data, dim=None, method=None, pctile=None, std=None):
     """
     # NOTE: Here `pctile` is shared between inter-model percentile differences and
     # composites of a second array based on values in the first array.
-    # NOTE: Currently proplot will automatically apply xarray tuple multi-index
-    # coordinates to bar plot then error out so apply numpy array coords for now.
     method = method or 'avg'
     ndim = data.ndim
     kw = {'dim': dim or 'facets', 'skipna': True}
@@ -566,7 +566,8 @@ def apply_method(*datas, method=None, verbose=False, **kwargs):
         The reduction method. Here ``dist`` retains the facets dimension for e.g. bar
         and scatter plots (and their multiples), ``avg|med|std|pctile`` reduce the
         facets dimension for a single input argument, and ``corr|diff|proj|slope``
-        reduce the facets dimension for two input arguments. See below for details.
+        reduce the facets dimension for two input arguments. Can also end string
+        with ``_anom`` or ``_norm`` to take global anomaly or use normalization.
     verbose : bool, optional
         Whether to print extra information.
     **kwargs
@@ -582,12 +583,41 @@ def apply_method(*datas, method=None, verbose=False, **kwargs):
         The plotting and `_infer_command` keyword arguments.
     """
     # Apply methods
+    # NOTE: This supports on-the-fly anomalies and normalization. Should eventually
+    # move this stuff to climopy (already implemented in accessor getter).
+    kw_double = {key: kwargs.pop(key) for key in ('invert',) if key in kwargs}
+    kw_single = {key: kwargs.pop(key) for key in ('pctile', 'std') if key in kwargs}
+    if kwargs:  # any remaining
+        raise ValueError(f'Unexpected keyword arguments {kwargs}.')
+    ndim = max(data.ndim for data in datas)
+    datas = tuple(data.copy() for data in datas)  # e.g. for distribution updates
+    default = 'dist' if ndim == 1 else 'avg' if len(datas) == 1 else 'rsq'
+    method = method or default
+    method, *options = method.split('_')
+    anomaly = 'anom' in options
+    normalize = 'norm' in options
+    if len(datas) == 1:
+        data, defaults = _method_single(*datas, method=method, **kw_single)
+    elif len(datas) == 2:
+        data, defaults = _method_double(*datas, method=method, **kw_double)
+    else:
+        raise ValueError(f'Unexpected argument count {len(datas)}.')
+    if anomaly and 'lon' in data.coords and 'lat' in data.coords:
+        with xr.set_options(keep_attrs=True):
+            data = data - data.climo.average('area')
+    if normalize and 'lon' in data.coords and 'lat' in data.coords:
+        with xr.set_options(keep_attrs=True):
+            data = data / data.climo.average('area')
+        if units := data.attrs.get('units', ''):
+            data.attrs['units'] = f'{units} / ({units})'
+
+    # Add shading to regression line plots
     # NOTE: Manually recalculate slope error here because faster than polyfit by
     # single columns and often use multi-dimensional data. Leverage fact that
     # offset = ymean - slope * xmean and slope stdeerr = sqrt(resid ** 2 / xanom ** 2
     # / n - 2) where the residual resid = y - ((ymean - slope * xmean) + slope * x)
     # = (y - ymean) - slope * (x - xmean) i.e. very very simple.
-    # TODO: Consider adding below to add shading to regression line plots
+    # TODO: Consider adding this back. For now do not include.
     # dof = data0.sizes[dim] - 2
     # anom0, anom1 = data0 - data0.mean(dim), data1 - data1.mean(dim)
     # resid = anom1 - data * anom0
@@ -600,26 +630,6 @@ def apply_method(*datas, method=None, verbose=False, **kwargs):
     #     del_lower, del_upper = _get_bounds(sigma, values, dof=dof)
     #     errors = np.array([del_lower, del_upper])  # 2xN array
     #     defaults.update({f'{key}data': errors})
-    ndim = max(data.ndim for data in datas)
-    datas = tuple(data.copy() for data in datas)  # e.g. for distribution updates
-    if ndim == 1:
-        method = method or 'dist'  # only possibility
-    elif len(datas) == 1:
-        method = method or 'avg'
-    else:
-        method = method or 'rsq'
-    keys_double = ('invert',)
-    keys_single = ('pctile', 'std')
-    kw_double = {key: kwargs.pop(key) for key in keys_double if key in kwargs}
-    kw_single = {key: kwargs.pop(key) for key in keys_single if key in kwargs}
-    if kwargs:
-        raise ValueError(f'Unexpected keyword arguments {kwargs}.')
-    if len(datas) == 1:
-        data, defaults = _apply_single(*datas, method=method, **kw_single)
-    elif len(datas) == 2:
-        data, defaults = _apply_double(*datas, method=method, **kw_double)
-    else:
-        raise ValueError(f'Unexpected argument count {len(datas)}.')
 
     # Standardize and possibly print information
     # NOTE: Considered re-applying coordinates here but better instead to relegate
@@ -746,7 +756,7 @@ def apply_reduce(data, attrs=None, **kwargs):
             kwargs['period'] = 'ann' if experiment == 'picontrol' else period[1:]
         if region[0] == 'a':  # abrupt-only region
             kwargs['region'] = 'globe' if experiment == 'picontrol' else region[1:]
-        if name in ('tpat', 'tabs'):  # others undefined so overwrite
+        if name in ('tpat', 'tstd', 'tdev', 'tabs'):  # others undefined so overwrite
             kwargs['region'] = 'globe'
         if experiment == 'picontrol':  # others undefined so overwrite
             kwargs['start'], kwargs['stop'] = 0, 150
@@ -790,7 +800,7 @@ def apply_reduce(data, attrs=None, **kwargs):
                 kw1 = {'start': kwargs.get('start', 0), 'stop': kwargs.get('stop', 150)}
             data0 = data.sel(experiment='picontrol', **kw0)
             data1 = data.sel(experiment='abrupt4xco2', **kw1)
-            data, defaults = _apply_double(data0, data1, dim='area', method=value)
+            data, defaults = _method_double(data0, data1, dim='area', method=value)
             name = defaults.pop('name')  # see below
             attrs.update({**data.attrs, **defaults})
         else:  # apply simple reduction
@@ -816,7 +826,7 @@ def apply_reduce(data, attrs=None, **kwargs):
     return data
 
 
-def process_data(dataset, *kws_process, attrs=None, suffix=True, feedback=None):
+def process_data(dataset, *kws_process, attrs=None, suffix=True):
     """
     Combine the data based on input reduce dictionaries.
 
@@ -830,8 +840,6 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True, feedback=None):
         The attribute dictionaries.
     suffix : bool, optional
         Whether to add optional `anomaly` suffix.
-    feedback : str, optional
-        The feedback name to use in temperature pattern regression.
 
     Returns
     -------
@@ -842,12 +850,7 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True, feedback=None):
     kwargs : dict
         The plotting and `_infer_command` keyword arguments.
     """
-    # Group added/subtracted reduce instructions into separate dictionaries
-    # NOTE: Initial kw_red values are formatted as (('[+-]', value), ...) to
-    # permit arbitrary combinations of names and indexers (see _parse_specs).
-    # WARNING: Here 'product' can be used for e.g. cmip6-cmip5 abrupt4xco2-picontrol
-    # but there are some terms that we always want to group together e.g. 'experiment'
-    # and 'startstop'. So include some overrides below.
+    # Initial stuff
     if len(kws_process) not in (1, 2):
         raise ValueError(f'Expected two process dictionaries. Got {len(kws_process)}.')
     alias_to_name = {
@@ -857,23 +860,24 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True, feedback=None):
         alias_to_name.update({'picontrol': 'control', 'abrupt4xco2': 'response'})
     else:
         alias_to_name.update({'control': 'picontrol', 'response': 'abrupt4xco2'})
-    kws_reduce, kws_input = [], []
-    for kw_process in kws_process:  # iterate method reduce arguments
-        # Initial stuff
-        # NOTE: See _group_parts comments for details
-        kw_reduce = {}
-        kw_process = kw_process.copy()
-        kw_method = {
-            key: kw_process.pop(key) for key in KEYS_METHOD
-            if key in kw_process
-        }
+
+    # Split instructions along operators
+    # NOTE: Initial kw_red values are formatted as (('[+-]', value), ...) to
+    # permit arbitrary combinations of names and indexers (see _parse_specs).
+    # TODO: Possibly keep original 'signs' instead of _group_parts signs? See
+    # below where arguments are combined and have to pick a sign.
+    kws_group, kws_count, kws_input, kws_method = [], [], [], []
+    for i, kw_process in enumerate(kws_process):  # iterate method reduce arguments
+        kw_process, kw_coords, kw_count = kw_process.copy(), {}, {}
         kw_input = {
             key: getattr(value, 'name', value) for key, value in kw_process.items()
             if key != 'name' and value is not None
         }
+        kw_method = {
+            key: kw_process.pop(key) for key in KEYS_METHOD
+            if key in kw_process
+        }
         kw_process = _group_parts(kw_process, keep_operators=True)
-
-        # Get reduce instructions
         for key, value in kw_process.items():
             sels = ['+']
             for part in _ungroup_parts(value):
@@ -896,73 +900,101 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True, feedback=None):
                     sel = part.to(unit)
                 sels.append(sel)
             signs, values = sels[0::2], sels[1::2]
-            kw_reduce[key] = tuple(zip(signs, values))
+            kw_coords[key] = tuple(zip(signs, values))
+            kw_count[key] = len(values)
+        kws_group.append(kw_coords)
+        kws_count.append(kw_count)
+        kws_input.append(kw_input)
+        kws_method.append(kw_method)
 
-        # Split instructions along operators
-        # TODO: Possibly add more grouping options (similar to _build_specs)
-        startstop = 'startstop' in kw_reduce and 'experiment' in kw_reduce
+    # Group split reduce instructions into separate dictionaries
+    # TODO: Add more grouping options (similar to _build_specs). For now just
+    # support multiple start-stop and experiment grouping.
+    # WARNING: Here 'product' can be used for e.g. cmip6-cmip5 abrupt4xco2-picontrol
+    # but there are some terms that we always want to group together e.g. 'experiment'
+    # and 'startstop'. So include some overrides below.
+    kws_reduce = []
+    for key in sorted(set(key for kw in kws_count for key in kw)):
+        count = [kw.get(key, 0) for kw in kws_count]
+        if count[0] == count[-1]:  # otherwise match correlation pair operators
+            continue
+        if count[1] % count[0] == 0:
+            i, j = 0, 1
+        elif count[0] % count[1] == 0:
+            i, j = 1, 0
+        else:
+            raise ValueError(f'Incompatible counts {count[0]} and {count[1]}.')
+        values = kws_group[i].get(key, (('+', None),))
+        values = values * (count[j] // count[i])  # i.e. *average* with itself
+        kws_group[i][key] = values
+    for kw_coords, kw_method in zip(kws_group, kws_method):
+        startstop = 'startstop' in kw_coords and 'experiment' in kw_coords
         groups = [('startstop', 'experiment')] if startstop else []
         for group in groups:
-            values = _to_lists(*(kw_reduce[key] for key in group))
-            kw_reduce.update(dict(zip(group, values)))
-        groups.extend((key,) for key in kw_reduce if not any(key in group for group in groups))  # noqa: E501
-        kw_product = {group: tuple(zip(*(kw_reduce[key] for key in group))) for group in groups}  # noqa: E501
+            values = _to_lists(*(kw_coords[key] for key in group))
+            kw_coords.update(dict(zip(group, values)))
+        groups.extend(
+            (key,) for key in kw_coords if not any(key in group for group in groups)
+        )
+        kw_product = {
+            group: tuple(zip(*(kw_coords[key] for key in group))) for group in groups
+        }
         ikws_reduce = []
         for values in itertools.product(*kw_product.values()):  # non-grouped coords
-            items = {key: val for group, vals in zip(groups, values) for key, val in zip(group, vals)}  # noqa: E501
+            items = {
+                key: val for group, vals in zip(groups, values)
+                for key, val in zip(group, vals)
+            }
             signs, values = zip(*items.values())
             sign = -1 if signs.count('-') % 2 else +1
-            kw = dict(zip(items.keys(), values))
-            kw.update(kw_method)
-            ikws_reduce.append((sign, kw))
+            kw_reduce = dict(zip(items.keys(), values))
+            kw_reduce.update(kw_method)
+            ikws_reduce.append((sign, kw_reduce))
         kws_reduce.append(ikws_reduce)
-        kws_input.append(kw_input)
 
     # Reduce along facets dimension and carry out operation
-    # WARNING: Currently impossible to perform e.g. regressions when have different
-    # number of operations in numerator and denominator. Enforce with strict below.
     # TODO: Support operations before reductions instead of after. Should have
-    # effect on e.g. correlation, regression results.
-    # NOTE: Here 'feedback' is for figures regressing both temperature patterns and
-    # feedback patterns on themselves -- temperature patterns are only one where
-    # regressor is different from regressee. When just want to show *one* feedback
-    # can use e.g. component=('tpat', 'cld'), name=('cld', None), pairs='name'.
+    # effect on e.g. regional correlation, regression results.
+    # WARNING: Here _group_parts modified e.g. picontrol base from late-early
+    # to late+early (i.e. average) so try to use sign from non-control experiment.
     print('.', end='')
-    feedback = alias_to_name.get(feedback, feedback or 'rfnt_lam')
+    warming = ('tpat', 'tdev', 'tstd', 'tabs', 'rfnt_ecs')
     kwargs = {}
     datas_persum = []  # each item part of a summation
     methods_persum = set()
     kws_reduce = _to_lists(*kws_reduce, equal=False)
     if any(len(kws) != len(kws_reduce[0]) for kws in kws_reduce):
         raise ValueError('Operator count mismatch in numerator and denominator.')
-    for ikws_reduce in zip(*kws_reduce):
+    for ikws_reduce in zip(*kws_reduce):  # iterate operators
         isigns, ikws_reduce = zip(*ikws_reduce)
-        datas, kw_method = [], {}
+        datas, exps, kw_method = [], [], {}
         for kw_reduce in ikws_reduce:  # iterate method reduce arguments
             kw_reduce = kw_reduce.copy()
             name = kw_reduce.pop('name')  # NOTE: always present
             area = kw_reduce.get('area')
-            temps = ('tpat', 'tabs', 'rfnt_ecs')
             experiment = kw_reduce.get('experiment')
-            if name in temps[:2] and experiment == 'picontrol':
-                name = 'tpat'  # still use rfnt_ecs for e.g. abrupt minus pre-industrial
-            if name in temps and area == 'avg' and experiment == 'picontrol' and len(ikws_reduce) == 2:  # noqa: E501
-                name = feedback  # regressions of abrupt vs. pre-industrial
-            # if name == 'ts' and experiment != 'abrupt4xco2-picontrol' and len(ikws_reduce) == 2:  # noqa: E501
-            #     experiment = 'abrupt4xco2-picontrol'
+            if name == 'tabs' and experiment == 'picontrol':
+                name = 'tstd'  # use rfnt_ecs for e.g. abrupt minus pre-industrial
+            if name in warming and area == 'avg' and len(ikws_reduce) == 2:
+                if name in warming[:2] or experiment == 'picontrol':
+                    name = 'tstd'  # default to global average temp standard deviation
             for key in tuple(kw_reduce):
                 if key in KEYS_METHOD:
                     kw_method.setdefault(key, kw_reduce.pop(key))
             if name not in dataset:
-                raise ValueError(f'Invalid name {name}. Options are {tuple(dataset.data_vars)}.')  # noqa: E501
+                raise ValueError(
+                    f'Invalid name(s) {name}. Options are {tuple(dataset.data_vars)}.'
+                )
             data = dataset[name]
             data = apply_reduce(data, **kw_reduce)
             datas.append(data)
+            exps.append(experiment)
         datas, method, default = apply_method(*datas, **kw_method)
         for key, value in default.items():
             kwargs.setdefault(key, value)
         if len(datas) == 1:  # e.g. regression applied
-            isigns = (min(isigns),)
+            idxs = tuple(i for i, exp in enumerate(exps) if i != 'picontrol')
+            isigns = (isigns[idxs[-1] if idxs else -1],)  # WARNING: see _group_parts
         datas_persum.append((isigns, datas))  # plotting command arguments
         methods_persum.add(method)
         if len(methods_persum) > 1:
@@ -1006,7 +1038,7 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True, feedback=None):
             data.name = name  # e.g. 'ts' minus 'tabs'
         if method == 'dist' and len(idatas) > 1 and np.allclose(data, 0):
             data = idatas[0]
-        if suffix and any(sign == -1 for sign in isigns):
+        if suffix and any(sign == -1 for sign in isigns):  # TODO: make optional?
             data.attrs['short_suffix'] = data.attrs['long_suffix'] = 'anomaly'
         args.append(data)
 
@@ -1020,20 +1052,24 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True, feedback=None):
     if len(args) == len(kws_input):  # one or two (e.g. scatter)
         for arg, kw_input in zip(args, kws_input):
             arg.attrs.update(attrs)
-            arg.coords.update(kw_input)
+            for key, value in kw_input.items():
+                if key not in arg.coords:
+                    arg.coords[key] = value
     else:  # create 2-tuple coordinates
         kw_input = {}
         keys = sorted(set(key for kw in kws_input for key in kw))
         for key in keys:
             values = tuple(kw.get(key, None) for kw in kws_input)
             value = values[0]
-            if values[0] != values[1]:
+            if len(values) == 2 and values[0] != values[1]:
                 value = np.array(None, dtype=object)
                 value[...] = tuple(values)
             kw_input[key] = value
         for arg in args:  # should be singleton
             arg.attrs.update(attrs)
-            arg.coords.update(kw_input)
+            for key, value in kw_input.items():  # e.g. regress lon/lat on feedback map
+                if key not in arg.coords:
+                    arg.coords[key] = value
     # if args[0].sizes.keys() & {'lon', 'lat'}:
     #     ic(kws_process, args[0].climo.average('area').item())
     return args, method, kwargs

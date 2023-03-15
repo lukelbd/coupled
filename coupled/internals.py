@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Internal helper functions for figure templates.
+Internal helper utilities used by plotting functions.
 """
 import collections
 import itertools
@@ -24,7 +24,7 @@ WRAP_SCALE = 1.8
 
 # Keywords for inter-model reduction methods
 KEYS_METHOD = (  # skip 'spatial' because used in apply_reduce
-    'method', 'std', 'pctile', 'invert',
+    'method', 'std', 'pctile', 'invert', 'normalize',
 )
 
 # Regexes for float and operator detection
@@ -36,12 +36,15 @@ REGEX_SPLIT = re.compile(  # ignore e.g. leading positive and negative signs
 )
 
 # Prefixes used to detect and segregate keyword arguments
-# NOTE: See templates.py documentation for various 'other' arguments.
+# NOTE: See plotting.py documentation for various 'other' arguments.
+DETECT_SIDE = (
+    'left', 'right', 'bottom', 'top',
+)
 DETECT_FIG = (
-    'fig', 'ref', 'space', 'share', 'span', 'align', 'inner', 'outer', 'panel', 'tight',
+    'fig', 'ref', 'space', 'share', 'span', 'align', 'inner', 'outer', 'panel', 'tight', *DETECT_SIDE,  # noqa: E501
 )
 DETECT_GRIDSPEC = (
-    'left', 'right', 'bottom', 'top', 'space', 'ratio', 'group', 'equal', 'pad',
+    'space', 'ratio', 'group', 'equal', 'pad',  # NOTE: cannot use e.g. left=N for now
 )
 DETECT_GRIDSPEC = [
     f'{s}{prefix}' for prefix in DETECT_GRIDSPEC for s in ('w', 'h', '')
@@ -141,7 +144,8 @@ TRANSLATE_PATHS = {
     ('experiment', 'picontrol'): 'pictl',
     ('experiment', 'abrupt4xco2'): '4xco2',
     ('startstop', (0, 150)): 'full',
-    ('startstop', (0, 50)): 'hist',  # NOTE: used as 'historical' analogue in lit
+    ('startstop', (0, 50)): 'start',  # NOTE: used as 'historical' analogue in lit
+    ('startstop', (100, 150)): 'end',  # NOTE: used as 'historical' analogue in lit
     ('startstop', (0, 20)): 'early',
     ('startstop', (20, 150)): 'late',
 }
@@ -205,12 +209,14 @@ TRANSLATE_LABELS = {
     ('experiment', 'picontrol'): 'control',
     ('experiment', 'abrupt4xco2'): r'4$\times$CO$_2$',
     ('startstop', (0, 150)): 'full',
-    ('startstop', (0, 50)): '50-year',
+    ('startstop', (0, 50)): 'early',
+    ('startstop', (100, 150)): 'late',
     ('startstop', (0, 20)): 'early',
     ('startstop', (20, 150)): 'late',
 }
 
 # Time translations
+# NOTE: Optionally translate periods
 TRANSLATE_LONGS = {
     ('period', 'ann'): 'annual',
     ('period', 'djf'): 'boreal winter',
@@ -540,23 +546,30 @@ def _get_label(dataset, key, value, mode=None, name=None):
             if not isinstance(part, ureg.Quantity):
                 part = ureg.Quantity(part, unit)
             part = part.to(unit)
+            if part.units == ureg.parse_units('degE') and part > 180 * ureg.deg:
+                part = part - 360 * ureg.deg
             if mode == 'path':
-                label = f'{part:~.0f}'
+                label = f'{part:~.0f}'  # e.g. include degree sign
             else:
                 label = f'{part:~P.0f}'.replace(' ', r'$\,$')
         if label is None:  # e.g. skip 'avg' label
             continue
+        deg = '\N{DEGREE SIGN}'
+        for neg, pos in ('SN', 'WE'):
+            if '-' in label and f'{deg}{pos}' in label:
+                label = label.replace('-', '').replace(f'{deg}{pos}', f'{deg}{neg}')
         if mode == 'path':  # extra processing
-            for symbol in ('\N{DEGREE SIGN}', *operator_to_label, '_', ' '):
+            for symbol in (deg, *operator_to_label, '_', ' '):
                 label = label.lower().replace(symbol, '')
         labels.append(label)
-    sep = '' if mode == 'path' else ' '
     if len(labels) > 1:  # if result is still weird user should pass explicit values
         if labels[0] in operator_to_label.values():
             labels = labels[1:]  # e.g. experiment=abrupt4xco2, stop=None-20
         if labels[-1] in operator_to_label.values():
             labels = labels[:-1]  # e.g. experiment=abrupt4xco2-picontrol, stop=20-None
-    return sep.join(labels)
+    sep = '' if mode == 'path' else ' '
+    label = sep.join(labels)
+    return label
 
 
 def _infer_labels(
@@ -612,7 +625,7 @@ def _infer_labels(
         spatial = spatial or any(kw.get('spatial') for kws in ikws_infer for kw in kws)
         invert = invert or any(kw.get('invert') for kws in ikws_infer for kw in kws)
 
-    # Reduce label dicationaries to drop or select redundancies across the list
+    # Reduce labels dicationaries to drop or select redundancies across the list
     # TODO: Also drop scalar 'identical' specifications of e.g. 'annual', 'slope',
     # and 'eraint' default selections for feedback variants and climate averages?
     if not spatial:
@@ -655,35 +668,36 @@ def _infer_labels(
     # Combine pairs of labels
     # NOTE: This optionally assigns labels that are identical across the pair to
     # the front or the back of the combined 'this vs. that' label.
-    items_skip = ('local', 'global')  # WARNING: update if area labels change
     kws_label = [kws_label] if identical else list(zip(*kws_label))
     labels = []
-    for i, kws_pair in enumerate(kws_label):
+    found = set(kw.get('area', None) or '' for kws in kws_label for kw in kws)
+    skip = set(item for item in found if not item or item in ('local', 'global'))
+    for kws_pair in kws_label:
         # Allocate label components
         keys = set(key for kw in kws_pair for key in kw)
         front, left, right, back = [], [], [], []
         if not invert:
             kws_pair = kws_pair[::-1]  # place dependent variable *first*
         for key in sorted(keys, key=sorter):
-            items = list(filter(None, (kw.get(key) for kw in kws_pair)))
-            if len(set(items)) > 1:
-                both = items[0] in items_skip and items[1] in items_skip
-                if both or items[0] not in items_skip:
-                    left.append(items[0])  # *both* e.g. local vs. global feedback
-                if both or items[1] not in items_skip:
+            items = list(kw.get(key) for kw in kws_pair)
+            if key == 'area' and len(skip) == len(found) == 1:
+                pass
+            elif len(set(items)) > 1:  # one unset or both set to different
+                if items[0]:  # e.g. local vs. global feedback
+                    left.append(items[0])
+                if items[1]:
                     right.append(items[1])
-            elif items:
-                if items[0] in items_skip:
-                    pass  # not a special region e.g. 'West Pacific'
-                elif key in order_back:
-                    back.append(items[0])  # e.g. abrupt vs. picontrol *feedback*
-                else:
-                    front.append(items[0])  # e.g. *cmip5* abrupt vs. picontrol
+            elif any(items):  # non-empty and non-None
+                if key in order_back:  # e.g. 'abrupt vs. picontrol *feedback*'
+                    back.append(items[0])
+                else:  # e.g. '*cmip6* abrupt vs. picontrol'
+                    front.append(items[0])
         # Combine and adjust labels
-        reverse_drop = lambda lab, key: lab[::-1].replace(key[::-1], '', 1)[::-1]
+        remove = lambda lab, key: lab[::-1].replace(key[::-1], '', 1)[::-1]
         left, right = ' '.join(filter(None, left)), ' '.join(filter(None, right))
         center = ' vs. '.join(filter(None, (left, right)))
         label = ' '.join(filter(None, (*front, center, *back)))
+        average = 'CMIP5 plus CMIP6'
         abrupt = r'abrupt 4$\times$CO$_2$'
         control = 'pre-industrial'
         change = f'{abrupt} minus {control}'
@@ -695,7 +709,9 @@ def _infer_labels(
             elif label in (change, f'early {change}', f'late {change}'):
                 pass  # special exceptions in case 'feedback' is missing
             else:
-                label = reverse_drop(f'{label.replace(change, abrupt)} response', f'{abrupt} ')  # noqa: E501
+                label = remove(f'{label.replace(change, abrupt)} response', f'{abrupt} ')  # noqa: E501
+        if average in label:
+            label = label.replace(average, 'CMIP')
         if warming in label:
             label = label.replace(warming, 'warming')
         if identical and label[-8:] == 'feedback':  # change end to 'feedbacks'
@@ -703,7 +719,7 @@ def _infer_labels(
         if scaling in label:  # drop '2xCO2' scaling
             label = label.replace(scaling, abrupt, 1)
         if label.count('boreal') == 2:  # drop e.g. 'boreal winter minus boreal summer'
-            label = reverse_drop(label, 'boreal ')
+            label = remove(label, 'boreal ')
         if control in label and 'surface warming' in label:  # convert 'ts'
             label = label.replace('warming', 'temperature')
         label = _fit_label(label.strip(), **kwargs)
@@ -926,7 +942,7 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
             ikws_process.append(jkws_process)
             ikws_collection.append(jkws_collection)
         # Infer grid labels
-        abcwidth = pplt.units(2 * pplt.rc.fontsize, 'pt', 'in')
+        abcwidth = pplt.units(1 * pplt.rc.fontsize, 'pt', 'in')
         refwidth = pplt.units(refwidth or pplt.rc['subplots.refwidth'], 'in')
         refwidth -= abcwidth if len(rowspecs) < 2 or len(colspecs) < 2 else 0
         grdlabels = _infer_labels(
@@ -947,7 +963,6 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
     # row or column list, and the specs from the other list are repeated below.
     # WARNING: Critical to make copies of dictionaries or create new ones
     # here since itertools product repeats the same spec multiple times.
-    autocmap = ('Fire', 'NegPos', 'NegPos') if autocmap is True else autocmap
     kws_rowcol = [
         [
             list(zip(jkws_process, jkws_collection))
@@ -998,21 +1013,21 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
 
             # Merge pairs and possibly apply autocmap
             if len(kw_process) == 2:
-                keys1, keys2 = map(set, kw_process)
                 for kw1, kw2 in (kw_process, kw_process[::-1]):
                     for key, value in kw2.items():
                         kw1.setdefault(key, value)
                 if kw_process[0] == kw_process[1]:
                     kw_process = kw_process[:1]
             if autocmap:  # use different colormaps for project and other anomalies
-                idx = max(
+                index = max(
                     0 if not isinstance(value, str) or '-' not in value
                     else 1 if key != 'project' else 2
                     for kw in kw_process for key, value in kw.items()
                 )
-                kw_collection.command['cmap'] = autocmap[idx]
-                kw_collection.command.setdefault('robust', 98 - 2 * idx)
-                kw_collection.command.setdefault('symmetric', idx > 0)
+                cmaps = ('Fire', 'NegPos', 'NegPos') if autocmap is True else autocmap
+                kw_collection.command['cmap'] = cmaps[index]
+                kw_collection.command.setdefault('robust', 98 - 2 * index)
+                kw_collection.command.setdefault('symmetric', index > 0)
             ikws_process.append(tuple(kw_process))
             ikws_collection.append(kw_collection)
 

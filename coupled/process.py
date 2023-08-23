@@ -48,30 +48,30 @@ FEEDBACK_CONSTRAINTS = {
     # 'cld': (0.69, (1.04 - 0.31) / 2,  # He et al. with 95% uncertainty
     # 'cld': (0.68, 0.18, 226),  # custom trended estimate
     'cld': (0.35, 0.26, 226),  # custom detrended estimate
-    'net': (-0.84, 0.29, 274),  # un-adjusted uncertainty
-    'hadnet': (-0.84, 0.31, 274),
+    'net': (-0.84, 0.29, 274),
     'sw': (0.86, 0.24, 274),
-    'hadsw': (0.88, 0.25, 274),
     'lw': (-1.70, 0.19, 274),
-    'hadlw': (-1.72, 0.21, 274),
     'cre': (0.27, 0.23, 274),
-    'hadcre': (0.30, 0.24, 274),
     'swcre': (0.19, 0.24, 274),
-    'hadswcre': (0.15, 0.26, 274),
     'lwcre': (0.08, 0.13, 274),
+    # 'net': (-0.84, 0.31, 249),  # correlation-adjusted error
+    # 'sw': (0.86, 0.25, 242),
+    # 'lw': (-1.70, 0.19, 274),
+    # 'cre': (0.27, 0.23, 274),
+    # 'swcre': (0.19, 0.24, 274),
+    # 'lwcre': (0.08, 0.15, 232),
+    'hadnet': (-0.84, 0.31, 274),
+    'hadsw': (0.88, 0.25, 274),
+    'hadlw': (-1.72, 0.21, 274),
+    'hadcre': (0.30, 0.24, 274),
+    'hadswcre': (0.15, 0.26, 274),
     'hadlwcre': (0.15, 0.14, 274),
-    # 'net': (-0.84, 0.61),  # correlation adjusted
-    # 'hadnet': (-0.84, 0.66),
-    # 'sw': (0.89, 0.51),
-    # 'hadsw': (0.93, 0.51),
-    # 'lw': (-1.70, 0.38),
-    # 'hadlw': (-1.72, 0.42),
-    # 'cre': (0.27, 0.47),
-    # 'hadcre': (0.30, 0.51),
-    # 'swcre': (0.19, 0.49),
-    # 'hadswcre': (0.15, 0.53),
-    # 'lwcre': (0.08, 0.29),
-    # 'hadlwcre': (0.15, 0.29),
+    # 'hadnet': (-0.84, 0.31, 274),  # correlation-adjusted error
+    # 'hadsw': (0.88, 0.25, 274),
+    # 'hadlw': (-1.72, 0.21, 274),
+    # 'hadcre': (0.30, 0.24, 274),
+    # 'hadswcre': (0.15, 0.26, 274),
+    # 'hadlwcre': (0.15, 0.14, 274),
 }
 
 # Variable dependencies
@@ -363,7 +363,7 @@ def _components_slope(
 
 
 def _constrain_response(
-    data0, data1, constraint=None, steps=None, pctile=None, N=None, graphical=False
+    data0, data1, constraint=None, pctile=None, N=None, graphical=False
 ):
     """
     Return percentile bounds for observational constraint.
@@ -376,8 +376,6 @@ def _constrain_response(
         The predictand data. Must be 1D.
     constraint : 2-tuple, default: (0.32, 1.06)
         The 95% bounds on the observational constraint.
-    steps : int, default: 19
-        The number of time steps used in the observational estimate.
     pctile : float, default: 95
         The emergent constraint percentile bounds to be returned.
     N : int, default: 100000

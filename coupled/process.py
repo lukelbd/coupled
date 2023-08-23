@@ -17,7 +17,7 @@ from climopy import ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
-from .internals import ALIAS_FEEDBACKS, KEYS_METHOD, KEYS_VARIABLE, ORDER_LOGICAL
+from .internals import ALIAS_FEEDBACKS, FEEDBACK_ALIASES, KEYS_METHOD, KEYS_VARIABLE, ORDER_LOGICAL  # noqa: E501
 from .internals import _group_parts, _ungroup_parts, _to_lists
 from .results import FACETS_LEVELS, REGEX_FLUX, VERSION_LEVELS
 from cmip_data.internals import MODELS_INSTITUTES, INSTITUTES_LABELS
@@ -38,6 +38,41 @@ VERSION_DEFAULTS = {
     'region': 'globe',
     'start': 0,
     'stop': 150,
+}
+
+# Observational constraints
+# NOTE: These were read from He et al. figure and copied from custom calculations. All
+# use GISTEMP for consistency with He et al. and since that's the model-consistent one.
+# TODO: Auto-generate this dictionary or save and commit then parse a text file.
+# TODO: Add custom kernel-based estimates and use e.g. 'he' for external estimate
+FEEDBACK_CONSTRAINTS = {
+    # 'cld': (0.69, (1.04 - 0.31) / 2,  # He et al. figure
+    # 'cld': (0.68, 0.36),  # custom trended estimate
+    'cld': (0.35, 0.49),  # custom detrended estimate
+    'net': (-0.84, 0.58),  # un-adjusted uncertainty
+    'hadnet': (-0.84, 0.62),
+    'sw': (0.89, 0.47),
+    'hadsw': (0.93, 0.50),
+    'lw': (-1.70, 0.38),
+    'hadlw': (-1.72, 0.41),
+    'cre': (0.27, 0.45),
+    'hadcre': (0.30, 0.48),
+    'swcre': (0.19, 0.48),
+    'hadswcre': (0.15, 0.51),
+    'lwcre': (0.08, 0.26),
+    'hadlwcre': (0.15, 0.28),
+    # 'net': (-0.84, 0.61),  # correlation adjusted
+    # 'hadnet': (-0.84, 0.66),
+    # 'sw': (0.89, 0.51),
+    # 'hadsw': (0.93, 0.51),
+    # 'lw': (-1.70, 0.38),
+    # 'hadlw': (-1.72, 0.42),
+    # 'cre': (0.27, 0.47),
+    # 'hadcre': (0.30, 0.51),
+    # 'swcre': (0.19, 0.49),
+    # 'hadswcre': (0.15, 0.53),
+    # 'lwcre': (0.08, 0.29),
+    # 'hadlwcre': (0.15, 0.29),
 }
 
 # Variable dependencies
@@ -317,7 +352,7 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None, dof=Non
 
 
 def _constrain_response(
-    data0, data1, constraint=None, steps=None, pctile=None, N=None, montecarlo=False
+    data0, data1, constraint=None, steps=None, pctile=None, N=None, graphical=False
 ):
     """
     Return percentile bounds for observational constraint.
@@ -335,9 +370,9 @@ def _constrain_response(
     pctile : float, default: 95
         The emergent constraint percentile bounds to be returned.
     N : int, default: 100000
-        The number of Monte Carlo samples to carry out.
+        The number of bootstrapped samples to carry out.
     graphical : bool, optional
-        Whether to use graphical intersections instead of Monte Carlo.
+        Whether to use graphical intersections instead of bootstrapping.
 
     Returns
     -------
@@ -348,55 +383,74 @@ def _constrain_response(
     result2 : 3-tuple
         The emergent constraint accounting for regression uncertainty.
     """
-    # NOTE: This requires reverse engineering the t-distribution associated with
-    # observational estimate. Need the percentile bounds and number of years used.
+    # NOTE: Below we reverse engineer the t-distribution associated with observational
+    # estimate, then use those distribution properties for our bootstrapping.
+    # NOTE: Below tried adding 'offset uncertainty' but resulted in equivalent spread
+    # compared to standard slop-only regression uncertainty.
+    # NOTE: Use N - 2 degrees of freedom for both observed feedback and inter-model
+    # coefficients since they are both linear regressions. For now ignore uncertainty
+    # of individual feedback regressions that comprise inter-model regression because
+    # their sample sizes are larger (150 years) and uncertainties are unc-rrelated so
+    # should roughly cancel out across e.g. 30 members of ensemble.
     N = N or 10000  # samples to draw
     pctile = 95 if pctile is None else pctile
     pctile = 0.5 * (100 - pctile)  # e.g. [90, 50] --> [[5, 25], [95, 75]]
     pctile = np.array([pctile, 100 - pctile])
-    if constraint is None:
-        steps = 2019 - 2001 + 1  # number of years
-        constraint = (0.32, 1.06)  # read from He et al. figure
+    steps = 120  # approximate degrees of freedom in Dessler et al.
+    # steps = 6 * (2019 - 2001 + 1)  # number of years in He et al. estimate
+    if isinstance(constraint, str):
+        constraint = FEEDBACK_ALIASES.get(constraint, constraint)
+        average, spread = FEEDBACK_CONSTRAINTS[constraint]
+        constraint = np.array([average - spread, average + spread])
     elif np.iterable(constraint) and len(constraint) in (2, 3):
-        steps = steps or 19  # use He et al. by default
-        constraint = (constraint[0], constraint[-1])  # ignore input average
+        constraint = np.array([constraint[0], constraint[-1]])
     else:
         raise ValueError(f'Invalid constraint {constraint}. Must be length 2.')
     if data0.ndim != 1 or data1.ndim != 1:
         raise ValueError(f'Invalid data dims {data0.ndim} and {data1.ndim}. Must be 1D.')  # noqa: E501
-    average = np.mean(constraint)  # observed Gregory regression best estimate
+    observations = (constraint[0], average, constraint[1])
     data0 = np.array(data0).squeeze()
     data1 = np.array(data1).squeeze()
     idxs = np.argsort(data0, axis=0)
     data0, data1 = data0[idxs], data1[idxs]  # required for graphical error
     mean0, mean1 = data0.mean(), data1.mean()
-    slope, error, rsquare, fit, fit_lower, fit_upper = linefit(
+    bmean, berror, rsquare, fit, fit_lower, fit_upper = linefit(
         data0, data1, adjust=False, pctile=pctile
     )
-    if not montecarlo:
+    if graphical:
         fit_lower = fit_lower.squeeze()
         fit_upper = fit_upper.squeeze()
         xs = np.sort(data0, axis=0)  # linefit returns result for sorted data
-        x0, x1 = constraint  # observational constraint
-        y0 = np.interp(x0, xs, fit_lower)
-        y1 = np.interp(x1, xs, fit_upper)
-        interval = (y0, y1)
-        estimate = mean1 + slope.item() * (average - mean0)
+        xmean = np.mean(constraint)  # observational best estimate
+        xmin, xmax = constraint  # observational constraint
+        ymin = np.interp(xmin, xs, fit_lower)
+        ymax = np.interp(xmax, xs, fit_upper)
+        ymean = mean1 + bmean.item() * (xmean - mean0)
+        constrained = (ymin, ymean, ymax)
+        ymin, ymax = mean1 + bmean * (constraint - mean0)
+        alternative = (ymin, ymean, ymax)  # no regression uncertainty
     else:  # NOTE: important to include both offset and slope uncertainty
         score = stats.t.isf(0.025, steps - 2)  # t score associated with 95% bounds
-        sigma = (constraint[1] - average) / score  # inferred Gregory regression sigma
-        xs = stats.t.rvs(steps - 2, loc=average, scale=sigma, size=N)  # observations
-        bs_ = stats.t.rvs(data0.size - 2, loc=slope, scale=error, size=N)  # identical
-        as_ = mean1 - mean0 * stats.t.rvs(data0.size - 2, loc=slope, scale=error, size=N)  # noqa: E501
-        ys = as_ + bs_ * xs  # include both uncertainties
-        # ys = mean1 + bs_ * (xs - mean0)  # include single uncertainty
-        interval = np.percentile(ys, pctile)
-        estimate = np.mean(ys)
-    observations = (constraint[0], average, constraint[1])
-    transform = mean1 + slope.item() * (np.array(constraint) - mean0)
-    result1 = (transform[0], estimate, transform[1])
-    result2 = (interval[0], estimate, interval[1])
-    return observations, result1, result2
+        xmean = np.mean(constraint)  # observational best estimate
+        xerror = (constraint[1] - xmean) / score  # observed feedback sigma
+        rerror = np.sqrt((1 - rsquare) * np.var(data1, ddof=1))  # model residual sigma
+        xs = stats.t.rvs(steps - 2, loc=xmean, scale=xerror, size=N)  # observations
+        err = stats.t.rvs(data0.size - 2, loc=0, scale=rerror, size=N)
+        ys = err + mean1 + bmean * (xs - mean0)
+        # amean = mean1 - mean0 * bmean  # see wiki page
+        # aerror = berror * np.sqrt(np.sum(data0 ** 2) / data0.size)  # see wiki page
+        # bs_ = stats.t.rvs(data0.size - 2, loc=bmean, scale=berror, size=N)
+        # as_ = stats.t.rvs(data0.size - 2, loc=amean, scale=aerror, size=N)
+        # ys = err + as_ + bs_ * xs  # include both uncertainties
+        # ys = mean1 + bs_ * (xs - mean0)  # include slope uncertainty only
+        ymean = np.mean(ys)
+        ymin, ymax = np.percentile(ys, pctile)
+        constrained = (ymin, ymean, ymax)
+        ys = mean1 + bmean * (xs - mean0)  # no regression uncertainty
+        ymean = np.mean(ys)
+        ymin, ymax = np.percentile(ys, pctile)
+        alternative = (ymin, ymean, ymax)
+    return observations, alternative, constrained
 
 
 def _parse_project(data, project=None):

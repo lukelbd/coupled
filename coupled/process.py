@@ -7,6 +7,7 @@ import math
 import re
 import warnings
 
+import cftime
 import climopy as climo  # noqa: F401
 import numpy as np
 import pandas as pd
@@ -258,7 +259,7 @@ def _components_corr(data0, data1, dim=None, pctile=None):
     return corr, corr_lower, corr_upper, rsquare
 
 
-def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
+def _components_slope(data0, data1, dim=None, adjust=False, pctile=None, dof=None):
     """
     Return components of a line fit operation.
 
@@ -274,6 +275,8 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
         Whether to adjust the slope for autocorrelation effects.
     pctile : float, default: 95
         The percentile range for the lower and upper uncertainty bounds.
+    dof : int, optional
+        Effective degrees of freedom in the time series.
 
     Returns
     -------
@@ -284,12 +287,17 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     fit, fit_lower, fit_upper : xarray.DataArray
         The fit to the original points with `pctile` lower and upper bounds.
     """
+    # TODO: Update linefit() to return either slope and fit lower and upper bounds
+    # or just the slope sigma that can be used to calculate other stuff.
+    # TODO: Copy Dessler and Forster methodology for getting effective degrees
+    # of freedom for time series with autocorrelated components.
     # NOTE: Here np.polyfit requires monotonically increasing coordinates. Not sure
     # why... could consider switching to manual slope and stderr calculation.
     dim = dim or data0.dims[0]
     data0, data1 = xr.align(data0, data1)
     axis = data0.dims.index(dim)
     idx = np.argsort(data0.values, axis=axis)
+    dof = dof or data0.size - 2  # or reduced uncertainty
     data0 = data0.isel({dim: idx})
     data1 = data1.isel({dim: idx})
     pctile = 95 if pctile is None else pctile
@@ -298,11 +306,14 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     slope, sigma, rsquare, fit, fit_lower, fit_upper = linefit(
         data0, data1, dim=dim, adjust=adjust, pctile=pctile,
     )
-    dslope_lower, dslope_upper = _get_bounds(sigma, pctile, dof=data0.size - 2)
+    dslope_lower, dslope_upper = _get_bounds(sigma, pctile, dof=dof)
     dslope_lower = xr.DataArray(dslope_lower, dims=('pctile', *sigma.dims))
     dslope_upper = xr.DataArray(dslope_upper, dims=('pctile', *sigma.dims))
     slope_lower, slope_upper = slope + dslope_lower, slope + dslope_upper
-    return slope, slope_lower, slope_upper, rsquare, fit, fit_lower, fit_upper
+    fit.coords.update({'x': data0, 'y': data1})
+    fit_lower.coords.update({'x': data0, 'y': data1})
+    fit_upper.coords.update({'x': data0, 'y': data1})
+    return slope, slope_lower, slope_upper, sigma, rsquare, fit, fit_lower, fit_upper
 
 
 def _constrain_response(
@@ -867,22 +878,30 @@ def apply_reduce(data, attrs=None, **kwargs):
         data = data.reset_index('project', drop=True)  # models are unique
 
     # Apply time reductions
-    # TODO: Replace 'average_periods' with this and normalize by annual temperature
+    # TODO: Replace 'average_periods' with this and normalize by annual temperature.
+    # Also should add generalized no-op instruction for leaving coordinates alone.
     # NOTE: The new climopy cell duration calculation will auto-detect monthly and
     # yearly data, but not yet done, so use explicit days-per-month weights for now.
     season = kwargs.pop('season', None)
     month = kwargs.pop('month', None)
-    if season is not None or month is not None:
+    time = kwargs.pop('time', 'avg')  # same as _apply_single() and climo.reduce()
+    if 'time' in data.dims:
         if season is not None:
             seasons = data.time.dt.season.str.lower()
             data = data.isel(time=(seasons == season.lower()))
         elif isinstance(month, str):
             months = data.time.dt.strftime('%b').str.lower()
             data = data.isel(time=(months == month.lower()))
-        else:
+        elif month is not None:
             months = data.time.dt.month
             data = data.isel(time=(months == month))
-    if 'time' in data.coords:  # manual weighted average
+        elif isinstance(time, str) and time != 'avg':
+            time = cftime.datetime.strptime(time, '%Y-%m-%d')  # cftime 1.6.2
+            data = data.sel(time=time, method='nearest')
+        elif not isinstance(time, str) and time is not None:
+            time = time  # should already be datetime
+            data = data.sel(time=time, method='nearest')
+    if 'time' in data.dims and time == 'avg':  # manual weighted average
         days = data.time.dt.days_in_month
         wgts = days.groupby('time.year') / days.groupby('time.year').sum()
         wgts = wgts.astype(np.float32)  # preserve float32 variables
@@ -1034,7 +1053,7 @@ def get_data(dataset, name, attr=None, **kwargs):
             with xr.set_options(keep_attrs=True):
                 data = sum(sign * _find_data(key) for sign, key in zip(signs, keys))
         data = data.copy(deep=False)  # update attributes on derived variable
-        for key in ('short_name', 'long_name'):
+        for key in ('short_name', 'long_name', 'standard_name'):
             if not search:
                 continue
             if key not in data.attrs:
@@ -1049,16 +1068,16 @@ def get_data(dataset, name, attr=None, **kwargs):
         return data
 
     # Get variable or derivation
-    # NOTE: Here apply_reduce will automatically perform default selections
-    # for certain dimensions. Only carry out when requesting the data.
-    # NOTE: Currently handles net flux (longwave plus shortwave), atmospheric flux
-    # (top-of-atmosphere plus surface), cloud effect (all-sky minus clear-sky),
-    # radiative response (full minus effective forcing), and transport terms.
     # TODO: Should combine climopy and this approach by 1) translating instructions,
     # 2) selecting relevant variables, 3) performing scalar selections first (e.g.
     # points, maxima), 4) combining variables (e.g. products, sums), then 5) more
     # complex coordinate operations (e.g. averages, integrals). And optionally order
     # operations around non-linear variable or coordinate operations.
+    # NOTE: Here apply_reduce will automatically perform default selections for certain
+    # dimensions (only carry out when requesting data). Also gets net flux (longwave
+    # plus shortwave), atmospheric flux (top-of-atmosphere plus surface), cloud effect
+    # (all-sky minus clear-sky), radiative response (full minus effective forcing),
+    # net imbalance (downwelling minus upwelling), and various transport terms.
     def _find_data(key, **attrs):
         key = ALIAS_FEEDBACKS.get(key, key)
         subs = lambda reg, *ss: tuple(reg.sub(s, key).strip('_') for s in ss)
@@ -1090,6 +1109,9 @@ def get_data(dataset, name, attr=None, **kwargs):
             key = key.replace('ecs2x', 'ecs')
             with xr.set_options(keep_attrs=True):
                 data = 0.5 * _find_data(key)
+        elif key == 'rluscs' or key == 'rsdtcs':
+            key = key[:-2]  # all-sky is same as clear-sky
+            data = _find_data(key)
         elif key == 'tabs':
             parts = ('tpat', 'rfnt_ecs')
             data = _operate_data(parts, long_name='effective warming', units='K', product=True)  # noqa: E501
@@ -1132,16 +1154,26 @@ def get_data(dataset, name, attr=None, **kwargs):
             elif bnd == 'a':
                 parts = subs(regex, r'\1\2\3\4t\6', r'\1\2\3\4s\6')
                 data = _operate_data(parts, 'TOA', 'atmospheric')
-            elif net == 'e':  # effective forcing
+            elif net == 'e':  # effective forcing e.g. 'rlet'
                 parts = subs(regex, r'\1\2\3n\5\6_erf')
                 data = _operate_data(parts, 'effective ', '')  # NOTE: change?
-            elif net == 'r':  # radiative response
+            elif net == 'r':  # radiative response e.g. 'rlrt'
                 parts = subs(regex, r'\1\2\3n\5\6', r'\1\2\3n\5\6_erf')
                 data = _operate_data(parts, 'flux', 'response', (1, -1))
             elif wav == 'f':  # WARNING: critical to put this last!
                 replace = 'net ' if part == '' and sky == '' else ''
                 parts = subs(regex, r'\1\2l\4\5\6', r'\1\2s\4\5\6')
                 data = _operate_data(parts, 'longwave ', replace)
+            elif net == 'n':  # WARNING: only used for ceres currently
+                if wav == 'l' and bnd == 't':
+                    signs = (-1,)
+                    patterns = (r'\1\2\3u\5\6',)
+                else:
+                    signs = (1, -1)
+                    patterns = (r'\1\2\3d\5\6', r'\1\2\3u\5\6')
+                search = re.compile('(upwelling|downwelling|incoming|outgoing)')
+                parts = subs(regex, *patterns)
+                data = _operate_data(parts, search, 'net', signs)
             else:
                 opts = ', '.join(s for s in dataset.data_vars if regex.search(s))
                 raise ValueError(f'Missing flux variable {key}. Options are: {opts}.')  # noqa: E501

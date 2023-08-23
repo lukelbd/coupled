@@ -1448,12 +1448,12 @@ def _setup_scatter(
             ax.format(xlim=lim, ylim=lim)  # autoscale disabled
             ax.plot(ones, ones, color='k', dashes=(1, 3), linewidth=pplt.rc.metawidth)
 
-    # Add manual line fit
+    # Add manual regression line
     # NOTE: Here climopy automatically reapplies dataarray coordinates to fit line
     # and lower and upper bounds so do not explicitly need sorted x coordinates.
     if linefit:  # https://en.wikipedia.org/wiki/Simple_linear_regression
         dim = data0.dims[0]  # generally facets dimension
-        slope, _, _, rsquare, fit, fit_lower, fit_upper = _components_slope(
+        slope, _, _, _, rsquare, fit, fit_lower, fit_upper = _components_slope(
             data0, data1, dim=dim, adjust=False, pctile=None,  # use default of 95
         )
         # sign = '\N{MINUS SIGN}' if slope < 0 else ''  # negative r-squared

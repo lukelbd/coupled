@@ -934,7 +934,8 @@ def _combine_commands(dataset, arguments, kws_collection):
             data_lower1, data_lower2 = data_lower.values.flat
             data_upper1, data_upper2 = data_upper.values.flat
             rsquare = ureg.Quantity(rsquare.item(), '').to('percent')
-            annotation = f'${rsquare:~L.0f}$'.replace('%', r'\%').replace(r'\ ', '')
+            annotation = f'${rsquare:~L.0f}$'.replace(r'\ ', '')
+            # annotation = f'${rsquare:~L.0f}$'.replace('%', r'\%').replace(r'\ ', '')
             # rvalue = np.sign(data.item()) * rsquare.item() ** 0.5
             # annotation = f'${rvalue:.2f}$'  # latex for long dash minus sign
             # annotation = '' if correlation else annotation
@@ -1406,7 +1407,7 @@ def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=
 
 
 def _setup_scatter(
-    ax, data0, data1, collection=None, oneone=False, linefit=False, annotate=False, constraint=None, montecarlo=False,  # noqa: E501
+    ax, data0, data1, collection=None, oneone=False, linefit=False, annotate=False, constraint=None, graphical=False,  # noqa: E501
 ):
     """
     Adjust and optionally add content to scatter plots.
@@ -1430,8 +1431,8 @@ def _setup_scatter(
         Whether to add annotations to the scatter markers.
     constraint : float, optional
         Whether to illustrate a constraint. If ``True`` uses a default value.
-    montecarlo : bool, optional
-        Whether to use Monte Carlo or graphical estimates of the constraint.
+    graphical : bool, optional
+        Whether to use bootstrapped or graphical estimates of the constraint.
     """
     # Add reference one:one line
     # NOTE: This also disables autoscaling so that line always looks like a diagonal
@@ -1439,14 +1440,15 @@ def _setup_scatter(
     if oneone:
         units0 = data0.climo.units
         units1 = data1.climo.units
-        lim = (*ax.get_xlim(), *ax.get_ylim())
-        lim = (min(lim), max(lim))
-        avg = 0.5 * (lim[0] + lim[1])
-        span = lim[1] - lim[0]
-        ones = (avg - 1e3 * span, avg + 1e3 * span)
         if units0 == units1:
-            ax.format(xlim=lim, ylim=lim)  # autoscale disabled
-            ax.plot(ones, ones, color='k', dashes=(1, 3), linewidth=pplt.rc.metawidth)
+            lim = (*ax.get_xlim(), *ax.get_ylim())
+            lim = (min(lim), max(lim))
+            avg = 0.5 * (lim[0] + lim[1])
+            span = lim[1] - lim[0]
+            ones = (avg - 1e3 * span, avg + 1e3 * span)
+            # ax.format(xlim=lim, ylim=lim)  # autoscale disabled
+            # ax.plot(ones, ones, color='k', dashes=(1, 3), lw=pplt.rc.metawidth, scalex=0, scaley=0)  # noqa: E501
+            ax.add_artist(mlines.Line2D(ones, ones, color='k', dashes=(1, 3), lw=pplt.rc.metawidth))  # noqa: E501
 
     # Add manual line fit
     # NOTE: Here climopy automatically reapplies dataarray coordinates to fit line
@@ -1466,27 +1468,32 @@ def _setup_scatter(
         label = label.replace(r'\ ', '')
         datax = np.sort(data0, axis=0)  # linefit returns result for sorted data
         c = collection[0].get_color()
-        c = 'red' if constraint is None else c  # line fit color
-        ax.plot(datax, fit, color=c, linestyle='-', linewidth=1.5 * pplt.rc.metawidth)
-        ax.area(datax, fit_lower.squeeze(), fit_upper.squeeze(), color=c, alpha=0.3, lw=0)  # noqa: E501
+        c = 'red' if not constraint else c  # line fit color
+        ax.plot(datax, fit, c=c, ls='-', lw=1.5 * pplt.rc.metawidth)
+        ax.area(datax, fit_lower.squeeze(), fit_upper.squeeze(), c=c, a=0.3, lw=0)
         ax.format(lltitle=label)  # add annotation
-        if constraint is not None and constraint is not False:
+        if constraint is not None:
+            constraint = 'cld' if constraint is True else constraint
             xcolor, ycolor = 'cyan7', 'pink7'  # TODO: fix colors?
             xs, ys1, ys2 = _constrain_response(
-                data0, data1,
-                montecarlo=montecarlo,
-                constraint=None if constraint is True else constraint,
+                data0, data1, graphical=graphical, constraint=constraint,
             )
             xmin, xmean, xmax = xs
             ymin1, ymean, ymax1 = ys1
             ymin2, ymean, ymax2 = ys2
+            xmin0, xmax0 = np.percentile(data0, [2.5, 97.5])
+            ymin0, ymax0 = np.percentile(data1, [2.5, 97.5])
             args = ([xmean, xmean], [ymin2 - 20, ymean])
+            # for x0 in (xmin0, xmax0):  # unconstrained bounds
+            #     ax.axvline(x0, color=xcolor, alpha=0.5, ls='--', lw=1)
             ax.axvspan(xmin, xmax, color=xcolor, alpha=0.2, lw=0)
-            ax.add_artist(mlines.Line2D(*args, color=xcolor, lw=1))  # noqa: E501
+            ax.add_artist(mlines.Line2D(*args, color=xcolor, lw=1))
             args = ([xmin - 20, xmean], [ymean, ymean])
-            ax.axhspan(ymin2, ymax2, color=ycolor, alpha=0.10, lw=0)
-            ax.axhspan(ymin1, ymax1, color=ycolor, alpha=0.20, lw=0)
-            ax.add_artist(mlines.Line2D(*args, color=ycolor, lw=1))  # noqa: E501
+            # for y0 in (ymin0, ymax0):  # unconstrained bounds
+            #     ax.axhline(y0, color=ycolor, alpha=0.5, ls='--', lw=1)
+            ax.axhspan(ymin2, ymax2, color=ycolor, alpha=0.1, lw=0)
+            ax.axhspan(ymin1, ymax1, color=ycolor, alpha=0.2, lw=0)
+            ax.add_artist(mlines.Line2D(*args, color=ycolor, lw=1))
 
     # Add annotations
     # NOTE: Using set_in_layout False significantly improves speed since tight bounding
@@ -1929,6 +1936,7 @@ def create_plot(
     # group contours by identical processing keyword arguments so their levels can be
     # shared but then have a colorbar referencing several identical-label variables.
     print('\nPlotting data:', end=' ')
+    oneone = False  # whether to scale x and y separately
     groups_xunits = {}
     groups_yunits = {}  # groupings of units across axes
     groups_handles = {}  # groupings of handles across axes
@@ -2042,7 +2050,9 @@ def create_plot(
                 groups_xunits.setdefault(xunits, []).append(ax)
                 groups_yunits.setdefault(yunits, []).append(ax)
             if 'scatter' in command:
-                keys = ('oneone', 'linefit', 'annotate', 'constraint', 'montecarlo')
+                ax.use_sticky_edges = False  # show end of line fit shading
+                keys = ('oneone', 'linefit', 'annotate', 'constraint', 'graphical')
+                oneone = oneone or kw_other.get('oneone', False)
                 kw_other = {key: val for key, val in kw_other.items() if key in keys}
                 _setup_scatter(ax, *args, handle, **kw_other)  # 'args' is 2-tuple
             if 'bar' in command:  # ensure padding around bar edges
@@ -2161,8 +2171,7 @@ def create_plot(
     # 'outer' from constraints '_build_specs()' function instead.
     if not standardize:  # auto-search shared axes and possibly apply 'relative' limits
         ref = fig.subplotgrid[0]
-        groups_xunits = {}
-        groups_yunits = {}
+        groups_xunits, groups_yunits = {}, {}
         if hasattr(ref, '_shared_axes'):
             groups_shared = {'x': list(ref._shared_axes['x']), 'y': list(ref._shared_axes['y'])}  # noqa: E501
         else:
@@ -2174,12 +2183,17 @@ def create_plot(
                         groups_xunits[idx] = groups[idx]
                     else:
                         groups_yunits[idx] = groups[idx]
-    for axis, rlim, groups in zip('xy', (rxlim, rylim), (groups_xunits, groups_yunits)):
+    for axis1, axis2, groups1, groups2, rlim in zip(
+        'xy', 'yx', (groups_xunits, groups_yunits), (groups_yunits, groups_xunits), (rxlim, rylim),  # noqa: E501
+    ):
         rlim = rlim or (0, 1)  # disallow *implicit* application of multiple options
-        for i, (unit, axs) in enumerate(groups.items()):
-            lims = [getattr(ax, f'get_{axis}lim')() for ax in axs]
+        for i, (unit, axs) in enumerate(groups1.items()):
+            pairs = [(axis1, ax) for ax in axs]
+            if oneone:  # additionally scale by other axis
+                pairs.extend((axis2, ax) for ax in groups2.get(unit, ()))
+            lims = [getattr(ax, f'get_{axis}lim')() for axis, ax in pairs]
             span = max((lim[1] - lim[0] for lim in lims), key=abs)  # preserve sign
-            for ax, lim in zip(axs, lims):
+            for (axis, ax), lim in zip(pairs, lims):
                 average = 0.5 * (lim[0] + lim[1])
                 min_ = average + span * (rlim[0] - 0.5)
                 max_ = average + span * (rlim[1] - 0.5)

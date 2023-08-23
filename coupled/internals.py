@@ -57,7 +57,7 @@ DETECT_AXES = (
     'x', 'y', 'lon', 'lat', 'abc', 'title', 'proj', 'land', 'coast', 'rc', 'margin',
 )
 DETECT_OTHER = (
-    'hori', 'pcolor', 'cycle', 'multi', 'one', 'line', 'constr', 'monte', 'offset', 'annot', 'corr', 'inter',  # noqa: E501
+    'hori', 'pcolor', 'cycle', 'multi', 'one', 'line', 'const', 'graph', 'offset', 'annot', 'corr', 'inter',  # noqa: E501
 )
 DETECT_ATTRS = (
     'short', 'long', 'standard', 'units',
@@ -434,7 +434,6 @@ def _fit_label(label, fontsize=None, refwidth=None, nmax=None):
     # NOTE: This adds extra padding to allow labels to extend into border.
     # NOTE: Adjust contribution from math, e.g. 2$\times$CO$_2$, since this
     # consists of mahy characters that do not contribute to actual space.
-    # WARNING: Play with 'adjust' for math
     label = label or ''
     label = label.replace('\n', ' ')  # remove previous wrapping just in case
     label = label + ' '  # end with dummy space for threshold loop below

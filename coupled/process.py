@@ -41,26 +41,25 @@ VERSION_DEFAULTS = {
 }
 
 # Observational constraints
-# NOTE: These were read from He et al. figure and copied from custom calculations. All
-# use GISTEMP for consistency with He et al. and since that's the model-consistent one.
 # TODO: Auto-generate this dictionary or save and commit then parse a text file.
-# TODO: Add custom kernel-based estimates and use e.g. 'he' for external estimate
+# NOTE: These show best estimate, standard errors, and degrees of freedom for feedback
+# regression slopes using either GISTEMP4 or HadCRUT5. See observed.ipynb notebook.
 FEEDBACK_CONSTRAINTS = {
-    # 'cld': (0.69, (1.04 - 0.31) / 2,  # He et al. figure
-    # 'cld': (0.68, 0.36),  # custom trended estimate
-    'cld': (0.35, 0.49),  # custom detrended estimate
-    'net': (-0.84, 0.58),  # un-adjusted uncertainty
-    'hadnet': (-0.84, 0.62),
-    'sw': (0.89, 0.47),
-    'hadsw': (0.93, 0.50),
-    'lw': (-1.70, 0.38),
-    'hadlw': (-1.72, 0.41),
-    'cre': (0.27, 0.45),
-    'hadcre': (0.30, 0.48),
-    'swcre': (0.19, 0.48),
-    'hadswcre': (0.15, 0.51),
-    'lwcre': (0.08, 0.26),
-    'hadlwcre': (0.15, 0.28),
+    # 'cld': (0.69, (1.04 - 0.31) / 2,  # He et al. with 95% uncertainty
+    # 'cld': (0.68, 0.18, 226),  # custom trended estimate
+    'cld': (0.35, 0.26, 226),  # custom detrended estimate
+    'net': (-0.84, 0.29, 274),  # un-adjusted uncertainty
+    'hadnet': (-0.84, 0.31, 274),
+    'sw': (0.86, 0.24, 274),
+    'hadsw': (0.88, 0.25, 274),
+    'lw': (-1.70, 0.19, 274),
+    'hadlw': (-1.72, 0.21, 274),
+    'cre': (0.27, 0.23, 274),
+    'hadcre': (0.30, 0.24, 274),
+    'swcre': (0.19, 0.24, 274),
+    'hadswcre': (0.15, 0.26, 274),
+    'lwcre': (0.08, 0.13, 274),
+    'hadlwcre': (0.15, 0.14, 274),
     # 'net': (-0.84, 0.61),  # correlation adjusted
     # 'hadnet': (-0.84, 0.66),
     # 'sw': (0.89, 0.51),
@@ -294,7 +293,9 @@ def _components_corr(data0, data1, dim=None, pctile=None):
     return corr, corr_lower, corr_upper, rsquare
 
 
-def _components_slope(data0, data1, dim=None, adjust=False, pctile=None, dof=None):
+def _components_slope(
+    data0, data1, dim=None, adjust=False, pctile=None, use_sigma=False, dof=None,
+):
     """
     Return components of a line fit operation.
 
@@ -308,10 +309,17 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None, dof=Non
         The dimension for the regression.
     adjust : bool, optional
         Whether to adjust the slope for autocorrelation effects.
+    use_sigma : bool, optional
+        Whether to use sigma for the lower and upper slope bounds.
     pctile : float, default: 95
         The percentile range for the lower and upper uncertainty bounds.
     dof : int, optional
         Effective degrees of freedom in the time series.
+
+    Other Parameters
+    ----------------
+    return_sigma : bool, optional
+        Whether to return slope uncertainty bounds or raw standard error.
 
     Returns
     -------
@@ -341,14 +349,17 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None, dof=Non
     slope, sigma, rsquare, fit, fit_lower, fit_upper = linefit(
         data0, data1, dim=dim, adjust=adjust, pctile=pctile,
     )
-    dslope_lower, dslope_upper = _get_bounds(sigma, pctile, dof=dof)
-    dslope_lower = xr.DataArray(dslope_lower, dims=('pctile', *sigma.dims))
-    dslope_upper = xr.DataArray(dslope_upper, dims=('pctile', *sigma.dims))
-    slope_lower, slope_upper = slope + dslope_lower, slope + dslope_upper
     fit.coords.update({'x': data0, 'y': data1})
     fit_lower.coords.update({'x': data0, 'y': data1})
     fit_upper.coords.update({'x': data0, 'y': data1})
-    return slope, slope_lower, slope_upper, sigma, rsquare, fit, fit_lower, fit_upper
+    if not use_sigma:  # default behavior
+        dslope_lower, dslope_upper = _get_bounds(sigma, pctile, dof=dof)
+        dslope_lower = xr.DataArray(dslope_lower, dims=('pctile', *sigma.dims))
+        dslope_upper = xr.DataArray(dslope_upper, dims=('pctile', *sigma.dims))
+    else:  # e.g. observed gregory regressions
+        dslope_lower, dslope_upper = -1 * sigma, sigma
+    slope_lower, slope_upper = slope + dslope_lower, slope + dslope_upper
+    return slope, slope_lower, slope_upper, rsquare, fit, fit_lower, fit_upper
 
 
 def _constrain_response(
@@ -396,19 +407,17 @@ def _constrain_response(
     pctile = 95 if pctile is None else pctile
     pctile = 0.5 * (100 - pctile)  # e.g. [90, 50] --> [[5, 25], [95, 75]]
     pctile = np.array([pctile, 100 - pctile])
-    steps = 120  # approximate degrees of freedom in Dessler et al.
+    # steps = 120  # approximate degrees of freedom in Dessler et al.
     # steps = 6 * (2019 - 2001 + 1)  # number of years in He et al. estimate
     if isinstance(constraint, str):
         constraint = FEEDBACK_ALIASES.get(constraint, constraint)
-        average, spread = FEEDBACK_CONSTRAINTS[constraint]
-        constraint = np.array([average - spread, average + spread])
-    elif np.iterable(constraint) and len(constraint) in (2, 3):
-        constraint = np.array([constraint[0], constraint[-1]])
-    else:
+    elif not np.iterable(constraint) or len(constraint) != 3:
         raise ValueError(f'Invalid constraint {constraint}. Must be length 2.')
     if data0.ndim != 1 or data1.ndim != 1:
         raise ValueError(f'Invalid data dims {data0.ndim} and {data1.ndim}. Must be 1D.')  # noqa: E501
-    observations = (constraint[0], average, constraint[1])
+    xmean, xscale, xdof = FEEDBACK_CONSTRAINTS[constraint]
+    xmin, xmax = stats.t.ppf(0.01 * pctile, scale=xscale, df=xdof)
+    observations = (xmin, xmean, xmax)
     data0 = np.array(data0).squeeze()
     data1 = np.array(data1).squeeze()
     idxs = np.argsort(data0, axis=0)
@@ -417,25 +426,13 @@ def _constrain_response(
     bmean, berror, rsquare, fit, fit_lower, fit_upper = linefit(
         data0, data1, adjust=False, pctile=pctile
     )
-    if graphical:
-        fit_lower = fit_lower.squeeze()
-        fit_upper = fit_upper.squeeze()
-        xs = np.sort(data0, axis=0)  # linefit returns result for sorted data
-        xmean = np.mean(constraint)  # observational best estimate
-        xmin, xmax = constraint  # observational constraint
-        ymin = np.interp(xmin, xs, fit_lower)
-        ymax = np.interp(xmax, xs, fit_upper)
-        ymean = mean1 + bmean.item() * (xmean - mean0)
-        constrained = (ymin, ymean, ymax)
-        ymin, ymax = mean1 + bmean * (constraint - mean0)
-        alternative = (ymin, ymean, ymax)  # no regression uncertainty
-    else:  # NOTE: important to include both offset and slope uncertainty
-        score = stats.t.isf(0.025, steps - 2)  # t score associated with 95% bounds
-        xmean = np.mean(constraint)  # observational best estimate
-        xerror = (constraint[1] - xmean) / score  # observed feedback sigma
+    if not graphical:  # bootstrapped residual addition
+        # xscore = stats.t.isf(0.025, xdof)  # t score associated with 95% bounds
+        # xerror = (xmax - xmean) / xscore  # used when percentiles were hardcoded
         rerror = np.sqrt((1 - rsquare) * np.var(data1, ddof=1))  # model residual sigma
-        xs = stats.t.rvs(steps - 2, loc=xmean, scale=xerror, size=N)  # observations
-        err = stats.t.rvs(data0.size - 2, loc=0, scale=rerror, size=N)
+        rdof = data0.size - 2  # inter-model regression dof
+        xs = stats.t.rvs(xdof, loc=xmean, scale=xscale, size=N)  # observations
+        err = stats.t.rvs(rdof, loc=0, scale=rerror, size=N)  # regression
         ys = err + mean1 + bmean * (xs - mean0)
         # amean = mean1 - mean0 * bmean  # see wiki page
         # aerror = berror * np.sqrt(np.sum(data0 ** 2) / data0.size)  # see wiki page
@@ -450,6 +447,16 @@ def _constrain_response(
         ymean = np.mean(ys)
         ymin, ymax = np.percentile(ys, pctile)
         alternative = (ymin, ymean, ymax)
+    else:  # intersection of shaded regions
+        fit_lower = fit_lower.squeeze()
+        fit_upper = fit_upper.squeeze()
+        xs = np.sort(data0, axis=0)  # linefit returns result for sorted data
+        ymin = np.interp(xmin, xs, fit_lower)
+        ymax = np.interp(xmax, xs, fit_upper)
+        ymean = mean1 + bmean.item() * (xmean - mean0)
+        constrained = (ymin, ymean, ymax)
+        ymin, ymax = mean1 + bmean * (np.array(observations) - mean0)
+        alternative = (ymin, ymean, ymax)  # no regression uncertainty
     return observations, alternative, constrained
 
 

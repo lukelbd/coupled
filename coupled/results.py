@@ -64,7 +64,7 @@ MODELS_SKIP = (
 # climate average; the pre-industrial climate average is always over the full 150 years.
 VERSION_LEVELS = (
     'source',
-    'statistic',
+    'style',
     'region',
     'start',  # iniital year of regression or 'forced' climate average
     'stop',  # final year of regression or 'forced' climate average
@@ -1246,7 +1246,7 @@ def feedback_datasets(
     nodrift = nodrift and '-nodrift' or ''
     scale = 2.0 if quadruple else 1.0  # TODO: possibly change convention
     datasets = {}
-    print(f'Feedback files: <source>-<statistic>{nodrift}')
+    print(f'Feedback files: <source>-<style>{nodrift}')
     print(f'Number of feedback file groups: {len(database)}.')
     if database:
         print('Model:', end=' ')
@@ -1270,7 +1270,7 @@ def feedback_datasets(
         for path in paths:
             # Load file
             *_, indicator, suffix = path.stem.split('_')
-            start, stop, source, statistic, *_ = suffix.split('-')  # ignore -nodrift
+            start, stop, source, style, *_ = suffix.split('-')  # ignore -nodrift
             start, stop = map(int, (start, stop))
             if sources and source not in sources:
                 continue
@@ -1292,7 +1292,7 @@ def feedback_datasets(
                 region = 'point' if indicator.split('-')[1] == 'local' else 'globe'
                 if not point and region == 'point':
                     continue
-                versions[source, statistic, region, start, stop] = dataset
+                versions[source, style, region, start, stop] = dataset
             else:
                 for region in dataset.region.values:  # includes pbot and ptop
                     sel = dataset.sel(region=region, drop=True)
@@ -1302,7 +1302,7 @@ def feedback_datasets(
                         continue
                     if not hemisphere and region == 'hemisphere':
                         continue
-                    versions[source, statistic, region, start, stop] = sel
+                    versions[source, style, region, start, stop] = sel
             del dataset
 
         # Concatenate the data
@@ -1311,16 +1311,16 @@ def feedback_datasets(
         # changed between running feedback calculations on different models.
         concat, noncat = {}, {}
         for key, dataset in versions.items():
-            names = ('pbot', 'ptop')
+            noncats = ('pbot', 'ptop')
             dataset = _update_feedback_attrs(dataset, **kw_both, **kw_periods)
             dataset = _update_feedback_terms(dataset, **kw_both, **kw_terms)
-            for name in names:
+            for name in noncats:
                 if name in dataset:
                     data = dataset[name]
                     if 'plev' in data.dims:  # error in _fluxes_from_anomalies
                         data = data.isel(plev=0, drop=True)
                     noncat[name] = data.expand_dims('version')
-            drop = set(names) & dataset.keys()
+            drop = set(noncats) & dataset.keys()
             dataset = dataset.drop_vars(drop)
             concat[key] = dataset
         index = xr.DataArray(
@@ -1336,12 +1336,24 @@ def feedback_datasets(
             compat='override',
             combine_attrs='override',
         )
-        # TODO: Work around xarray error.
-        # for key, array in noncat.items():
-        #     dataset[key] = array
+
+        # Final changes
+        # TODO: Work around xarray error addding 'non-concatenated' variables
+        # for top and bottom of kernel integration terms.
+        # TODO: Support subtracting global anomaly within get_data() by adding a suffix
+        # to the variable string? Could also try to use existing operation system but
+        # gets tricky with e.g. regressions of global anomalies.
         dataset = dataset.squeeze()
         if standardize:
             dataset = _standardize_order(dataset)
+        # for key, array in noncat.items():
+        #     dataset[key] = array
+        if 'tstd' in dataset:
+            data = dataset['tstd']
+            anom = data - data.climo.add_cell_measures().climo.average('area')
+            attrs = dict(units='K', standard_units='K', short_name='warming', long_name='relative warming')  # noqa: E501
+            anom.attrs.update(attrs)
+            dataset['tdev'] = anom  # helper derived variable
         datasets[group] = dataset
 
     if datasets:
@@ -1393,7 +1405,7 @@ def feedback_datasets_json(
     for file in sorted(file for path in paths for file in path.glob('cmip*.json')):
         source = file.stem.split('_')[1]
         print(f'External file: {file.name}')
-        index = (source, 'slope', 'globe', 0, 150)
+        index = (source, 'annual', 'globe', 0, 150)
         index = xr.DataArray(
             pd.MultiIndex.from_tuples([index], names=VERSION_LEVELS),
             dims='version',
@@ -1486,7 +1498,7 @@ def feedback_datasets_text(
         if source == 'zelinka':
             continue
         print(f'External file: {file.name}')
-        index = (source, 'slope', 'globe', 0, 150)
+        index = (source, 'annual', 'globe', 0, 150)
         index = xr.DataArray(
             pd.MultiIndex.from_tuples([index], names=VERSION_LEVELS),
             dims='version',

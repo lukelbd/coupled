@@ -664,7 +664,7 @@ def _auto_props(data, kw_collection):
     alpha, alphas, fades = projs, {5: 0.3}, {False: 0.85, True: 1}  # use fading
     if len(set(perturbs)) != 1 or len(set(periods)) != 1:
         perturbs = perturbs * (len(periods) if len(perturbs) == 1 else 1)
-        periods = periods * (len(perturbs) if len(periods) == 1 else 1)
+        # periods = periods * (len(perturbs) if len(periods) == 1 else 1)
         tuples = list(zip(perturbs, *zip(*periods)))
         if multicolor:  # multiple colors for start stop
             color = tuples
@@ -1407,7 +1407,7 @@ def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=
 
 
 def _setup_scatter(
-    ax, data0, data1, collection=None, oneone=False, linefit=False, annotate=False, constraint=None, graphical=False,  # noqa: E501
+    ax, data0, data1, collection=None, zeros=False, oneone=False, linefit=False, annotate=False, constraint=None, graphical=False,  # noqa: E501
 ):
     """
     Adjust and optionally add content to scatter plots.
@@ -1423,8 +1423,10 @@ def _setup_scatter(
 
     Other Parameters
     ----------------
+    zeros : bool, optional
+        Whether to add dotted lines on zeros.
     oneone : bool, optional
-        Whether to add a one-one line.
+        Whether to add a one-one dotted line.
     linefit : bool, optional
         Whether to add a least-squares fit line.
     annotate : bool, optional
@@ -1437,7 +1439,12 @@ def _setup_scatter(
     # Add reference one:one line
     # NOTE: This also disables autoscaling so that line always looks like a diagonal
     # drawn right across the axes. Also requires same units on x and y axis.
+    if zeros:
+        style = dict(color='k', lw=1 * pplt.rc.metawidth)
+        ax.axhline(0, alpha=0.1, zorder=0, **style)
+        ax.axvline(0, alpha=0.1, zorder=0, **style)
     if oneone:
+        style = dict(color='k', dashes=(1, 3), lw=pplt.rc.metawidth)
         units0 = data0.climo.units
         units1 = data1.climo.units
         if units0 == units1:
@@ -1448,14 +1455,14 @@ def _setup_scatter(
             ones = (avg - 1e3 * span, avg + 1e3 * span)
             # ax.format(xlim=lim, ylim=lim)  # autoscale disabled
             # ax.plot(ones, ones, color='k', dashes=(1, 3), lw=pplt.rc.metawidth, scalex=0, scaley=0)  # noqa: E501
-            ax.add_artist(mlines.Line2D(ones, ones, color='k', dashes=(1, 3), lw=pplt.rc.metawidth))  # noqa: E501
+            ax.add_artist(mlines.Line2D(ones, ones, **style))  # noqa: E501
 
     # Add manual regression line
     # NOTE: Here climopy automatically reapplies dataarray coordinates to fit line
     # and lower and upper bounds so do not explicitly need sorted x coordinates.
     if linefit:  # https://en.wikipedia.org/wiki/Simple_linear_regression
         dim = data0.dims[0]  # generally facets dimension
-        slope, _, _, _, rsquare, fit, fit_lower, fit_upper = _components_slope(
+        slope, _, _, rsquare, fit, fit_lower, fit_upper = _components_slope(
             data0, data1, dim=dim, adjust=False, pctile=None,  # use default of 95
         )
         # sign = '\N{MINUS SIGN}' if slope < 0 else ''  # negative r-squared
@@ -2051,7 +2058,7 @@ def create_plot(
                 groups_yunits.setdefault(yunits, []).append(ax)
             if 'scatter' in command:
                 ax.use_sticky_edges = False  # show end of line fit shading
-                keys = ('oneone', 'linefit', 'annotate', 'constraint', 'graphical')
+                keys = ('zeros', 'oneone', 'linefit', 'annotate', 'constraint', 'graphical')  # noqa: E501
                 oneone = oneone or kw_other.get('oneone', False)
                 kw_other = {key: val for key, val in kw_other.items() if key in keys}
                 _setup_scatter(ax, *args, handle, **kw_other)  # 'args' is 2-tuple

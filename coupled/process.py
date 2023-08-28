@@ -34,7 +34,7 @@ GENERAL_DEFAULTS = {
 # Version defaults
 VERSION_DEFAULTS = {
     'source': 'eraint',
-    'statistic': 'slope',
+    'style': 'slope',
     'region': 'globe',
     'start': 0,
     'stop': 150,
@@ -391,7 +391,8 @@ def _constrain_response(
     # their sample sizes are larger (150 years) and uncertainties are unc-rrelated so
     # should roughly cancel out across e.g. 30 members of ensemble.
     N = N or 10000  # samples to draw
-    pctile = 95 if pctile is None else pctile
+    pctile = 90 if pctile is None else pctile
+    # pctile = 95 if pctile is None else pctile
     pctile = 0.5 * (100 - pctile)  # e.g. [90, 50] --> [[5, 25], [95, 75]]
     pctile = np.array([pctile, 100 - pctile])
     # steps = 120  # approximate degrees of freedom in Dessler et al.
@@ -403,7 +404,7 @@ def _constrain_response(
     if data0.ndim != 1 or data1.ndim != 1:
         raise ValueError(f'Invalid data dims {data0.ndim} and {data1.ndim}. Must be 1D.')  # noqa: E501
     xmean, xscale, xdof = FEEDBACK_CONSTRAINTS[constraint]
-    xmin, xmax = stats.t.ppf(0.01 * pctile, scale=xscale, df=xdof)
+    xmin, xmax = stats.t.ppf(0.01 * pctile, loc=xmean, scale=xscale, df=xdof)
     observations = (xmin, xmean, xmax)
     data0 = np.array(data0).squeeze()
     data1 = np.array(data1).squeeze()
@@ -442,7 +443,7 @@ def _constrain_response(
         ymax = np.interp(xmax, xs, fit_upper)
         ymean = mean1 + bmean.item() * (xmean - mean0)
         constrained = (ymin, ymean, ymax)
-        ymin, ymax = mean1 + bmean * (np.array(observations) - mean0)
+        ymin, ymean, ymax = mean1 + bmean * (np.array(observations) - mean0)
         alternative = (ymin, ymean, ymax)  # no regression uncertainty
     return observations, alternative, constrained
 

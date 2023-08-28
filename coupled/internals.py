@@ -57,7 +57,7 @@ DETECT_AXES = (
     'x', 'y', 'lon', 'lat', 'abc', 'title', 'proj', 'land', 'coast', 'rc', 'margin',
 )
 DETECT_OTHER = (
-    'hori', 'pcolor', 'cycle', 'multi', 'one', 'line', 'const', 'graph', 'offset', 'annot', 'corr', 'inter',  # noqa: E501
+    'hori', 'pcolor', 'cycle', 'multi', 'zero', 'one', 'line', 'const', 'graph', 'offset', 'annot', 'corr', 'inter',  # noqa: E501
 )
 DETECT_ATTRS = (
     'short', 'long', 'standard', 'units',
@@ -85,7 +85,7 @@ ORDER_LOGICAL = (
     'ensemble',
     'version',  # feedback version index
     'source',
-    'statistic',
+    'style',
     'region',
     'startstop',
     'start',
@@ -119,7 +119,7 @@ ORDER_READABLE = (
     'ensemble',  # remaining facets
     'experiment',
     'region',  # feedback version index
-    'statistic',
+    'style',
     'source',
     'version',
     'name',
@@ -536,7 +536,9 @@ def _get_label(dataset, key, value, mode=None, name=None):
                 label = 'unperturbed'
             if version and mode != 'path' and part == 'abrupt4xco2':
                 label = 'perturbed'
-            if isinstance(label, tuple):  # i.e. 'startstop' without shorthand
+            if isinstance(label, tuple) and any(_ is None for _ in label):
+                label = ''
+            elif isinstance(label, tuple):  # i.e. 'startstop' without shorthand
                 label = '-'.join(format(lab, 's' if isinstance(lab, str) else '04.0f') for lab in label)  # noqa: E501
         else:
             unit = get_data(dataset, key, 'units')
@@ -751,7 +753,7 @@ def _infer_path(dataset, *kws_process):
     kws_process = [kw.copy() for kws in kws_process for kw in kws]
     labels = []
     defaults = {'project': 'cmip', 'ensemble': 'flagship', 'period': 'ann'}
-    defaults.update({'source': 'eraint', 'statistic': 'slope', 'region': 'globe'})
+    defaults.update({'source': 'eraint', 'style': 'slope', 'region': 'globe'})
     kws_process = list(map(_group_parts, kws_process))
     for key in ORDER_LOGICAL:
         seen, parts = set(), []

@@ -293,9 +293,7 @@ def _components_corr(data0, data1, dim=None, pctile=None):
     return corr, corr_lower, corr_upper, rsquare
 
 
-def _components_slope(
-    data0, data1, dim=None, adjust=False, pctile=None, use_sigma=False, dof=None,
-):
+def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     """
     Return components of a line fit operation.
 
@@ -309,17 +307,9 @@ def _components_slope(
         The dimension for the regression.
     adjust : bool, optional
         Whether to adjust the slope for autocorrelation effects.
-    use_sigma : bool, optional
-        Whether to use sigma for the lower and upper slope bounds.
-    pctile : float, default: 95
+    pctile : bool or float, default: 95
         The percentile range for the lower and upper uncertainty bounds.
-    dof : int, optional
-        Effective degrees of freedom in the time series.
-
-    Other Parameters
-    ----------------
-    return_sigma : bool, optional
-        Whether to return slope uncertainty bounds or raw standard error.
+        Use ``False`` to instead just show standard error ranges.
 
     Returns
     -------
@@ -340,24 +330,23 @@ def _components_slope(
     data0, data1 = xr.align(data0, data1)
     axis = data0.dims.index(dim)
     idx = np.argsort(data0.values, axis=axis)
-    dof = dof or data0.size - 2  # or reduced uncertainty
     data0 = data0.isel({dim: idx})
     data1 = data1.isel({dim: idx})
-    pctile = 95 if pctile is None else pctile
-    pctile = 0.5 * (100 - np.atleast_1d(pctile))
-    pctile = np.array([pctile, 100 - pctile])  # e.g. [90, 50] --> [[5, 25], [95, 75]]
     slope, sigma, rsquare, fit, fit_lower, fit_upper = linefit(
         data0, data1, dim=dim, adjust=adjust, pctile=pctile,
     )
     fit.coords.update({'x': data0, 'y': data1})
     fit_lower.coords.update({'x': data0, 'y': data1})
     fit_upper.coords.update({'x': data0, 'y': data1})
-    if not use_sigma:  # default behavior
-        dslope_lower, dslope_upper = _get_bounds(sigma, pctile, dof=dof)
+    if pctile is False:  # use standard errors
+        dslope_lower, dslope_upper = -1 * sigma, sigma
+    else:
+        pctile = 95 if pctile is None or pctile is True else pctile
+        pctile = 0.5 * (100 - np.atleast_1d(pctile))
+        pctile = np.array([pctile, 100 - pctile])  # e.g. [90, 50] --> [[5, 25], [95, 75]]  # noqa: E501
+        dslope_lower, dslope_upper = _get_bounds(sigma, pctile, dof=data0.size - 2)
         dslope_lower = xr.DataArray(dslope_lower, dims=('pctile', *sigma.dims))
         dslope_upper = xr.DataArray(dslope_upper, dims=('pctile', *sigma.dims))
-    else:  # e.g. observed gregory regressions
-        dslope_lower, dslope_upper = -1 * sigma, sigma
     slope_lower, slope_upper = slope + dslope_lower, slope + dslope_upper
     return slope, slope_lower, slope_upper, rsquare, fit, fit_lower, fit_upper
 

@@ -320,12 +320,14 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     fit, fit_lower, fit_upper : xarray.DataArray
         The fit to the original points with `pctile` lower and upper bounds.
     """
-    # TODO: Update linefit() to return either slope and fit lower and upper bounds
-    # or just the slope sigma that can be used to calculate other stuff.
-    # TODO: Copy Dessler and Forster methodology for getting effective degrees
-    # of freedom for time series with autocorrelated components.
     # NOTE: Here np.polyfit requires monotonically increasing coordinates. Not sure
     # why... could consider switching to manual slope and stderr calculation.
+    # NOTE: Unlike climopy linefit(), which returns scalar slope standard error and
+    # best fit uncertainty range with *optional* percentile dimension, this returns
+    # slope estimate uncertainty range with *mandatory* percentile dimension and
+    # a single best fit uncertainy range. In this project require former for thin and
+    # thick whiskers on _combine_command() bar plots while a single best fit range
+    # is sufficient for most scatter and regression plots. Should merge with linefit().
     dim = dim or data0.dims[0]
     data0, data1 = xr.align(data0, data1)
     axis = data0.dims.index(dim)
@@ -335,19 +337,19 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     slope, sigma, rsquare, fit, fit_lower, fit_upper = linefit(
         data0, data1, dim=dim, adjust=adjust, pctile=pctile,
     )
-    fit.coords.update({'x': data0, 'y': data1})
-    fit_lower.coords.update({'x': data0, 'y': data1})
-    fit_upper.coords.update({'x': data0, 'y': data1})
+    coords = {'x': data0, 'y': data1}
+    fit.coords.update(coords)
+    fit_lower.coords.update(coords)
+    fit_upper.coords.update(coords)
     if pctile is False:  # use standard errors
-        dslope_lower, dslope_upper = -1 * sigma, sigma
+        slope_lower, slope_upper = slope - sigma, slope + sigma
     else:
         pctile = 95 if pctile is None or pctile is True else pctile
         pctile = 0.5 * (100 - np.atleast_1d(pctile))
         pctile = np.array([pctile, 100 - pctile])  # e.g. [90, 50] --> [[5, 25], [95, 75]]  # noqa: E501
-        dslope_lower, dslope_upper = _get_bounds(sigma, pctile, dof=data0.size - 2)
-        dslope_lower = xr.DataArray(dslope_lower, dims=('pctile', *sigma.dims))
-        dslope_upper = xr.DataArray(dslope_upper, dims=('pctile', *sigma.dims))
-    slope_lower, slope_upper = slope + dslope_lower, slope + dslope_upper
+        sigma_lower, sigma_upper = _get_bounds(sigma, pctile, dof=data0.size - 2)
+        slope_lower = slope + xr.DataArray(sigma_lower, dims=('pctile', *sigma.dims))
+        slope_upper = slope + xr.DataArray(sigma_upper, dims=('pctile', *sigma.dims))
     return slope, slope_lower, slope_upper, rsquare, fit, fit_lower, fit_upper
 
 
@@ -947,7 +949,7 @@ def apply_reduce(data, attrs=None, **kwargs):
         elif isinstance(time, str) and time != 'avg':
             time = cftime.datetime.strptime(time, '%Y-%m-%d')  # cftime 1.6.2
             data = data.sel(time=time, method='nearest')
-        elif not isinstance(time, str) and time is not None:
+        elif not isinstance(time, str) and time is not None and time is not False:
             time = time  # should already be datetime
             data = data.sel(time=time, method='nearest')
     if 'time' in data.dims and time == 'avg':  # manual weighted average

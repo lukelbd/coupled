@@ -331,9 +331,8 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     dim = dim or data0.dims[0]
     data0, data1 = xr.align(data0, data1)
     axis = data0.dims.index(dim)
-    idx = np.argsort(data0.values, axis=axis)
-    data0 = data0.isel({dim: idx})
-    data1 = data1.isel({dim: idx})
+    isel = {dim: np.argsort(data0.values, axis=axis)}
+    data0, data1 = data0.isel(isel), data1.isel(isel)
     slope, sigma, rsquare, fit, fit_lower, fit_upper = linefit(
         data0, data1, dim=dim, adjust=adjust, pctile=pctile,
     )
@@ -952,16 +951,13 @@ def apply_reduce(data, attrs=None, **kwargs):
         elif not isinstance(time, str) and time is not None and time is not False:
             time = time  # should already be datetime
             data = data.sel(time=time, method='nearest')
-    if 'time' in data.dims and time == 'avg':  # manual weighted average
-        days = data.time.dt.days_in_month
+    if 'time' in data.dims and time == 'avg':  # annual average all months
+        days = data.time.dt.days_in_month.astype(data.dtype)
         wgts = days.groupby('time.year') / days.groupby('time.year').sum()
-        wgts = wgts.astype(np.float32)  # preserve float32 variables
-        ones = xr.where(data.isnull(), 0, 1)
-        ones = ones.astype(np.float32)  # preserve float32 variables
         with xr.set_options(keep_attrs=True):
-            numerator = (data * wgts).groupby('time.year').sum(dim='time')
-            denominator = (ones * wgts).groupby('time.year').sum(dim='time')
-            data = numerator / denominator
+            data = (data * wgts).groupby('time.year').sum('time', skipna=False)
+        if 'year' in data.sizes:  # always
+            data = data.mean('year', skipna=True, keep_attrs=True)  # possibly no-op
 
     # Iterate over data arrays
     # TODO: Also support operations directly on arrays

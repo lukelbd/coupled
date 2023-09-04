@@ -66,7 +66,7 @@ VERSION_LEVELS = (
     'source',
     'style',
     'region',
-    'start',  # iniital year of regression or 'forced' climate average
+    'start',  # initial year of regression or 'forced' climate average
     'stop',  # final year of regression or 'forced' climate average
 )
 

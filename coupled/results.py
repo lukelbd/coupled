@@ -5,6 +5,7 @@ Utilities for loading coupled model output.
 import itertools
 import json
 import re
+import time  # noqa: F401
 from pathlib import Path
 
 import climopy as climo  # noqa: F401  # add accessor
@@ -19,7 +20,7 @@ from icecream import ic  # noqa: F401
 from cmip_data.feedbacks import FEEDBACK_DESCRIPTIONS
 from cmip_data.internals import ENSEMBLES_FLAGSHIP
 from cmip_data.internals import Database, glob_files, _item_dates, _parse_constraints
-from cmip_data.utils import average_periods, load_file
+from cmip_data.utils import assign_dates, load_file
 
 __all__ = [
     'open_dataset',
@@ -40,7 +41,8 @@ REGEX_DIREC = re.compile(r'(upwelling|downwelling|outgoing|incident)')
 REGEX_TRANSPORT = re.compile(r'(mse|total)')
 
 # Keyword arguments
-# NOTE: Shared between functions
+# NOTE: Period keys are outdated, currently only used with previous 'slope'
+# feedback files but for climate data simply load monthly data, average later.
 KEYS_PERIODS = ('annual', 'seasonal', 'monthly')
 KEYS_REGIONS = ('point', 'latitude', 'hemisphere')
 KEYS_RANGES = ('early', 'late', 'historical')
@@ -314,7 +316,7 @@ def _standardize_order(dataset):
     feedbacks = list(itertools.product(parts, fluxes, params))
     feedbacks = list('_'.join(tup).strip('_') for tup in feedbacks)
     # Update insertion order
-    basics = ('ta', 'ts', 'tstd', 'tpat', 'tabs', 'ps', 'psl', 'pbot', 'ptop')
+    basics = ('ta', 'ts', 'tpat', 'tstd', 'tdev', 'tabs', 'ps', 'psl', 'pbot', 'ptop')
     circulation = ('zg', 'ua', 'va', 'uas', 'vas', 'tauu', 'tauv')
     humidity = ('hus', 'hur', 'huss', 'hurs', 'prw', 'cl', 'clt', 'cct')
     surface = ('albedo', 'hfls', 'hfss')
@@ -855,8 +857,8 @@ def _update_feedback_attrs(
                 dataset = dataset.drop_vars(name)
 
     # Other metadata repairs
-    # NOTE: This mimics the behavior of average_periods in climate_datasets
-    # by optionally skipping unneeded periods to save space.
+    # NOTE: This optionally skips unneeded periods to save space. However now simply
+    # load monthly data and take annual averages when needed. Should remove.
     renames = {
         'pbot': ('plev_bot', 'lower'),
         'ptop': ('plev_top', 'upper'),
@@ -929,80 +931,41 @@ def _update_feedback_terms(
     parts_erf : bool, optional
         Whether to include non-net effective radiative forcing components.
     """
-    # Add climate sensitivity estimate
-    # NOTE: Previously computed climate sensitivity 'components' based on individual
-    # effective forcings and feedbacks but interpretation is not useful. Now store
-    # zero sensitivity components and only compute after the fact.
-    check = lambda keys: all(key in dataset for key in keys)
-    scale = '' if quadruple else r'2$\times$CO$_2$ '  # avoid 'abrupt 4xCO2 4xCO2'
-    if 'rfnt_ecs' in dataset and 'lon' not in dataset['rfnt_ecs'].dims:
-        numer = denom = None
-    elif check(numer := ('rfnt_erf',)) and check(denom := ('rfnt_lam',)):
-        pass  # full wavelength
-    elif check(numer := ('rlnt_erf', 'rsnt_erf')) and check(denom := ('rlnt_lam', 'rsnt_lam')):  # noqa: E501
-        pass  # wavelength components
-    else:
-        numer = denom = None
-    if numer and denom and 'rfnt_ecs' not in dataset:
-        with xr.set_options(keep_attrs=True):
-            numer = sum(dataset[key] for key in numer)
-        with xr.set_options(keep_attrs=True):
-            denom = sum(dataset[key] for key in denom)
-        numer = numer.climo.add_cell_measures().climo.average('area')
-        denom = denom.climo.add_cell_measures().climo.average('area')
-        data = -1 * numer / denom
-        data.attrs['units'] = 'K'
-        data.attrs['short_name'] = 'climate sensitivity'
-        data.attrs['long_name'] = f'{scale}effective climate sensitivity'
-        dataset['rfnt_ecs'] = data
-
-    # Update and potentially drop variables
-    # NOTE: Previously full wavelength was included in saved files but newest code only
-    # keeps longwave and shortwave to save storage space. Must test on new files.
-    # NOTE: Below renames 'net' feedback to 'longwave' feedback in case of parts_wav
-    # is `False` so that external sources without partitioning can be used. This is
-    # not needed for component feedbacks; Piers Forster includes 'cre' but we can drop
-    # since also provides 'lwcs' and 'swcs' from which get_data() can derive 'cre', and
-    # Mark Zelinka includes 'lwcld' and 'swcld' components alongside net 'cld'.
+    # Initial stuff
+    # NOTE: Previously full wavelength was included in saved files but newest code
+    # only keeps longwave and shortwave to save storage space. Try to bypass 'full'.
     if parts_relative is None:
         parts_relative = parts_kernels
     if parts_absolute is None:
         parts_absolute = False
     parts_relative = parts_kernels if parts_relative is None else parts_relative
     parts_absolute = False if parts_absolute is None else parts_absolute
-    keep_wav = ('', 'cl')  # keep net all-sky, net clear-sky, cloud kernel wavelengths
-    keys = {'pbot', 'ptop', 'tstd', 'tpat', 'tabs', 'rfnt_ecs'}
-    ignore = ()  # figure out parts to ignore
-    ignore += () if parts_planck or parts_relative else ('pl*',)
-    ignore += () if parts_planck or parts_absolute else ('pl',)
-    ignore += () if parts_relative else ('lr*', 'hur')
-    ignore += () if parts_absolute else ('lr', 'hus')
-    ignore += () if parts_kernels else ('cl', 'alb', 'resid')
-    boundary = boundary or 't'
-    variables = list(dataset.data_vars)
-    for key in variables:  # possibly augmented during iteration
-        if 'ecs' in key and 'lon' in dataset[key].dims:  # ignore outdated values
-            continue
+    parts_keep = ('', 'cl')  # keep net all-sky, clear-sky, cloud kernel wavelengths
+    parts_ignore = () if parts_planck or parts_relative else ('pl*',)
+    parts_ignore += () if parts_planck or parts_absolute else ('pl',)
+    parts_ignore += () if parts_relative else ('lr*', 'hur')
+    parts_ignore += () if parts_absolute else ('lr', 'hus')
+    parts_ignore += () if parts_kernels else ('cl', 'alb', 'resid')
+
+    # Iterate over variables
+    # NOTE: This previously included much more but has mostly been moved to get_data().
+    # Idea is to calculate on-the-fly whenever possible unless the component is almost
+    # never needed on its own (e.g. shortwave component of 'hur', 'pl*', or 'lr*').
+    keys_keep = {'pbot', 'ptop', 'tstd', 'tpat', 'tabs'}
+    boundary = boundary or 't'  # string or tuple
+    variables = list(dataset.data_vars)  # augmented during iteration
+    for key in variables:
+        # Rename longwave to full for special case of external data
+        # NOTE: This is not needed for component feedbacks. Forster includels 'cre'
+        # but we can drop since also provides 'lwcs' and 'swcs' from which get_data()
+        # can derive 'cre' and Zelinka includes 'lwcld' and 'swcld' alongside 'cld'.
         if not (m := REGEX_FLUX.search(key)):
             continue
-        # Add or rename full-wavelength components
-        long = dataset[key].attrs.get('long_name', '')
-        long = long.replace('longwave', '').replace('shortwave', '').replace('  ', ' ')
-        if m.group(1) in ('pl', 'lr', 'alb'):  # rename indicator to 'f' for 'full'
-            full = REGEX_FLUX.sub(r'\1\2f\4\5\6', key)
-            if key in dataset and full not in dataset:
-                dataset = dataset.rename({key: full})
-                dataset[full].attrs['long_name'] = long
-                variables.append(full)  # augment for later iteration
-        if m.group(3) == 'l':  # get 'full' from 'l' and 's' components
-            full = REGEX_FLUX.sub(r'\1\2f\4\5\6', key)
-            short = REGEX_FLUX.sub(r'\1\2s\4\5\6', key)
-            if short in dataset and full not in dataset:
-                with xr.set_options(keep_attrs=True):  # keep units and short_name
-                    dataset[full] = dataset[key] + dataset[short]
-                dataset[full].attrs['long_name'] = long
-                variables.append(full)  # augment for later iteration
-        if 'ecs' not in key and m.group(3) == 'f' and m.group(1) == m.group(6) == '':
+        if 'ecs' in key and ('lon' in dataset[key].dims or 'lat' in dataset[key].dims):
+            continue  # ignore outdated regional breakdowns
+        if 'ecs' in key and (m.group(1) != '' or m.group(6) != '' or m.group(3) != 'f'):
+            continue  # ignore unneeded breakdowns
+        if m.group(3) == 'f' and m.group(1) == m.group(6) == '':
             long = REGEX_FLUX.sub(r'\1\2l\4\5\6', key)
             short = REGEX_FLUX.sub(r'\1\2s\4\5\6', key)
             if not parts_wav and long not in dataset and short not in dataset:
@@ -1010,21 +973,72 @@ def _update_feedback_terms(
                 dataset[short] = xr.zeros_like(dataset[long])
                 variables.extend((long, short))  # augment for later iteration
                 continue
-        # Skip various keys
-        if boundary is not None and m.group(5) not in boundary:
+
+        # Add or rename shortwave and longwave components
+        # WARNING: Critical to rename 'alb' for consistency.
+        # NOTE: Possibly faster to just keep water vapor components instead of
+        # adding them at the start? Idea is to prevent future plotting slowdowns.
+        if m.group(3) != 'f' and m.group(1) in {'pl', 'lr', 'alb'} - {*parts_ignore}:
+            full = REGEX_FLUX.sub(r'\1\2f\4\5\6', key)
+            if key in dataset and full not in dataset:
+                dataset = dataset.rename({key: full})
+                variables.append(full)  # augment for later iteration
+        if not parts_wav and m.group(3) == 'l' and m.group(1) not in (*parts_keep, *parts_ignore):  # noqa: E501
+            full = REGEX_FLUX.sub(r'\1\2f\4\5\6', key)
+            short = REGEX_FLUX.sub(r'\1\2s\4\5\6', key)
+            if short in dataset and full not in dataset:
+                with xr.set_options(keep_attrs=True):  # keep units and short_name
+                    dataset[full] = dataset[key] + dataset[short]
+                long_name = dataset[full].attrs.get('long_name', '')
+                long_name = re.sub(r'(longwave|shortwave)\s*', long_name, '')
+                dataset[full].attrs['long_name'] = long_name
+                variables.append(full)  # augment for later iteration
+
+        # Bypass variables based on user input
+        # NOTE: Effective radiative forcing components can be used to estimate
+        # forcing adjustments (find citation)? However skip by default.
+        if boundary is not None and 'a' not in boundary and m.group(5) not in boundary:
             continue
         if not parts_clear and m.group(6) != '':
             continue
-        if ignore is not None and m.group(1) in ignore:
+        if parts_ignore is not None and m.group(1) in parts_ignore:
             continue
-        if not parts_wav and m.group(3) == 'f' and m.group(1) in keep_wav:
-            continue  # no need to store full wavelength as well
-        if not parts_wav and m.group(3) != 'f' and m.group(1) not in keep_wav:
-            continue
+        if not parts_wav and m.group(3) == 'f' and m.group(1) in parts_keep:
+            continue  # no need to load full wavelength as well
+        if not parts_wav and m.group(3) != 'f' and m.group(1) not in parts_keep:
+            continue  # ignore full wavelength parts
         if not parts_erf and 'erf' in key and m.group(1) != '':
             continue
-        keys.add(key)
-    drop = dataset.data_vars.keys() - keys
+        keys_keep.add(key)
+
+    # Add climate sensitivity estimate
+    # NOTE: Previously computed climate sensitivity 'components' based on individual
+    # effective forcings and feedbacks but interpretation is not useful. Now store
+    # zero sensitivity components and only compute after the fact.
+    numers = [('rfnt_erf',), ('rlnt_erf', 'rsnt_erf'), ()]
+    denoms = [('rfnt_lam',), ('rlnt_lam', 'rsnt_lam'), ()]
+    for numer, denom in zip(numers, denoms):
+        if all(name in dataset for name in (*numer, *denom)):  # noqa: E501
+            break
+    scale = '' if quadruple else r'2$\times$CO$_2$ '  # avoid 'abrupt 4xCO2 4xCO2'
+    attrs = {'units': 'K', 'short_name': 'climate sensitivity'}
+    long_name = f'{scale}effective climate sensitivity'
+    if numer and denom and 'rfnt_ecs' not in dataset:
+        with xr.set_options(keep_attrs=True):
+            numer = sum(dataset[key] for key in numer)
+            denom = sum(dataset[key] for key in denom)
+        if 'lon' in numer.sizes and 'lat' in numer.sizes:
+            numer = numer.climo.add_cell_measures().climo.average('area')
+            denom = denom.climo.add_cell_measures().climo.average('area')
+        if 'time' in numer.sizes and 'time' in denom.sizes:  # average over months
+            wgts = numer.time.dt.days_in_month / numer.time.dt.days_in_month.sum()
+            numer = (numer * wgts).sum('time', skipna=False)
+            denom = (denom * wgts).sum('time', skipna=False)
+        dataset['rfnt_ecs'] = -1 * numer / denom
+        dataset['rfnt_ecs'].attrs.update(attrs)
+
+    # Return filtered dataset
+    drop = dataset.data_vars.keys() - keys_keep - {'rfnt_ecs'}
     drop.update(key for key in dataset if 'cell' in key)
     dataset = dataset.drop_vars(drop)
     return dataset
@@ -1070,7 +1084,6 @@ def climate_datasets(
     kw_transport = {key: constraints.pop(key) for key in KEYS_TRANSPORT if key in constraints}  # noqa: E501
     kw_version = {key: constraints.pop(key) for key in KEYS_VERSION if key in constraints}  # noqa: E501
     kw_moist = {key: constraints.pop(key) for key in KEYS_MOIST if key in constraints}
-    kw_periods = {key: constraints.pop(key) for key in KEYS_PERIODS if key in constraints}  # noqa: E501
     files, *_ = glob_files(*paths, project=constraints.get('project', None))
     constraints.setdefault('table', ['Amon', 'Emon'])
     constraints.setdefault('experiment', ['piControl', 'abrupt4xCO2'])
@@ -1138,10 +1151,9 @@ def climate_datasets(
         # NOTE: Empirical testing revealed limiting integration to troposphere
         # often prevented strong transient heat transport showing up in overturning
         # cells due to aliasing of overemphasized stratospheric geopotential transport.
-        # WARNING: Critical to place average_periods after adjustments so that
-        # time-covariance of surface pressure and near-surface flux terms is
-        # effectively factored in (since average_periods only includes explicit
-        # month-length weights and ignores implicit cell height weights).
+        # WARNING: Critical to place time averaging after transport calculations so that
+        # time-covariance of surface pressure and near-surface flux terms is factored
+        # in (otherwise would need to include cell heights before averaging).
         if 'ps' not in dataset and 'plev' in dataset.coords:
             print('Warning: Surface pressure is unavailable.', end=' ')
         dataset = dataset.climo.add_cell_measures(surface=('ps' in dataset))
@@ -1149,13 +1161,15 @@ def climate_datasets(
         dataset = _update_climate_transport(dataset, **kw_transport, **kw_version)
         dataset = _update_climate_hydrology(dataset, **kw_moist)  # after transport
         dataset = _update_climate_units(dataset)  # after transport
-        if 'time' in dataset:  # TODO: remove this and just keep months
-            dataset = average_periods(dataset, **kw_periods)
-        if 'plev' in dataset:
-            dataset = dataset.sel(plev=slice(None, 7000))
         drop = ['cell_', '_bot', '_top']
         drop = [key for key in dataset.coords if any(o in key for o in drop)]
         dataset = dataset.drop_vars(drop).squeeze()
+        if 'plev' in dataset:
+            dataset = dataset.sel(plev=slice(None, 7000))
+        if 'time' in dataset:
+            with xr.set_options(keep_attrs=True):
+                dataset = dataset.groupby('time.month').mean('time', skipna=True)
+            dataset = assign_dates(dataset, year=1800)  # see also _regress_annual
         if standardize:
             dataset = _standardize_order(dataset)
         datasets[project, model, experiment, ensemble] = dataset
@@ -1197,7 +1211,7 @@ def climate_datasets(
 
 def feedback_datasets(
     *paths,
-    source=None, nodrift=False, quadruple=True, boundary=None, standardize=True,
+    source=None, style=None, nodrift=False, quadruple=True, boundary=None, standardize=True,  # noqa: E501
     point=True, latitude=True, hemisphere=True, early=True, late=True, historical=True,
     **constraints,
 ):
@@ -1210,6 +1224,8 @@ def feedback_datasets(
         The search paths.
     source : str or sequence, optional
         The kernel source(s) to optionally filter.
+    style : str or sequence, optional
+        The feedback style(s) to optionally filter.
     nodrift : bool, optional
         Whether to use drift corrections.
     quadruple : bool, optional
@@ -1242,6 +1258,7 @@ def feedback_datasets(
     files, *_ = glob_files(*paths, project=constraints.get('project', None))
     constraints['variable'] = 'feedbacks'  # TODO: similar for climate_datasets
     database = Database(files, FACETS_LEVELS, flagship_translate=True, **constraints)
+    styles = (style,) if isinstance(style, str) else tuple(style or ())
     sources = (source,) if isinstance(source, str) else tuple(source or ())
     nodrift = nodrift and '-nodrift' or ''
     scale = 2.0 if quadruple else 1.0  # TODO: possibly change convention
@@ -1274,6 +1291,8 @@ def feedback_datasets(
             start, stop = map(int, (start, stop))
             if sources and source not in sources:
                 continue
+            if styles and style not in styles:
+                continue
             if not early and (start, stop) == (0, 20):
                 continue
             if not late and (start, stop) == (20, 150):
@@ -1283,10 +1302,15 @@ def feedback_datasets(
             if outdated := 'local' in indicator or 'global' in indicator:
                 if indicator.split('-')[0] != 'local':  # ignore global vs. global
                     continue
+            t0 = time.time()
             dataset = load_file(path, project=database.project, validate=False)
+            dt, t0 = t0 - time.time(), time.time()
+            print(f'Open time: {dt:= time.time():.2f}')
             for array in dataset.data_vars.values():
                 if '_erf' in array.name or '_ecs' in array.name:
                     array *= scale  # NOTE: array.data *= fails for unloaded data
+            dt, t0 = t0 - time.time(), time.time()
+            print(f'Scale time: {dt:.2f}')
             # Filter and add to dictionary
             if outdated:
                 region = 'point' if indicator.split('-')[1] == 'local' else 'globe'
@@ -1312,8 +1336,17 @@ def feedback_datasets(
         concat, noncat = {}, {}
         for key, dataset in versions.items():
             noncats = ('pbot', 'ptop')
+            dt, t0 = t0 - time.time(), time.time()
             dataset = _update_feedback_attrs(dataset, **kw_both, **kw_periods)
             dataset = _update_feedback_terms(dataset, **kw_both, **kw_terms)
+            dt, t0 = t0 - time.time(), time.time()
+            print(f'Update time: {dt:.2f}')
+            if 'time' in dataset:
+                with xr.set_options(keep_attrs=True):
+                    dataset = dataset.groupby('time.month').mean('time', skipna=True)
+                dataset = assign_dates(dataset, year=1800)
+            dt, t0 = t0 - time.time(), time.time()
+            print(f'Assign time: {dt:.2f}')
             for name in noncats:
                 if name in dataset:
                     data = dataset[name]
@@ -1593,21 +1626,20 @@ def open_dataset(
     # WARNING: Using dataset.update() instead of xr.combine_by_coords() below can
     # result in silently replacing existing data with NaNs (verified with test). The
     # latter is required when adding new 'facets' and 'version' coordinate values.
-    keys_both = ('nodrift', *KEYS_PERIODS)
     keys_climate = ('years', 'anomaly', 'ignore', *KEYS_ENERGY, *KEYS_MOIST, *KEYS_TRANSPORT, *KEYS_VERSION)  # noqa: E501
-    keys_internal = ('source', *KEYS_REGIONS, *KEYS_RANGES)
+    keys_internal = ('source', 'style', *KEYS_REGIONS, *KEYS_RANGES, *KEYS_PERIODS)
     keys_feedback = ('quadruple', 'boundary', *KEYS_FEEDBACKS)
     kw_json = {'nonflag': constraints.pop('nonflag', False)}
     kw_text = {'transient': constraints.pop('transient', False)}
-    kw_both = {k: constraints.pop(k) for k in keys_both if k in constraints}
+    kw_nodrift = {k: constraints.pop(k) for k in ('nodrift',) if k in constraints}
     kw_climate = {k: constraints.pop(k) for k in keys_climate if k in constraints}
     kw_internal = {k: constraints.pop(k) for k in keys_internal if k in constraints}
     kw_feedback = {k: constraints.pop(k) for k in keys_feedback if k in constraints}
     kw_internal = {**kw_internal, **kw_feedback}  # slightly simpler
     dirs_table = ('cmip-tables',)
     dirs_climate = ('cmip-climate',)
-    dirs_feedback = ('cmip-feedbacks', 'historical-feedbacks')
-    bases = ('~/data', '~/scratch2', '~/scratch5')
+    dirs_feedback = ('cmip-feedbacks', 'ceres-feedbacks')
+    bases = ('~/data', '~/scratch')
     datasets = {}
     projects = project.split(',') if isinstance(project, str) else ('cmip5', 'cmip6')
     if feedbacks_json is None:
@@ -1617,8 +1649,8 @@ def open_dataset(
     for project in map(str.upper, projects):
         print(f'Project: {project}')
         for b, function, dirs, kw in (
-            (climate, climate_datasets, dirs_climate, {**kw_climate, **kw_both}),
-            (feedbacks, feedback_datasets, dirs_feedback, {**kw_internal, **kw_both}),
+            (climate, climate_datasets, dirs_climate, {**kw_climate, **kw_nodrift}),
+            (feedbacks, feedback_datasets, dirs_feedback, {**kw_internal, **kw_nodrift}),  # noqa: E501
             (feedbacks_json, feedback_datasets_json, dirs_table, {**kw_json, **kw_feedback}),  # noqa: E501
             (feedbacks_text, feedback_datasets_text, dirs_table, {**kw_text, **kw_feedback}),  # noqa: E501
         ):
@@ -1633,7 +1665,7 @@ def open_dataset(
             kwargs = {**constraints, 'project': project, 'standardize': False, **kw}
             parts = function(*paths, **kwargs)
             for group, data in parts.items():
-                if group in datasets:
+                if group in datasets:  # e.g. combine 'version' coordinates
                     comb = (datasets[group], data)
                     data = xr.combine_by_coords(comb, combine_attrs='override')
                 datasets[group] = data

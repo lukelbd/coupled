@@ -72,6 +72,31 @@ DETECT_LEGEND = (
     'legend', 'order', 'frame', 'handle', 'border', 'column',
 )
 
+# Path naming and reduction defaults
+# NOTE: New format will specify either 'monthly' or 'annual'
+DEFAULTS_PATH = {
+    'project': 'cmip',  # ignore if passed
+    'ensemble': 'flagship',
+    'period': 'ann',
+    'source': 'eraint',
+    'style': 'slope',
+    'region': 'globe',
+}
+DEFAULTS_REDUCE = {
+    'experiment': 'picontrol',
+    'ensemble': 'flagship',
+    'period': 'ann',
+    'time': 'avg',
+}
+DEFAULTS_VERSION = {
+    'experiment': 'abrupt4xco2',
+    'source': 'eraint',
+    'style': 'slope',
+    'region': 'globe',
+    'start': 0,
+    'stop': 150,
+}
+
 # Argument sorting constants
 # NOTE: Use logical top-down order for file naming and reduction instruction order
 # and more complex bottom-up human-readable order for automatic label generation.
@@ -90,9 +115,10 @@ ORDER_LOGICAL = (
     'startstop',
     'start',
     'stop',
-    'month',  # space and time
+    'time',  # space and time
+    'period',
     'season',
-    'period',  # NOTE: this is outdated
+    'month',
     'plev',
     'area',
     'volume',
@@ -413,6 +439,46 @@ def _combine_labels(*labels, identical=False):
     return labels
 
 
+def _create_path(dataset, *kws_process):
+    """
+    Convert reduction operators into path suitable for saving.
+
+    Parameters
+    ----------
+    dataset : xarray.Dataset
+        The source dataset.
+    *kws_process : dict
+        The `process_data` keywords.
+
+    Returns
+    -------
+    path : str
+        The parts joined with underscores and dashes.
+    """
+    # NOTE: This omits keywords that correspond to default values but always
+    # includes experiment because default is ambiguous between variables.
+    kws_process = [(kw,) if isinstance(kw, dict) else tuple(kw) for kw in kws_process]
+    kws_process = [kw.copy() for kws in kws_process for kw in kws]
+    labels = []
+    kws_process = list(map(_group_parts, kws_process))
+    for key in ORDER_LOGICAL:
+        seen, parts = set(), []
+        values = [kw[key] for kw in kws_process if key in kw]
+        values = [value for value in values if value not in seen and not seen.add(value)]  # noqa: E501
+        if len(values) == 1 and values[0] == DEFAULTS_PATH.get(key, None):
+            continue
+        for value in values:  # across all subplots and tuples
+            label = _get_label(dataset, key, value, mode='path')
+            if not label:
+                continue
+            if label not in parts:  # e.g. 'avg' to be ignored
+                parts.append(label)
+        if parts:
+            labels.append(parts)  # sort these so newer orders overwrite
+    result = '_'.join('-'.join(sorted(parts)) for parts in labels)
+    return result
+
+
 def _fit_label(label, fontsize=None, refwidth=None, nmax=None):
     """
     Fit label into given width by replacing spaces with newlines.
@@ -645,6 +711,8 @@ def _infer_labels(
                 name = kw_infer.get('name', None)
                 kw_label, kw_infer = {}, _group_parts(kw_infer)
                 for key, value in kw_infer.items():  # get individual label
+                    if key == 'statistic':  # TODO: remove!
+                        continue
                     if key in KEYS_VARIABLE:  # ignore climo.get() keywords
                         continue
                     if key in KEYS_METHOD or skip_names and key in ('name', 'spatial'):
@@ -729,48 +797,6 @@ def _infer_labels(
         labels.append(label)
 
     return labels[0] if identical else labels
-
-
-def _infer_path(dataset, *kws_process):
-    """
-    Convert reduction operators into path suitable for saving.
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The source dataset.
-    *kws_process : dict
-        The `process_data` keywords.
-
-    Returns
-    -------
-    path : str
-        The parts joined with underscores and dashes.
-    """
-    # NOTE: This omits keywords that correspond to default values but always
-    # includes experiment because default is ambiguous between variables.
-    kws_process = [(kw,) if isinstance(kw, dict) else tuple(kw) for kw in kws_process]
-    kws_process = [kw.copy() for kws in kws_process for kw in kws]
-    labels = []
-    defaults = {'project': 'cmip', 'ensemble': 'flagship', 'period': 'ann'}
-    defaults.update({'source': 'eraint', 'style': 'slope', 'region': 'globe'})
-    kws_process = list(map(_group_parts, kws_process))
-    for key in ORDER_LOGICAL:
-        seen, parts = set(), []
-        values = [kw[key] for kw in kws_process if key in kw]
-        values = [value for value in values if value not in seen and not seen.add(value)]  # noqa: E501
-        if len(values) == 1 and values[0] == defaults.get(key, None):
-            continue
-        for value in values:  # across all subplots and tuples
-            label = _get_label(dataset, key, value, mode='path')
-            if not label:
-                continue
-            if label not in parts:  # e.g. 'avg' to be ignored
-                parts.append(label)
-        if parts:
-            labels.append(parts)  # sort these so newer orders overwrite
-    result = '_'.join('-'.join(sorted(parts)) for parts in labels)
-    return result
 
 
 def get_spec(dataset, spec, **kwargs):
@@ -1080,7 +1106,7 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
         fontsize=pplt.rc.fontlarge
     )
     pathspecs = [dspec for ikws_process in kws_process for dspec in ikws_process]
-    pathlabel = _infer_path(dataset, *pathspecs)
+    pathlabel = _create_path(dataset, *pathspecs)
     fontwidth = pplt.utils._fontsize_to_pt(pplt.rc.fontlarge)  # a-b-c label adjustment
     axeswidth = refwidth - 3 * pplt.units(fontwidth, 'pt', 'in')
     kw_fit = dict(fontsize=fontwidth, refwidth=axeswidth)

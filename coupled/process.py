@@ -17,28 +17,15 @@ from climopy import ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
-from .internals import ALIAS_FEEDBACKS, FEEDBACK_ALIASES, KEYS_METHOD, KEYS_VARIABLE, ORDER_LOGICAL  # noqa: E501
+from .internals import DEFAULTS_REDUCE, DEFAULTS_VERSION, KEYS_METHOD, KEYS_VARIABLE, ORDER_LOGICAL  # noqa: E501
 from .internals import _group_parts, _ungroup_parts, _to_lists
+from .results import ALIAS_FEEDBACKS, FEEDBACK_ALIASES
 from .results import FACETS_LEVELS, REGEX_FLUX, VERSION_LEVELS
 from cmip_data.internals import MODELS_INSTITUTES, INSTITUTES_LABELS
+from cmip_data.feedbacks import FEEDBACK_DEPENDENCIES
 
 __all__ = ['apply_method', 'apply_reduce', 'get_data', 'process_data']
 
-# Reduce defaults
-GENERAL_DEFAULTS = {
-    'period': 'ann',
-    'experiment': 'picontrol',
-    'ensemble': 'flagship',
-}
-
-# Version defaults
-VERSION_DEFAULTS = {
-    'source': 'eraint',
-    'style': 'slope',
-    'region': 'globe',
-    'start': 0,
-    'stop': 150,
-}
 
 # Observational constraints
 # TODO: Auto-generate this dictionary or save and commit then parse a text file.
@@ -935,7 +922,7 @@ def apply_reduce(data, attrs=None, **kwargs):
     # yearly data, but not yet done, so use explicit days-per-month weights for now.
     season = kwargs.pop('season', None)
     month = kwargs.pop('month', None)
-    time = kwargs.pop('time', 'avg')  # same as _apply_single() and climo.reduce()
+    time = kwargs.pop('time', None)  # then get average later on
     if 'time' in data.dims:
         if season is not None:
             seasons = data.time.dt.season.str.lower()
@@ -952,16 +939,6 @@ def apply_reduce(data, attrs=None, **kwargs):
         elif not isinstance(time, str) and time is not None and time is not False:
             time = time  # should already be datetime
             data = data.sel(time=time, method='nearest')
-    if 'time' in data.dims and time == 'avg':  # manual weighted average
-        days = data.time.dt.days_in_month
-        wgts = days.groupby('time.year') / days.groupby('time.year').sum()
-        wgts = wgts.astype(np.float32)  # preserve float32 variables
-        ones = xr.where(data.isnull(), 0, 1)
-        ones = ones.astype(np.float32)  # preserve float32 variables
-        with xr.set_options(keep_attrs=True):
-            numerator = (data * wgts).groupby('time.year').sum(dim='time')
-            denominator = (ones * wgts).groupby('time.year').sum(dim='time')
-            data = numerator / denominator
 
     # Iterate over data arrays
     # TODO: Also support operations directly on arrays
@@ -981,15 +958,15 @@ def apply_reduce(data, attrs=None, **kwargs):
         name = data.name
         attrs = data.attrs.copy()
         attrs.update(attrs or {})
-        defaults = GENERAL_DEFAULTS.copy()
+        defaults = DEFAULTS_REDUCE.copy()
         if 'version' in data.coords:
-            defaults.update({'experiment': 'abrupt4xco2', **VERSION_DEFAULTS})
+            defaults.update(DEFAULTS_VERSION)
         if 'startstop' in kw:  # possibly passed from process_data()
             kw['start'], kw['stop'] = kw.pop('startstop')  # possibly None
         for key, value in defaults.items():  # apply default reductions
-            if key in kw and kw[key] is None:
-                kw[key] = value  # used 'None' as default placeholder
-            else:
+            if key in kw and kw[key] is None and key != 'time':
+                kw[key] = value  # typically use 'None' as default placeholder
+            else:  # for 'time' use 'None' to bypass operation
                 kw.setdefault(key, value)
         if 'version' in data.coords:
             experiment, region, period = kw['experiment'], kw['region'], kw['period']
@@ -1034,6 +1011,14 @@ def apply_reduce(data, attrs=None, **kwargs):
                     value = value.to(unit)
                 else:
                     value = ureg.Quantity(value, unit)
+            if key == 'time' and 'time' in data.sizes:  # manual weighted average
+                if value == 'avg':
+                    days = data.time.dt.days_in_month
+                    with xr.set_options(keep_attrs=True):  # average over entire record
+                        data = (data * days).sum('time', skipna=False) / days.sum()
+                elif value is not None:
+                    raise ValueError(f'Unknown time reduction method {time!r}.')
+                continue
             # Carry out reduction and restore coordinates
             # dimensions = ('lon', 'lat', 'plev', 'area', 'volume')
             # if key in dimensions:
@@ -1211,17 +1196,20 @@ def get_data(dataset, name, attr=None, **kwargs):
             elif net == 'r':  # radiative response e.g. 'rlrt'
                 parts = subs(regex, r'\1\2\3n\5\6', r'\1\2\3n\5\6_erf')
                 data = _operate_data(parts, 'flux', 'response', (1, -1))
-            elif wav == 'f':  # WARNING: critical to put this last!
-                replace = 'net ' if part == '' and sky == '' else ''
-                parts = subs(regex, r'\1\2l\4\5\6', r'\1\2s\4\5\6')
-                data = _operate_data(parts, 'longwave ', replace)
-            elif net == 'n':  # WARNING: only used for ceres currently
+            elif wav == 'f':  # WARNING: critical to add wavelengths last
+                wavs = [
+                    wav[0] for wav, names in FEEDBACK_DEPENDENCIES[part].items()
+                    if names or part in ('', 'cs')
+                ]
+                patterns = [rf'\1\2{wav}\4\5\6' for wav in wavs]
+                search = re.compile('(longwave|shortwave) ')
+                parts = subs(regex, *patterns)
+                data = _operate_data(parts, search, 'net ' if part == sky == '' else '')
+            elif net == 'n':  # WARNING: only used for CERES data currently
                 if wav == 'l' and bnd == 't':
-                    signs = (-1,)
-                    patterns = (r'\1\2\3u\5\6',)
+                    signs, patterns = (-1,), (r'\1\2\3u\5\6',)
                 else:
-                    signs = (1, -1)
-                    patterns = (r'\1\2\3d\5\6', r'\1\2\3u\5\6')
+                    signs, patterns = (1, -1), (r'\1\2\3d\5\6', r'\1\2\3u\5\6')
                 search = re.compile('(upwelling|downwelling|incoming|outgoing)')
                 parts = subs(regex, *patterns)
                 data = _operate_data(parts, search, 'net', signs)

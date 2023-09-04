@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Internal helper utilities used by plotting functions.
+Helper utilities for parsing plotting function input.
 """
 import collections
 import itertools
@@ -39,39 +39,6 @@ REGEX_SPLIT = re.compile(  # ignore e.g. leading positive and negative signs
     r'(?<=[^+./-])([+./-])(?=[^+./-])'
 )
 
-# Prefixes used to detect and segregate keyword arguments
-# NOTE: See plotting.py documentation for various 'other' arguments.
-DETECT_SIDE = (
-    'left', 'right', 'bottom', 'top',
-)
-DETECT_FIG = (
-    'fig', 'dpi', 'ref', 'space', 'share', 'span', 'align', 'inner', 'outer', 'panel', 'tight', *DETECT_SIDE,  # noqa: E501
-)
-DETECT_GRIDSPEC = (
-    'space', 'ratio', 'group', 'equal', 'pad',  # NOTE: cannot use e.g. left=N for now
-)
-DETECT_GRIDSPEC = [
-    f'{s}{prefix}' for prefix in DETECT_GRIDSPEC for s in ('w', 'h', '')
-]
-DETECT_AXES = (
-    'x', 'y', 'lon', 'lat', 'abc', 'title', 'proj', 'land', 'coast', 'rc', 'margin',
-)
-DETECT_OTHER = (
-    'hori', 'pcolor', 'cycle', 'multi', 'zero', 'one', 'line', 'const', 'graph', 'offset', 'annot', 'corr', 'inter',  # noqa: E501
-)
-DETECT_ATTRS = (
-    'short', 'long', 'standard', 'units',
-)
-DETECT_GUIDE = (
-    'loc', 'label', 'align',
-)
-DETECT_COLORBAR = (
-    'colorbar', 'locator', 'formatter', 'tick', 'minor', 'extend', 'length', 'shrink',
-)
-DETECT_LEGEND = (
-    'legend', 'order', 'frame', 'handle', 'border', 'column',
-)
-
 # Path naming and reduction defaults
 # NOTE: New format will specify either 'monthly' or 'annual'
 DEFAULTS_PATH = {
@@ -92,10 +59,38 @@ DEFAULTS_VERSION = {
     'experiment': 'abrupt4xco2',
     'source': 'eraint',
     'style': 'slope',
-    'region': 'globe',
     'start': 0,
     'stop': 150,
+    'region': 'globe',
 }
+
+# Prefixes used to detect and segregate keyword arguments
+# NOTE: See plotting.py documentation for various 'other' arguments.
+# NOTE: Cannot pass e.g. left=N to gridspec for some reason?
+DETECT_FIG = (
+    'fig', 'sup', 'dpi', 'ref', 'share', 'span', 'align',
+    'tight', 'innerpad', 'outerpad', 'panelpad',
+    'left', 'right', 'bottom', 'top',
+)
+DETECT_GRIDSPEC = (
+    'space', 'ratio', 'group', 'equal', 'pad',
+    'wspace', 'wratio', 'wgroup', 'wequal', 'wpad',
+    'hspace', 'hratio', 'hgroup', 'hequal', 'hpad',
+)
+DETECT_AXES = (
+    'x', 'y', 'lon', 'lat', 'grid', 'rotate',
+    'rc', 'proj', 'land', 'ocean', 'coast', 'margin',
+    'abc', 'title', 'ltitle', 'ctitle', 'rtitle',
+)
+DETECT_OTHER = (
+    'cycle', 'horizontal', 'offset', 'intersect', 'correlation',  # _combine
+    'zeros', 'oneone', 'linefit', 'annotate', 'constraint', 'graphical',  # _scatter
+    'multicolor', 'pcolor',  # _auto_props
+)
+DETECT_ATTRIBUTES = ('short_name', 'long_name', 'standard_name', 'units')
+DETECT_COLORBAR = ('locator', 'formatter', 'tick', 'minor', 'extend', 'length', 'shrink')  # noqa: E501
+DETECT_LEGEND = ('order', 'frame', 'handle', 'border', 'column')
+DETECT_GUIDE = ('loc', 'location', 'label', 'align')
 
 # Argument sorting constants
 # NOTE: Use logical top-down order for file naming and reduction instruction order
@@ -111,10 +106,10 @@ ORDER_LOGICAL = (
     'version',  # feedback version index
     'source',
     'style',
-    'region',
     'startstop',
     'start',
     'stop',
+    'region',
     'time',  # space and time
     'period',
     'season',
@@ -173,10 +168,12 @@ TRANSLATE_PATHS = {
     ('experiment', 'picontrol'): 'pictl',
     ('experiment', 'abrupt4xco2'): '4xco2',
     ('startstop', (0, 150)): 'full',
-    ('startstop', (0, 50)): 'start',  # NOTE: used as 'historical' analogue in lit
-    ('startstop', (100, 150)): 'end',  # NOTE: used as 'historical' analogue in lit
     ('startstop', (0, 20)): 'early',
     ('startstop', (20, 150)): 'late',
+    ('startstop', (0, 50)): 'early50',  # NOTE: used as 'historical' analogue in lit
+    ('startstop', (100, 150)): 'late50',  # NOTE: used as 'historical' analogue in lit
+    ('startstop', (1, 20)): 'early1',
+    ('startstop', (2, 20)): 'early2',
 }
 TRANSLATE_LABELS = {
     ('lat', 'absmin'): 'minimum',
@@ -867,11 +864,11 @@ def get_spec(dataset, spec, **kwargs):
             kw_axes[key] = value
         elif any(key.startswith(prefix) for prefix in DETECT_OTHER):
             kw_other[key] = value
-        elif any(key.startswith(prefix) for prefix in DETECT_ATTRS):
+        elif any(key.startswith(prefix) for prefix in DETECT_ATTRIBUTES):
             kw_attrs[key] = value
-        elif any(key.startswith(prefix) for prefix in DETECT_COLORBAR):
+        elif any(key.startswith(prefix) for prefix in ('colorbar', *DETECT_COLORBAR)):
             kw_colorbar[key] = value
-        elif any(key.startswith(prefix) for prefix in DETECT_LEGEND):
+        elif any(key.startswith(prefix) for prefix in ('legend', *DETECT_LEGEND)):
             kw_legend[key] = value
         elif any(key.startswith(prefix) for prefix in DETECT_GUIDE):
             kw_colorbar[key] = kw_legend[key] = value  # shared keywords

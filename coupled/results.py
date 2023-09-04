@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Utilities for loading coupled model output.
+Data utilities for loading coupled model output.
 """
 import itertools
 import json
@@ -1302,15 +1302,7 @@ def feedback_datasets(
             if outdated := 'local' in indicator or 'global' in indicator:
                 if indicator.split('-')[0] != 'local':  # ignore global vs. global
                     continue
-            t0 = time.time()
             dataset = load_file(path, project=database.project, validate=False)
-            dt, t0 = t0 - time.time(), time.time()
-            print(f'Open time: {dt:= time.time():.2f}')
-            for array in dataset.data_vars.values():
-                if '_erf' in array.name or '_ecs' in array.name:
-                    array *= scale  # NOTE: array.data *= fails for unloaded data
-            dt, t0 = t0 - time.time(), time.time()
-            print(f'Scale time: {dt:.2f}')
             # Filter and add to dictionary
             if outdated:
                 region = 'point' if indicator.split('-')[1] == 'local' else 'globe'
@@ -1319,40 +1311,37 @@ def feedback_datasets(
                 versions[source, style, region, start, stop] = dataset
             else:
                 for region in dataset.region.values:  # includes pbot and ptop
-                    sel = dataset.sel(region=region, drop=True)
                     if not point and region == 'point':
                         continue
                     if not latitude and region == 'latitude':
                         continue
                     if not hemisphere and region == 'hemisphere':
                         continue
-                    versions[source, style, region, start, stop] = sel
+                    slice_ = dataset.sel(region=region, drop=True)
+                    versions[source, style, region, start, stop] = slice_
             del dataset
 
-        # Concatenate the data
+        # Standardize and concatenate the data
         # NOTE: Concatenation automatically broadcasts global feedbacks across lons and
         # lats. Also critical to use 'override' for combine_attrs in case conventions
         # changed between running feedback calculations on different models.
         concat, noncat = {}, {}
         for key, dataset in versions.items():
-            noncats = ('pbot', 'ptop')
-            dt, t0 = t0 - time.time(), time.time()
+            noncats = {name: dataset[name] for name in ('pbot', 'ptop') if name in dataset}  # noqa: E501
             dataset = _update_feedback_attrs(dataset, **kw_both, **kw_periods)
             dataset = _update_feedback_terms(dataset, **kw_both, **kw_terms)
-            dt, t0 = t0 - time.time(), time.time()
-            print(f'Update time: {dt:.2f}')
-            if 'time' in dataset:
-                with xr.set_options(keep_attrs=True):
-                    dataset = dataset.groupby('time.month').mean('time', skipna=True)
+            for array in dataset.data_vars.values():
+                if '_erf' in array.name or '_ecs' in array.name:
+                    array *= scale  # NOTE: array.data *= fails for unloaded data
+            for name, data in noncats.items():
+                if 'plev' in data.dims:  # error in _fluxes_from_anomalies
+                    data = data.isel(plev=0, drop=True)
+                noncat[name] = data.expand_dims('version')
+            if 'time' in dataset.sizes:
+                if dataset.time.size > 12:
+                    with xr.set_options(keep_attrs=True):
+                        dataset = dataset.groupby('time.month').mean('time', skipna=True)  # noqa: E501
                 dataset = assign_dates(dataset, year=1800)
-            dt, t0 = t0 - time.time(), time.time()
-            print(f'Assign time: {dt:.2f}')
-            for name in noncats:
-                if name in dataset:
-                    data = dataset[name]
-                    if 'plev' in data.dims:  # error in _fluxes_from_anomalies
-                        data = data.isel(plev=0, drop=True)
-                    noncat[name] = data.expand_dims('version')
             drop = set(noncats) & dataset.keys()
             dataset = dataset.drop_vars(drop)
             concat[key] = dataset
@@ -1369,6 +1358,8 @@ def feedback_datasets(
             compat='override',
             combine_attrs='override',
         )
+        # dt, t0 = time.time() - t0, time.time()
+        # print(f'Concatenate time: {dt:.2f}')
 
         # Final changes
         # TODO: Work around xarray error addding 'non-concatenated' variables

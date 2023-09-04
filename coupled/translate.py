@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Helper functions for translating figure specifications.
+Helper utilities for parsing template function input.
 """
 import itertools
 

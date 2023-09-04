@@ -594,6 +594,13 @@ def _auto_props(data, kw_collection):
     kw_collection : namedtuple
         Inpute keyword arguments.
 
+    Other Parameters
+    ----------------
+    multicolor : bool, optional
+        Whether to use colors instead of alpha for projects (taken from `.other`).
+    cycle : cycle-spec, optional
+        The manual color cycle (taken from `.other`).
+
     Returns
     -------
     colors : list
@@ -718,14 +725,10 @@ def _auto_command(args, kw_collection, violin=True, shading=True, contour=None):
 
     Other Parameters
     ----------------
-    multicolor : bool, optional
-        Whether to use colors instead of alpha for projects (taken from `.other`).
     horizontal : bool, optional
         Whether to use vertical or horizontal orientation (taken from `.other`).
     pcolor : bool, optional
         Whether to use `pcolormesh` for 2D shaded plot (taken from `.other`).
-    cycle : cycle-spec, optional
-        The manual color cycle (taken from `.other`).
 
     Results
     -------

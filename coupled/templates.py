@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Helper functions for creating figures from some generalized templates.
+Template functions for generating complex plots.
 """
 from pathlib import Path
 
@@ -38,7 +38,48 @@ KEYS_EITHER = (  # used in constraint_rows()
 )
 
 
-def _bar_size(refsize=None, project=None, institute=None, **kwargs):
+def _constraint_props(method=None):
+    """
+    Generate hatches and levels suitable for indicating significant
+    correlation coefficients or variance explained proportions.
+
+    Parameters
+    ----------
+    method : bool
+        The method to use for shading.
+
+    Returns
+    -------
+    label : str
+        The constraint label.
+    methods : tuple
+        The filled contour and hatching methods.
+    hatches, levels : list
+        The hatching instructions and associated level boundaries.
+    """
+    method = method or 'slope'
+    check, *options = method.split('_')
+    if check in ('proj', 'norm'):  # TODO: merge with constraint 'pairs'
+        label = 'Projection'
+        methods = (method, 'corr')
+        # label = 'Correlation'
+        # methods = ('corr', 'corr')
+        hatches = ['.....', '...', None, '...', '.....']
+        levels = [-10, -0.8, -0.5, 0.5, 0.8, 10]
+        # levels = [-10, -0.66, -0.33, 0.33, 0.66, 10]
+    elif check in ('corr', 'rsq', 'slope', 'var', 'std'):
+        label = 'Regression'
+        methods = (method, 'rsq')
+        # label = 'Correlation'
+        # methods = ('corr', 'rsq')
+        hatches = [None, '...', '.....']
+        levels = [0, 33.333, 66.666, 1000]
+    else:
+        raise RuntimeError
+    return label, methods, hatches, levels
+
+
+def _default_size(refsize=None, project=None, institute=None, **kwargs):
     """
     Generate appropriate scale for bar-type feedback subplots so that
     annotations can be shown without overlapping.
@@ -81,50 +122,7 @@ def _bar_size(refsize=None, project=None, institute=None, **kwargs):
     return refsize, altsize
 
 
-def _constraint_props(method=None):
-    """
-    Generate hatches and levels suitable for indicating significant
-    correlation coefficients or variance explained proportions.
-
-    Parameters
-    ----------
-    method : bool
-        The method to use for shading.
-
-    Returns
-    -------
-    label : str
-        The constraint label.
-    methods : tuple
-        The filled contour and hatching methods.
-    hatches : list
-        The hatching instructions for significance indicators.
-    levels : list
-        The level boundaries for hatching instructions.
-    """
-    method = method or 'slope'
-    check, *options = method.split('_')
-    if check in ('proj', 'norm'):  # TODO: merge with constraint 'pairs'
-        label = 'Projection'
-        methods = (method, 'corr')
-        # label = 'Correlation'
-        # methods = ('corr', 'corr')
-        hatches = ['.....', '...', None, '...', '.....']
-        levels = [-10, -0.8, -0.5, 0.5, 0.8, 10]
-        # levels = [-10, -0.66, -0.33, 0.33, 0.66, 10]
-    elif check in ('corr', 'rsq', 'slope', 'var', 'std'):
-        label = 'Regression'
-        methods = (method, 'rsq')
-        # label = 'Correlation'
-        # methods = ('corr', 'rsq')
-        hatches = [None, '...', '.....']
-        levels = [0, 33.333, 66.666, 1000]
-    else:
-        raise RuntimeError
-    return label, methods, hatches, levels
-
-
-def _update_warming(dataset, source='~/scratch/cmip-processed'):
+def _scale_warming(dataset, source='~/scratch/cmip-processed'):
     """
     Update with ad hoc scaled warming projection terms. In future should
     be stored in feedback files with regression warming patterns.
@@ -139,7 +137,6 @@ def _update_warming(dataset, source='~/scratch/cmip-processed'):
     dataset : xarray.Dataset
         The updated dataset.
     """
-    # TODO: Remove this once transition to 'annual' files is complete.
     # NOTE: Tried scaling with feedback to get 'absolute' climate sensitivity implied
     # by feedback but unperturbed can be very small! So now use vector projections.
     # tpar = (1 + dataset['tpat']) / dataset['rfnt_lam'].climo.average('area')
@@ -252,7 +249,7 @@ def general_subplots(data, forward=True, save=True, **kwargs):
             project = projects.pop() if len(projects) == 1 else None
             institute = institutes.pop() if len(institutes) == 1 else None
             kw_size = {**kwargs, 'project': project, 'institute': institute}
-            refsize, altsize = _bar_size(**kw_size)
+            refsize, altsize = _default_size(**kw_size)
             defaults.update(refheight=refsize, refwidth=altsize, annotate=True)
         rspecs = []
         kwargs = {**defaults, **kwargs}

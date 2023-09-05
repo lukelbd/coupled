@@ -43,21 +43,19 @@ for path in sys.argv[1:]:
         ]
 
         # Update the path
+        ridx = ridxs[0] if len(ridxs) == 1 else 1  # always true
+        sidx = sidxs[0] if len(sidxs) == 1 else 0
+        difference = ridx - sidx
         if len(ridxs) > 1:
             warnings.warn(f'File {previous.name!r} has ambiguous regions.')
         if len(sidxs) > 1:
             warnings.warn(f'File {previous.name!r} has ambiguous periods.')
-        if groups == original and (len(ridxs) != 1 or len(sidxs) != 1):
-            continue  # no rearrangement necessary
-        ridx = ridxs[0] if len(ridxs) == 1 else 1  # always true
-        sidx = sidxs[0] if len(sidxs) == 1 else 0
-        difference = ridx - sidx
-        if abs(difference) != 1:
+        if abs(difference) != 1 and len(sidxs) == len(ridxs):
             warnings.warn(  # should equal 1, fix if equals -1
                 f'File {previous.name!r} has unexpected region and period '
                 f'positions {ridx} and {sidx}. Should be only one apart.'
             )
-        if difference == -1 and len(sidxs) == 1:
+        if difference == -1 and len(sidxs) == len(ridxs) == 1:
             groups = [*groups[:ridx], groups[sidx], groups[ridx], *groups[sidx + 1:]]
         if groups == original:
             continue

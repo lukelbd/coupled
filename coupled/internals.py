@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Internal helper utilities used by plotting functions.
+Helper utilities for parsing plotting function input.
 """
 import collections
 import itertools
@@ -39,38 +39,58 @@ REGEX_SPLIT = re.compile(  # ignore e.g. leading positive and negative signs
     r'(?<=[^+./-])([+./-])(?=[^+./-])'
 )
 
+# Path naming and reduction defaults
+# NOTE: New format will specify either 'monthly' or 'annual'
+DEFAULTS_REDUCE = {
+    'experiment': 'picontrol',
+    'ensemble': 'flagship',
+    'period': 'ann',
+    'time': 'avg',
+}
+DEFAULTS_VERSION = {
+    'experiment': 'abrupt4xco2',
+    'source': 'eraint',
+    'style': 'slope',
+    'start': 0,
+    'stop': 150,
+    'region': 'globe',
+}
+DEFAULTS_PATH = {
+    'project': 'cmip',  # ignore if passed
+    'ensemble': 'flagship',
+    'period': 'ann',
+    'source': 'eraint',
+    'style': 'slope',
+    'region': 'globe',
+}
+
 # Prefixes used to detect and segregate keyword arguments
 # NOTE: See plotting.py documentation for various 'other' arguments.
-DETECT_SIDE = (
+# NOTE: Cannot pass e.g. left=N to gridspec for some reason?
+DETECT_FIG = (
+    'fig', 'sup', 'dpi', 'ref', 'share', 'span', 'align',
+    'tight', 'innerpad', 'outerpad', 'panelpad',
     'left', 'right', 'bottom', 'top',
 )
-DETECT_FIG = (
-    'fig', 'dpi', 'ref', 'space', 'share', 'span', 'align', 'inner', 'outer', 'panel', 'tight', *DETECT_SIDE,  # noqa: E501
-)
 DETECT_GRIDSPEC = (
-    'space', 'ratio', 'group', 'equal', 'pad',  # NOTE: cannot use e.g. left=N for now
+    'space', 'ratio', 'group', 'equal', 'pad',
+    'wspace', 'wratio', 'wgroup', 'wequal', 'wpad',
+    'hspace', 'hratio', 'hgroup', 'hequal', 'hpad',
 )
-DETECT_GRIDSPEC = [
-    f'{s}{prefix}' for prefix in DETECT_GRIDSPEC for s in ('w', 'h', '')
-]
 DETECT_AXES = (
-    'x', 'y', 'lon', 'lat', 'abc', 'title', 'proj', 'land', 'coast', 'rc', 'margin',
+    'x', 'y', 'lon', 'lat', 'grid', 'rotate',
+    'rc', 'proj', 'land', 'ocean', 'coast', 'margin',
+    'abc', 'title', 'ltitle', 'ctitle', 'rtitle',
 )
 DETECT_OTHER = (
-    'hori', 'pcolor', 'cycle', 'multi', 'zero', 'one', 'line', 'const', 'graph', 'offset', 'annot', 'corr', 'inter',  # noqa: E501
+    'cycle', 'horizontal', 'offset', 'intersect', 'correlation',  # _combine
+    'zeros', 'oneone', 'linefit', 'annotate', 'constraint', 'graphical',  # _scatter
+    'multicolor', 'pcolor',  # _auto_props
 )
-DETECT_ATTRS = (
-    'short', 'long', 'standard', 'units',
-)
-DETECT_GUIDE = (
-    'loc', 'label', 'align',
-)
-DETECT_COLORBAR = (
-    'colorbar', 'locator', 'formatter', 'tick', 'minor', 'extend', 'length', 'shrink',
-)
-DETECT_LEGEND = (
-    'legend', 'order', 'frame', 'handle', 'border', 'column',
-)
+DETECT_ATTRIBUTES = ('short_name', 'long_name', 'standard_name', 'units')
+DETECT_COLORBAR = ('locator', 'formatter', 'tick', 'minor', 'extend', 'length', 'shrink')  # noqa: E501
+DETECT_LEGEND = ('order', 'frame', 'handle', 'border', 'column')
+DETECT_GUIDE = ('loc', 'location', 'label', 'align')
 
 # Argument sorting constants
 # NOTE: Use logical top-down order for file naming and reduction instruction order
@@ -86,13 +106,14 @@ ORDER_LOGICAL = (
     'version',  # feedback version index
     'source',
     'style',
-    'region',
     'startstop',
     'start',
     'stop',
-    'month',  # space and time
+    'region',  # special coordinates
+    'period',
     'season',
-    'period',  # NOTE: this is outdated
+    'month',
+    'time',  # space and time
     'plev',
     'area',
     'volume',
@@ -110,6 +131,7 @@ ORDER_READABLE = (
     'area',
     'volume',
     'plev',
+    'time',
     'period',  # NOTE: this is outdated
     'season',
     'month',
@@ -129,34 +151,79 @@ ORDER_READABLE = (
 
 # General translations
 TRANSLATE_PATHS = {
-    ('lat', 'absmin'): 'min',
-    ('lat', 'absmax'): 'max',
-    ('lon', 'int'): None,
-    ('lon', 'avg'): 'avg',  # always report
-    ('area', 'avg'): 'avg',  # always report
-    ('plev', 'avg'): 'avg',  # always report
-    ('region', 'point'): 'pt',
-    ('region', 'latitude'): 'lat',
-    ('region', 'hemisphere'): 'hemi',
-    ('region', 'apoint'): 'apt',
-    ('region', 'alatitude'): 'alat',
-    ('region', 'ahemisphere'): 'ahemi',
     ('institute', 'avg'): 'inst',
     ('institute', 'flagship'): 'flag',
     ('institute', None): 'model',
     ('experiment', 'picontrol'): 'pictl',
     ('experiment', 'abrupt4xco2'): '4xco2',
     ('startstop', (0, 150)): 'full',
-    ('startstop', (0, 50)): 'start',  # NOTE: used as 'historical' analogue in lit
-    ('startstop', (100, 150)): 'end',  # NOTE: used as 'historical' analogue in lit
     ('startstop', (0, 20)): 'early',
     ('startstop', (20, 150)): 'late',
+    ('startstop', (0, 50)): 'early50',  # NOTE: used as 'historical' analogue in lit
+    ('startstop', (100, 150)): 'late50',  # NOTE: used as 'historical' analogue in lit
+    ('startstop', (1, 20)): 'early1',
+    ('startstop', (2, 20)): 'early2',
+    ('region', 'point'): 'loc',
+    ('region', 'latitude'): 'lat',
+    ('region', 'hemisphere'): 'hemi',
+    ('region', 'globe'): 'globe',
+    ('region', 'apoint'): 'apt',
+    ('region', 'alatitude'): 'alat',
+    ('region', 'ahemisphere'): 'ahemi',
+    ('region', 'aglobe'): 'aglobe',
+    ('plev', 'avg'): 'avg',  # always report
+    ('volume', 'avg'): 'avg',  # always report
+    ('area', 'avg'): 'avg',  # always report
+    ('lat', 'absmin'): 'min',
+    ('lat', 'absmax'): 'max',
+    ('lat', 'min'): 'min',
+    ('lat', 'max'): 'max',
+    ('lon', 'int'): None,
+    ('lon', 'avg'): 'avg',  # always report
 }
 TRANSLATE_LABELS = {
-    ('lat', 'absmin'): 'minimum',
-    ('lat', 'absmax'): 'maximum',
-    ('lon', 'int'): None,
-    ('lon', 'avg'): None,
+    ('project', 'cmip'): 'CMIP',
+    ('project', 'cmip5'): 'CMIP5',
+    ('project', 'cmip6'): 'CMIP6',
+    ('project', 'cmip56'): 'matching CMIP5',
+    ('project', 'cmip65'): 'matching CMIP6',
+    ('project', 'cmip55'): 'non-matching CMIP5',
+    ('project', 'cmip66'): 'non-matching CMIP6',
+    ('project', 'cmip655'): 'matching CMIP',  # almost matching
+    ('project', 'cmip6556'): 'matching CMIP',
+    ('project', 'cmip5665'): 'matching CMIP',
+    ('project', 'cmip6655'): 'non-matching CMIP',
+    ('project', 'cmip5566'): 'non-matching CMIP',
+    ('institute', 'avg'): None,
+    ('institute', 'flagship'): None,
+    ('institute', None): None,
+    # ('institute', 'avg'): 'institute',
+    # ('institute', 'flagship'): 'flagship-only',
+    # ('institute', None): 'model',
+    ('experiment', 'picontrol'): 'control',
+    ('experiment', 'abrupt4xco2'): r'4$\times$CO$_2$',
+    # ('source', 'eraint'): 'custom',
+    # ('source', 'zelinka'): 'Zelinka',
+    ('source', 'eraint'): 'Davis et al.',
+    ('source', 'zelinka'): 'Zelinka et al.',
+    ('style', 'slope'): 'annual',
+    ('style', 'annual'): 'annual',
+    ('style', 'monthly'): 'monthly',
+    ('style', 'ratio'): 'ratio-style',
+    ('startstop', (0, 150)): 'full',
+    ('startstop', (0, 50)): 'early',
+    ('startstop', (100, 150)): 'late',
+    ('startstop', (0, 20)): 'early',
+    ('startstop', (20, 150)): 'late',
+    ('region', 'globe'): 'global-$T$',
+    ('region', 'point'): 'local-$T$',
+    ('region', 'latitude'): 'zonal-$T$',
+    ('region', 'hemisphere'): 'hemispheric-$T$',
+    ('spatial', 'slope'): 'spatial regression',  # NOTE: also see _apply_double
+    ('spatial', 'proj'): 'spatial projection',
+    ('spatial', 'corr'): 'spatial correlation',
+    ('spatial', 'cov'): 'spatial covariance',
+    ('spatial', 'rsq'): 'spatial variance explained',
     ('plev', 'int'): None,
     ('plev', 'avg'): 'column',
     ('area', None): 'local',  # NOTE: only used with identical=False
@@ -178,44 +245,12 @@ TRANSLATE_LABELS = {
     ('area', 'ne'): 'northern extratropical',
     ('area', 'sh'): 'southern hemisphere',
     ('area', 'nh'): 'northern hemisphere',
-    ('spatial', 'slope'): 'spatial regression',  # NOTE: also see _apply_double
-    ('spatial', 'proj'): 'spatial projection',
-    ('spatial', 'corr'): 'spatial correlation',
-    ('spatial', 'cov'): 'spatial covariance',
-    ('spatial', 'rsq'): 'spatial variance explained',
-    # ('source', 'eraint'): 'custom',
-    # ('source', 'zelinka'): 'Zelinka',
-    ('source', 'eraint'): 'Davis et al.',
-    ('source', 'zelinka'): 'Zelinka et al.',
-    ('region', 'globe'): 'global-$T$',
-    ('region', 'point'): 'local-$T$',
-    ('region', 'latitude'): 'zonal-$T$',
-    ('region', 'hemisphere'): 'hemispheric-$T$',
-    ('institute', 'avg'): None,
-    ('institute', 'flagship'): None,
-    ('institute', None): None,
-    # ('institute', 'avg'): 'institute',
-    # ('institute', 'flagship'): 'flagship-only',
-    # ('institute', None): 'model',
-    ('project', 'cmip'): 'CMIP',
-    ('project', 'cmip5'): 'CMIP5',
-    ('project', 'cmip6'): 'CMIP6',
-    ('project', 'cmip56'): 'matching CMIP5',
-    ('project', 'cmip65'): 'matching CMIP6',
-    ('project', 'cmip55'): 'non-matching CMIP5',
-    ('project', 'cmip66'): 'non-matching CMIP6',
-    ('project', 'cmip655'): 'matching CMIP',  # almost matching
-    ('project', 'cmip6556'): 'matching CMIP',
-    ('project', 'cmip5665'): 'matching CMIP',
-    ('project', 'cmip6655'): 'non-matching CMIP',
-    ('project', 'cmip5566'): 'non-matching CMIP',
-    ('experiment', 'picontrol'): 'control',
-    ('experiment', 'abrupt4xco2'): r'4$\times$CO$_2$',
-    ('startstop', (0, 150)): 'full',
-    ('startstop', (0, 50)): 'early',
-    ('startstop', (100, 150)): 'late',
-    ('startstop', (0, 20)): 'early',
-    ('startstop', (20, 150)): 'late',
+    ('lat', 'absmin'): 'minimum',
+    ('lat', 'absmax'): 'maximum',
+    ('lat', 'min'): 'minimum',
+    ('lat', 'max'): 'maximum',
+    ('lon', 'int'): None,
+    ('lon', 'avg'): None,
 }
 
 # Time translations
@@ -411,6 +446,46 @@ def _combine_labels(*labels, identical=False):
         else:
             labels = [regex.sub('', label).strip() for label in labels]
     return labels
+
+
+def _create_path(dataset, *kws_process):
+    """
+    Convert reduction operators into path suitable for saving.
+
+    Parameters
+    ----------
+    dataset : xarray.Dataset
+        The source dataset.
+    *kws_process : dict
+        The `process_data` keywords.
+
+    Returns
+    -------
+    path : str
+        The parts joined with underscores and dashes.
+    """
+    # NOTE: This omits keywords that correspond to default values but always
+    # includes experiment because default is ambiguous between variables.
+    kws_process = [(kw,) if isinstance(kw, dict) else tuple(kw) for kw in kws_process]
+    kws_process = [kw.copy() for kws in kws_process for kw in kws]
+    labels = []
+    kws_process = list(map(_group_parts, kws_process))
+    for key in ORDER_LOGICAL:
+        seen, parts = set(), []
+        values = [kw[key] for kw in kws_process if key in kw]
+        values = [value for value in values if value not in seen and not seen.add(value)]  # noqa: E501
+        if len(values) == 1 and values[0] == DEFAULTS_PATH.get(key, None):
+            continue
+        for value in values:  # across all subplots and tuples
+            label = _get_label(dataset, key, value, mode='path')
+            if not label:
+                continue
+            if label not in parts:  # e.g. 'avg' to be ignored
+                parts.append(label)
+        if parts:
+            labels.append(parts)  # sort these so newer orders overwrite
+    result = '_'.join('-'.join(sorted(parts)) for parts in labels)
+    return result
 
 
 def _fit_label(label, fontsize=None, refwidth=None, nmax=None):
@@ -645,6 +720,8 @@ def _infer_labels(
                 name = kw_infer.get('name', None)
                 kw_label, kw_infer = {}, _group_parts(kw_infer)
                 for key, value in kw_infer.items():  # get individual label
+                    if key == 'statistic':  # TODO: remove!
+                        continue
                     if key in KEYS_VARIABLE:  # ignore climo.get() keywords
                         continue
                     if key in KEYS_METHOD or skip_names and key in ('name', 'spatial'):
@@ -731,48 +808,6 @@ def _infer_labels(
     return labels[0] if identical else labels
 
 
-def _infer_path(dataset, *kws_process):
-    """
-    Convert reduction operators into path suitable for saving.
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The source dataset.
-    *kws_process : dict
-        The `process_data` keywords.
-
-    Returns
-    -------
-    path : str
-        The parts joined with underscores and dashes.
-    """
-    # NOTE: This omits keywords that correspond to default values but always
-    # includes experiment because default is ambiguous between variables.
-    kws_process = [(kw,) if isinstance(kw, dict) else tuple(kw) for kw in kws_process]
-    kws_process = [kw.copy() for kws in kws_process for kw in kws]
-    labels = []
-    defaults = {'project': 'cmip', 'ensemble': 'flagship', 'period': 'ann'}
-    defaults.update({'source': 'eraint', 'style': 'slope', 'region': 'globe'})
-    kws_process = list(map(_group_parts, kws_process))
-    for key in ORDER_LOGICAL:
-        seen, parts = set(), []
-        values = [kw[key] for kw in kws_process if key in kw]
-        values = [value for value in values if value not in seen and not seen.add(value)]  # noqa: E501
-        if len(values) == 1 and values[0] == defaults.get(key, None):
-            continue
-        for value in values:  # across all subplots and tuples
-            label = _get_label(dataset, key, value, mode='path')
-            if not label:
-                continue
-            if label not in parts:  # e.g. 'avg' to be ignored
-                parts.append(label)
-        if parts:
-            labels.append(parts)  # sort these so newer orders overwrite
-    result = '_'.join('-'.join(sorted(parts)) for parts in labels)
-    return result
-
-
 def get_spec(dataset, spec, **kwargs):
     """
     Parse the variable name specification.
@@ -841,11 +876,11 @@ def get_spec(dataset, spec, **kwargs):
             kw_axes[key] = value
         elif any(key.startswith(prefix) for prefix in DETECT_OTHER):
             kw_other[key] = value
-        elif any(key.startswith(prefix) for prefix in DETECT_ATTRS):
+        elif any(key.startswith(prefix) for prefix in DETECT_ATTRIBUTES):
             kw_attrs[key] = value
-        elif any(key.startswith(prefix) for prefix in DETECT_COLORBAR):
+        elif any(key.startswith(prefix) for prefix in ('colorbar', *DETECT_COLORBAR)):
             kw_colorbar[key] = value
-        elif any(key.startswith(prefix) for prefix in DETECT_LEGEND):
+        elif any(key.startswith(prefix) for prefix in ('legend', *DETECT_LEGEND)):
             kw_legend[key] = value
         elif any(key.startswith(prefix) for prefix in DETECT_GUIDE):
             kw_colorbar[key] = kw_legend[key] = value  # shared keywords
@@ -1080,7 +1115,7 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
         fontsize=pplt.rc.fontlarge
     )
     pathspecs = [dspec for ikws_process in kws_process for dspec in ikws_process]
-    pathlabel = _infer_path(dataset, *pathspecs)
+    pathlabel = _create_path(dataset, *pathspecs)
     fontwidth = pplt.utils._fontsize_to_pt(pplt.rc.fontlarge)  # a-b-c label adjustment
     axeswidth = refwidth - 3 * pplt.units(fontwidth, 'pt', 'in')
     kw_fit = dict(fontsize=fontwidth, refwidth=axeswidth)

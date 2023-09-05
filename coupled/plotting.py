@@ -594,6 +594,13 @@ def _auto_props(data, kw_collection):
     kw_collection : namedtuple
         Inpute keyword arguments.
 
+    Other Parameters
+    ----------------
+    multicolor : bool, optional
+        Whether to use colors instead of alpha for projects (taken from `.other`).
+    cycle : cycle-spec, optional
+        The manual color cycle (taken from `.other`).
+
     Returns
     -------
     colors : list
@@ -636,6 +643,10 @@ def _auto_props(data, kw_collection):
     experiment = np.atleast_1d(data.coords.get('experiment', None))
     start = np.atleast_1d(data.coords.get('start', None))
     stop = np.atleast_1d(data.coords.get('stop', None))
+    if stop.size == 1:  # TODO: figure out issue and remove kludge
+        stop = np.repeat(stop, start.size)
+    if start.size == 1:  # TODO: figure out issue and remove kludge
+        start = np.repeat(start, stop.size)
     mask = np.array([value is None or value != value for value in experiment])
     mask1 = np.array([value is None or value != value for value in start])
     mask2 = np.array([value is None or value != value for value in stop])
@@ -714,14 +725,10 @@ def _auto_command(args, kw_collection, violin=True, shading=True, contour=None):
 
     Other Parameters
     ----------------
-    multicolor : bool, optional
-        Whether to use colors instead of alpha for projects (taken from `.other`).
     horizontal : bool, optional
         Whether to use vertical or horizontal orientation (taken from `.other`).
     pcolor : bool, optional
         Whether to use `pcolormesh` for 2D shaded plot (taken from `.other`).
-    cycle : cycle-spec, optional
-        The manual color cycle (taken from `.other`).
 
     Results
     -------
@@ -1724,6 +1731,7 @@ def create_plot(
     labelright=False,
     labelparams=False,
     standardize=False,
+    identical=False,
     groupnames=True,
     figurespan=False,
     gridskip=None,
@@ -1769,6 +1777,9 @@ def create_plot(
     standardize : bool, optional
         Whether to make axis limits span the same range for all axes with same
         units. See also `rxlim` and `rylim`.
+    identical : bool, optional
+        Whether to make axis limits span the exact same values for all axes with same
+        units. Stricter condition.
     groupnames : bool, str, or sequence of str, optional
         If boolean, whether to group mappable scaling and colorbars by unique array
         ``name`` or by all other scalar coordinates plus ``'units'`` attributes. If
@@ -1826,6 +1837,7 @@ def create_plot(
     are defined) or `barh` (if only one model is defined).
     """
     # Initital stuff
+    # NOTE: Input geometry not respected if both row and column specs non singleton.
     # TODO: Support e.g. passing 2D arrays to line plotting methods with built-in
     # shadestd, shadepctile, etc. methods instead of using map. See apply_method.
     argskip = np.atleast_1d(() if argskip is None else argskip)
@@ -1833,11 +1845,10 @@ def create_plot(
     kws_process, kws_collection, figlabel, pathlabel, gridlabels = parse_specs(
         dataset, rowspecs, colspecs, **kwargs  # parse input specs
     )
-    # ic(rowspecs, colspecs, kws_process)
-    if isinstance(gridlabels, tuple):
+    if isinstance(gridlabels, tuple):  # both row and column specs non singleton
         grows, gcols = map(len, gridlabels)
         labels_default = (*gridlabels, [None] * grows * gcols)
-    else:
+    else:  # either row or column spec was singleton
         naxes = len(gridlabels) if gridlabels else 1
         naxes += gridskip.size
         labels_default = (None, None, gridlabels)
@@ -1849,6 +1860,7 @@ def create_plot(
             grows = 1 + (naxes - 1) // gcols
 
     # Label overrides
+    # NOTE: Here 'figsuffix' is for the figure and 'suffix' is for the path.
     # NOTE: This supports selective overrides e.g. rowlabels=['custom', None, None]
     figtitle = figtitle if figtitle is not None else figlabel
     figtitle = _capitalize_label(figtitle, prefix=figprefix, suffix=figsuffix)
@@ -2176,7 +2188,7 @@ def create_plot(
     # NOTE: Previously permitted e.g. rxlim=[(0, 1), (0, 0.5)] but these would
     # be applied *implicitly* based on drawing order so too confusing. Use
     # 'outer' from constraints '_build_specs()' function instead.
-    if not standardize:  # auto-search shared axes and possibly apply 'relative' limits
+    if not standardize and not identical:  # auto-search shared axes
         ref = fig.subplotgrid[0]
         groups_xunits, groups_yunits = {}, {}
         if hasattr(ref, '_shared_axes'):
@@ -2200,11 +2212,16 @@ def create_plot(
                 pairs.extend((axis2, ax) for ax in groups2.get(unit, ()))
             lims = [getattr(ax, f'get_{axis}lim')() for axis, ax in pairs]
             span = max((lim[1] - lim[0] for lim in lims), key=abs)  # preserve sign
+            amin = min(lim[0] for lim in lims)
+            amax = max(lim[1] for lim in lims)
             for (axis, ax), lim in zip(pairs, lims):
-                average = 0.5 * (lim[0] + lim[1])
-                min_ = average + span * (rlim[0] - 0.5)
-                max_ = average + span * (rlim[1] - 0.5)
-                getattr(ax, f'set_{axis}lim')((min_, max_))
+                if identical:
+                    getattr(ax, f'set_{axis}lim')((amin, amax))
+                else:
+                    average = 0.5 * (lim[0] + lim[1])
+                    min_ = average + span * (rlim[0] - 0.5)
+                    max_ = average + span * (rlim[1] - 0.5)
+                    getattr(ax, f'set_{axis}lim')((min_, max_))
 
     # Optionally save the figure
     # NOTE: Still add empty axes so super title is centered above empty

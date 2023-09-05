@@ -41,14 +41,6 @@ REGEX_SPLIT = re.compile(  # ignore e.g. leading positive and negative signs
 
 # Path naming and reduction defaults
 # NOTE: New format will specify either 'monthly' or 'annual'
-DEFAULTS_PATH = {
-    'project': 'cmip',  # ignore if passed
-    'ensemble': 'flagship',
-    'period': 'ann',
-    'source': 'eraint',
-    'style': 'slope',
-    'region': 'globe',
-}
 DEFAULTS_REDUCE = {
     'experiment': 'picontrol',
     'ensemble': 'flagship',
@@ -61,6 +53,14 @@ DEFAULTS_VERSION = {
     'style': 'slope',
     'start': 0,
     'stop': 150,
+    'region': 'globe',
+}
+DEFAULTS_PATH = {
+    'project': 'cmip',  # ignore if passed
+    'ensemble': 'flagship',
+    'period': 'ann',
+    'source': 'eraint',
+    'style': 'slope',
     'region': 'globe',
 }
 
@@ -109,11 +109,11 @@ ORDER_LOGICAL = (
     'startstop',
     'start',
     'stop',
-    'region',
-    'time',  # space and time
+    'region',  # special coordinates
     'period',
     'season',
     'month',
+    'time',  # space and time
     'plev',
     'area',
     'volume',
@@ -131,6 +131,7 @@ ORDER_READABLE = (
     'area',
     'volume',
     'plev',
+    'time',
     'period',  # NOTE: this is outdated
     'season',
     'month',
@@ -150,18 +151,6 @@ ORDER_READABLE = (
 
 # General translations
 TRANSLATE_PATHS = {
-    ('lat', 'absmin'): 'min',
-    ('lat', 'absmax'): 'max',
-    ('lon', 'int'): None,
-    ('lon', 'avg'): 'avg',  # always report
-    ('area', 'avg'): 'avg',  # always report
-    ('plev', 'avg'): 'avg',  # always report
-    ('region', 'point'): 'pt',
-    ('region', 'latitude'): 'lat',
-    ('region', 'hemisphere'): 'hemi',
-    ('region', 'apoint'): 'apt',
-    ('region', 'alatitude'): 'alat',
-    ('region', 'ahemisphere'): 'ahemi',
     ('institute', 'avg'): 'inst',
     ('institute', 'flagship'): 'flag',
     ('institute', None): 'model',
@@ -174,12 +163,67 @@ TRANSLATE_PATHS = {
     ('startstop', (100, 150)): 'late50',  # NOTE: used as 'historical' analogue in lit
     ('startstop', (1, 20)): 'early1',
     ('startstop', (2, 20)): 'early2',
+    ('region', 'point'): 'loc',
+    ('region', 'latitude'): 'lat',
+    ('region', 'hemisphere'): 'hemi',
+    ('region', 'globe'): 'globe',
+    ('region', 'apoint'): 'apt',
+    ('region', 'alatitude'): 'alat',
+    ('region', 'ahemisphere'): 'ahemi',
+    ('region', 'aglobe'): 'aglobe',
+    ('plev', 'avg'): 'avg',  # always report
+    ('volume', 'avg'): 'avg',  # always report
+    ('area', 'avg'): 'avg',  # always report
+    ('lat', 'absmin'): 'min',
+    ('lat', 'absmax'): 'max',
+    ('lat', 'min'): 'min',
+    ('lat', 'max'): 'max',
+    ('lon', 'int'): None,
+    ('lon', 'avg'): 'avg',  # always report
 }
 TRANSLATE_LABELS = {
-    ('lat', 'absmin'): 'minimum',
-    ('lat', 'absmax'): 'maximum',
-    ('lon', 'int'): None,
-    ('lon', 'avg'): None,
+    ('project', 'cmip'): 'CMIP',
+    ('project', 'cmip5'): 'CMIP5',
+    ('project', 'cmip6'): 'CMIP6',
+    ('project', 'cmip56'): 'matching CMIP5',
+    ('project', 'cmip65'): 'matching CMIP6',
+    ('project', 'cmip55'): 'non-matching CMIP5',
+    ('project', 'cmip66'): 'non-matching CMIP6',
+    ('project', 'cmip655'): 'matching CMIP',  # almost matching
+    ('project', 'cmip6556'): 'matching CMIP',
+    ('project', 'cmip5665'): 'matching CMIP',
+    ('project', 'cmip6655'): 'non-matching CMIP',
+    ('project', 'cmip5566'): 'non-matching CMIP',
+    ('institute', 'avg'): None,
+    ('institute', 'flagship'): None,
+    ('institute', None): None,
+    # ('institute', 'avg'): 'institute',
+    # ('institute', 'flagship'): 'flagship-only',
+    # ('institute', None): 'model',
+    ('experiment', 'picontrol'): 'control',
+    ('experiment', 'abrupt4xco2'): r'4$\times$CO$_2$',
+    # ('source', 'eraint'): 'custom',
+    # ('source', 'zelinka'): 'Zelinka',
+    ('source', 'eraint'): 'Davis et al.',
+    ('source', 'zelinka'): 'Zelinka et al.',
+    ('style', 'slope'): 'annual',
+    ('style', 'annual'): 'annual',
+    ('style', 'monthly'): 'monthly',
+    ('style', 'ratio'): 'ratio-style',
+    ('startstop', (0, 150)): 'full',
+    ('startstop', (0, 50)): 'early',
+    ('startstop', (100, 150)): 'late',
+    ('startstop', (0, 20)): 'early',
+    ('startstop', (20, 150)): 'late',
+    ('region', 'globe'): 'global-$T$',
+    ('region', 'point'): 'local-$T$',
+    ('region', 'latitude'): 'zonal-$T$',
+    ('region', 'hemisphere'): 'hemispheric-$T$',
+    ('spatial', 'slope'): 'spatial regression',  # NOTE: also see _apply_double
+    ('spatial', 'proj'): 'spatial projection',
+    ('spatial', 'corr'): 'spatial correlation',
+    ('spatial', 'cov'): 'spatial covariance',
+    ('spatial', 'rsq'): 'spatial variance explained',
     ('plev', 'int'): None,
     ('plev', 'avg'): 'column',
     ('area', None): 'local',  # NOTE: only used with identical=False
@@ -201,44 +245,12 @@ TRANSLATE_LABELS = {
     ('area', 'ne'): 'northern extratropical',
     ('area', 'sh'): 'southern hemisphere',
     ('area', 'nh'): 'northern hemisphere',
-    ('spatial', 'slope'): 'spatial regression',  # NOTE: also see _apply_double
-    ('spatial', 'proj'): 'spatial projection',
-    ('spatial', 'corr'): 'spatial correlation',
-    ('spatial', 'cov'): 'spatial covariance',
-    ('spatial', 'rsq'): 'spatial variance explained',
-    # ('source', 'eraint'): 'custom',
-    # ('source', 'zelinka'): 'Zelinka',
-    ('source', 'eraint'): 'Davis et al.',
-    ('source', 'zelinka'): 'Zelinka et al.',
-    ('region', 'globe'): 'global-$T$',
-    ('region', 'point'): 'local-$T$',
-    ('region', 'latitude'): 'zonal-$T$',
-    ('region', 'hemisphere'): 'hemispheric-$T$',
-    ('institute', 'avg'): None,
-    ('institute', 'flagship'): None,
-    ('institute', None): None,
-    # ('institute', 'avg'): 'institute',
-    # ('institute', 'flagship'): 'flagship-only',
-    # ('institute', None): 'model',
-    ('project', 'cmip'): 'CMIP',
-    ('project', 'cmip5'): 'CMIP5',
-    ('project', 'cmip6'): 'CMIP6',
-    ('project', 'cmip56'): 'matching CMIP5',
-    ('project', 'cmip65'): 'matching CMIP6',
-    ('project', 'cmip55'): 'non-matching CMIP5',
-    ('project', 'cmip66'): 'non-matching CMIP6',
-    ('project', 'cmip655'): 'matching CMIP',  # almost matching
-    ('project', 'cmip6556'): 'matching CMIP',
-    ('project', 'cmip5665'): 'matching CMIP',
-    ('project', 'cmip6655'): 'non-matching CMIP',
-    ('project', 'cmip5566'): 'non-matching CMIP',
-    ('experiment', 'picontrol'): 'control',
-    ('experiment', 'abrupt4xco2'): r'4$\times$CO$_2$',
-    ('startstop', (0, 150)): 'full',
-    ('startstop', (0, 50)): 'early',
-    ('startstop', (100, 150)): 'late',
-    ('startstop', (0, 20)): 'early',
-    ('startstop', (20, 150)): 'late',
+    ('lat', 'absmin'): 'minimum',
+    ('lat', 'absmax'): 'maximum',
+    ('lat', 'min'): 'minimum',
+    ('lat', 'max'): 'maximum',
+    ('lon', 'int'): None,
+    ('lon', 'avg'): None,
 }
 
 # Time translations

@@ -5,7 +5,6 @@ Data utilities for loading coupled model output.
 import itertools
 import json
 import re
-import time  # noqa: F401
 from pathlib import Path
 
 import climopy as climo  # noqa: F401  # add accessor
@@ -45,7 +44,7 @@ REGEX_TRANSPORT = re.compile(r'(mse|total)')
 # feedback files but for climate data simply load monthly data, average later.
 KEYS_PERIODS = ('annual', 'seasonal', 'monthly')
 KEYS_REGIONS = ('point', 'latitude', 'hemisphere')
-KEYS_RANGES = ('early', 'late', 'historical')
+KEYS_RANGES = ('early', 'late', 'historical', 'alternative')
 KEYS_FEEDBACKS = ('parts_erf', 'parts_wav', 'parts_clear', 'parts_kernels', 'parts_planck', 'parts_relative', 'parts_absolute')  # noqa: E501
 KEYS_ENERGY = ('drop_clear', 'drop_directions', 'skip_solar')
 KEYS_TRANSPORT = ('parts_local', 'parts_eddies', 'parts_static', 'parts_fluxes')
@@ -67,9 +66,9 @@ MODELS_SKIP = (
 VERSION_LEVELS = (
     'source',
     'style',
-    'region',
     'start',  # iniital year of regression or 'forced' climate average
     'stop',  # final year of regression or 'forced' climate average
+    'region',
 )
 
 # Levels for the MultiIndex coordinate 'facets'.
@@ -797,7 +796,7 @@ def _update_climate_transport(
 
 
 def _update_feedback_attrs(
-    dataset, quadruple=True, boundary=None, annual=True, seasonal=True, monthly=True,
+    dataset, quadruple=True, boundary=None,
 ):
     """
     Adjust feedback term attributes before plotting.
@@ -865,17 +864,6 @@ def _update_feedback_attrs(
         'tstd': ('ts_projection',),  # not realy but why not
         'tpat': ('ts_pattern',),
     }
-    if 'period' in dataset:  # this is for consistency with climate_datasets
-        drop = []
-        time = pd.date_range('2000-01-01', '2000-12-01', freq='MS')
-        if not annual:
-            drop.append('ann')
-        if not seasonal:
-            drop.extend(('djf', 'mam', 'jja', 'son'))
-        if not monthly:
-            drop.extend(time.strftime('%b').str.lower().values)
-        if drop:
-            dataset = dataset.drop_sel(period=drop, errors='ignore')
     for name, options in renames.items():
         for option in options:
             if option in dataset:
@@ -1028,8 +1016,9 @@ def _update_feedback_terms(
             numer = sum(dataset[key] for key in numer)
             denom = sum(dataset[key] for key in denom)
         if 'lon' in numer.sizes and 'lat' in numer.sizes:
-            numer = numer.climo.add_cell_measures().climo.average('area')
-            denom = denom.climo.add_cell_measures().climo.average('area')
+            parts = ('width', 'depth')
+            numer = numer.climo.add_cell_measures(parts).climo.average('area')
+            denom = denom.climo.add_cell_measures(parts).climo.average('area')
         if 'time' in numer.sizes and 'time' in denom.sizes:  # average over months
             wgts = numer.time.dt.days_in_month / numer.time.dt.days_in_month.sum()
             numer = (numer * wgts).sum('time', skipna=False)
@@ -1060,10 +1049,10 @@ def climate_datasets(
         The year range.
     anomaly : bool, optional
         Whether to load 4xCO2 data in anomaly form.
-    nodrift : bool, optional
-        Whether to use drift corrections.
     ignore : bool, optional
         The variables to optionally ignore.
+    nodrift : bool, optional
+        Whether to use drift corrections.
     standardize : bool, optional
         Whether to standardize the resulting order.
     **indexers
@@ -1076,10 +1065,11 @@ def climate_datasets(
     datasets : dict
         A dictionary of datasets.
     """
+    # Initial stuff
+    # TODO: Support regressions of each variable onto global temperature to go
+    # along with ratio-style climate responses. Analogous to feedback calculations.
     # NOTE: Non-flagship simulations can be added with flagship_translate=True
     # as with other processing functions. Ensembles are added in a MultiIndex
-    # NOTE: This loads all available variables by default, but can be
-    # restricted to a few with e.g. variable=['ts', 'ta'].
     kw_energetics = {key: constraints.pop(key) for key in KEYS_ENERGY if key in constraints}  # noqa: E501
     kw_transport = {key: constraints.pop(key) for key in KEYS_TRANSPORT if key in constraints}  # noqa: E501
     kw_version = {key: constraints.pop(key) for key in KEYS_VERSION if key in constraints}  # noqa: E501
@@ -1093,54 +1083,40 @@ def climate_datasets(
     datasets = {}
     print(f'Climate files: <dates>-climate{nodrift}')
     print(f'Number of climate file groups: {len(database)}.')
+
+    # Generate file lists
+    # WARNING: Critical to place time averaging after transport calculations so that
+    # time-covariance of surface pressure and near-surface flux terms is factored
+    # in (otherwise would need to include cell heights before averaging).
     if ignore is None:  # default value
         ignore = ('huss', 'hurs', 'uas', 'vas')
     if database:
         print('Model:', end=' ')
-    for (project, model, experiment, ensemble), data in database.items():
-        # Initial stuff
-        if not data:
-            continue
-        if model in MODELS_SKIP:
-            continue
-        for sub, replace in FACETS_RENAME.items():
-            experiment = experiment.replace(sub, replace)
-        if years is not None:
-            range_ = years
-        elif experiment == 'abrupt4xco2':
-            range_ = (120, 150)
-        elif experiment == 'picontrol':
-            range_ = (0, 150)
-        dates = f'{range_[0]:04d}-{range_[1]:04d}-climate{nodrift}'
-        print(f'{model}_{experiment}_{range_[0]:04d}-{range_[1]:04d}', end=' ')
-        att = {'axis': 'T', 'standard_name': 'time'}
-        time = pd.date_range('2000-01-01', '2000-12-01', freq='MS')
-        time = xr.DataArray(time, name='time', dims='time', attrs=att)
-
+    for facets, data in database.items():
         # Load the data
         # NOTE: Critical to overwrite the time coordinates after loading or else xarray
         # coordinate matching will apply all-NaN values for climatolgoies with different
         # base years (e.g. due to control data availability or response calendar diffs).
+        project, model, experiment, ensemble = facets
+        if not data or model in MODELS_SKIP:
+            continue
+        for sub, replace in FACETS_RENAME.items():
+            experiment = experiment.replace(sub, replace)
+        range_ = (120, 150) if experiment == 'abrupt4xco2' else (0, 150)
+        range_ = years if years is not None else range_
+        dates = f'{range_[0]:04d}-{range_[1]:04d}-climate{nodrift}'
+        print(f'{model}_{experiment}_{range_[0]:04d}-{range_[1]:04d}', end=' ')
         dataset = xr.Dataset()
         for key, paths in data.items():
             variable = key[database.key.index('variable')]
             paths = [path for path in paths if _item_dates(path) == dates]
-            if ignore and variable in ignore:
-                continue
-            if not paths:
+            if not paths or ignore and variable in ignore:
                 continue
             if len(paths) > 1:
                 print(f'Warning: Skipping ambiguous duplicate paths {list(map(str, paths))}.', end=' ')  # noqa: E501
                 continue
-            array = load_file(paths[0], variable, project=database.project)
-            if array.time.size != 12:
-                print(f'Warning: Skipping path {paths[0]} with time length {array.time.size}.', end=' ')  # noqa: E501
-                continue
-            months = array.time.dt.month
-            if sorted(months.values) != sorted(range(1, 13)):
-                print(f'Warning: Skipping path {paths[0]} with month values {months.values}.', end=' ')  # noqa: E501
-                continue
-            array = array.assign_coords(time=time)
+            array = load_file(paths[0], variable, project=project)
+            array = assign_dates(array, year=1800)  # exactly 12 months required
             descrip = array.attrs.pop('title', variable)  # in case long_name missing
             descrip = array.attrs.pop('long_name', descrip)
             descrip = ' '.join(s if s == 'TOA' else s.lower() for s in descrip.split())
@@ -1151,9 +1127,6 @@ def climate_datasets(
         # NOTE: Empirical testing revealed limiting integration to troposphere
         # often prevented strong transient heat transport showing up in overturning
         # cells due to aliasing of overemphasized stratospheric geopotential transport.
-        # WARNING: Critical to place time averaging after transport calculations so that
-        # time-covariance of surface pressure and near-surface flux terms is factored
-        # in (otherwise would need to include cell heights before averaging).
         if 'ps' not in dataset and 'plev' in dataset.coords:
             print('Warning: Surface pressure is unavailable.', end=' ')
         dataset = dataset.climo.add_cell_measures(surface=('ps' in dataset))
@@ -1166,30 +1139,27 @@ def climate_datasets(
         dataset = dataset.drop_vars(drop).squeeze()
         if 'plev' in dataset:
             dataset = dataset.sel(plev=slice(None, 7000))
-        if 'time' in dataset:
-            with xr.set_options(keep_attrs=True):
-                dataset = dataset.groupby('time.month').mean('time', skipna=True)
-            dataset = assign_dates(dataset, year=1800)  # see also _regress_annual
         if standardize:
             dataset = _standardize_order(dataset)
-        datasets[project, model, experiment, ensemble] = dataset
+        datasets[facets] = dataset
 
     # Translate abrupt 4xCO2 datasets into anomaly form
-    # TODO: Still somehow support 'response' suffix for abrupt4xCO2
-    # experiment instead of picontrol experiment after concatenating.
+    # TODO: Should still somehow support 'response' climopy and 'process.py' variable
+    # suffix for specifying abrupt4xCO2 experiment instead of picontrol experiment.
+    # Would require detecting anomalies are present and rebuilding original data.
     if datasets:
         print()
     if anomaly:
         print('Transforming abrupt 4xCO2 data into anomalies.')
-        for group, dataset in tuple(datasets.items()):
-            (project, model, experiment, ensemble) = group
+        for facets, dataset in tuple(datasets.items()):
+            project, model, experiment, ensemble = facets
             if experiment != 'abrupt4xco2':
                 continue
-            group0 = (project, model, 'picontrol', ensemble)
-            if group0 not in datasets:
-                del datasets[group]
+            control = (project, model, 'picontrol', ensemble)
+            if control not in datasets:
+                del datasets[facets]
                 continue
-            dataset0 = datasets[group0]
+            dataset0 = datasets[control]
             for name, data in dataset.data_vars.items():
                 if name[:4] in ('ps', 'cell'):
                     continue
@@ -1205,14 +1175,17 @@ def climate_datasets(
                             data.attrs['long_name'] += ' response'
                         if 'short_name' in data.attrs:
                             data.attrs['short_name'] += ' response'
-            datasets[group] = dataset
+            datasets[facets] = dataset
     return datasets
 
 
 def feedback_datasets(
     *paths,
-    source=None, style=None, nodrift=False, quadruple=True, boundary=None, standardize=True,  # noqa: E501
-    point=True, latitude=True, hemisphere=True, early=True, late=True, historical=True,
+    quadruple=True, boundary=None, source=None, style=None,
+    early=True, late=True, historical=False, delayed=False,
+    point=True, latitude=True, hemisphere=False,
+    annual=True, seasonal=True, monthly=False,
+    nodrift=False, standardize=True,
     **constraints,
 ):
     """
@@ -1222,22 +1195,22 @@ def feedback_datasets(
     ----------
     *path : path-like
         The search paths.
-    source : str or sequence, optional
-        The kernel source(s) to optionally filter.
-    style : str or sequence, optional
-        The feedback style(s) to optionally filter.
-    nodrift : bool, optional
-        Whether to use drift corrections.
     quadruple : bool, optional
         Whether to adjust parameters to correspond to quadrupled CO$_2$.
     boundary : bool or str, optional
         The boundaries to include.
-    standardize : bool, optional
-        Whether to standardize the resulting order.
+    source, style : str or sequence, optional
+        The kernel source(s) and feedback style(s) to optionally filter.
     point, latitude, hemisphere : bool, optional
         Whether to include or drop extra regional feedbacks.
-    early, late, historical : bool, optional
+    early, late, historical, delayed : bool, optional
+        Whether to include or drop extra range feedbacks.
+    annual, seasonal, monthly : bool, optional
         Whether to include or drop extra period feedbacks.
+    nodrift : bool, optional
+        Whether to use drift corrections.
+    standardize : bool, optional
+        Whether to standardize the resulting order.
     **kwargs
         Passed to `_update_feedback_terms`.
     **constraints
@@ -1248,18 +1221,28 @@ def feedback_datasets(
     datasets : dict
         A dictionary of datasets.
     """
-    # WARNING: Recent xarray versions produce bugs when running xr.concat or
-    # xr.update with multi-index. See: https://github.com/pydata/xarray/issues/7695
-    # NOTE: To reduce the number of variables this filters out
-    # unneeded boundaries and effective forcings automatically.
+    # Initial stuff
+    # TODO: Support subtracting global anomaly within get_data() by adding suffix
+    # to the variable string? Tricky in context of e.g. anomaly regressions.
     kw_both = {'quadruple': quadruple, 'boundary': boundary}
     kw_terms = {key: constraints.pop(key) for key in KEYS_FEEDBACKS if key in constraints}  # noqa: E501
-    kw_periods = {key: constraints.pop(key) for key in KEYS_PERIODS if key in constraints}  # noqa: E501
+    sample = pd.date_range('2000-01-01', '2000-12-01', freq='MS')
+    regions = [(point, 'point'), (latitude, 'latitude'), (hemisphere, 'hemisphere')]
+    regions = [region for b, region in regions if not b]  # whether to drop
+    periods = ['ann'] if annual else []
+    if not seasonal:
+        periods.extend(('djf', 'mam', 'jja', 'son'))
+    if not monthly:
+        periods.extend(sample.strftime('%b').str.lower().values)
+
+    # Generate file lists
+    # WARNING: Recent xarray versions produce bugs when running xr.concat or
+    # xr.update with multi-index. See: https://github.com/pydata/xarray/issues/7695
     files, *_ = glob_files(*paths, project=constraints.get('project', None))
     constraints['variable'] = 'feedbacks'  # TODO: similar for climate_datasets
     database = Database(files, FACETS_LEVELS, flagship_translate=True, **constraints)
-    styles = (style,) if isinstance(style, str) else tuple(style or ())
     sources = (source,) if isinstance(source, str) else tuple(source or ())
+    styles = (style,) if isinstance(style, str) else tuple(style or ())
     nodrift = nodrift and '-nodrift' or ''
     scale = 2.0 if quadruple else 1.0  # TODO: possibly change convention
     datasets = {}
@@ -1267,28 +1250,28 @@ def feedback_datasets(
     print(f'Number of feedback file groups: {len(database)}.')
     if database:
         print('Model:', end=' ')
-    for group, data in database.items():
+    for facets, data in database.items():
         # Load the data
         # NOTE: This accounts for files with dedicated regions indicated in the name,
         # files with numerator and denominator multi-index coordinates, and files with
         # just a denominator region coordinate. Note load_file builds the multi-index.
         for sub, replace in FACETS_RENAME.items():
-            group = tuple(s.replace(sub, replace) for s in group)
+            facets = tuple(facet.replace(sub, replace) for facet in facets)
+        if facets[1] in MODELS_SKIP:
+            continue
         paths = [
             path for paths in data.values() for path in paths
             if bool(nodrift) == bool('nodrift' in path.name)
         ]
         if not paths:
             continue
-        if group[1] in MODELS_SKIP:
-            continue
+        print(f'{facets[1]}_{facets[2]}', end=' ')
         versions = {}
-        print(f'{group[1]}_{group[2]}', end=' ')
         for path in paths:
-            # Load file
             *_, indicator, suffix = path.stem.split('_')
             start, stop, source, style, *_ = suffix.split('-')  # ignore -nodrift
             start, stop = map(int, (start, stop))
+            version = (source, style, start, stop)
             if sources and source not in sources:
                 continue
             if styles and style not in styles:
@@ -1299,86 +1282,74 @@ def feedback_datasets(
                 continue
             if not historical and stop - start == 50:
                 continue
+            if not delayed and start in range(1, 20):
+                continue
             if outdated := 'local' in indicator or 'global' in indicator:
                 if indicator.split('-')[0] != 'local':  # ignore global vs. global
                     continue
             dataset = load_file(path, project=database.project, validate=False)
-            # Filter and add to dictionary
             if outdated:
                 region = 'point' if indicator.split('-')[1] == 'local' else 'globe'
-                if not point and region == 'point':
-                    continue
-                versions[source, style, region, start, stop] = dataset
-            else:
-                for region in dataset.region.values:  # includes pbot and ptop
-                    if not point and region == 'point':
-                        continue
-                    if not latitude and region == 'latitude':
-                        continue
-                    if not hemisphere and region == 'hemisphere':
-                        continue
-                    slice_ = dataset.sel(region=region, drop=True)
-                    versions[source, style, region, start, stop] = slice_
+                dataset = dataset.expand_dims('region').assign_coords(region=[region])
+                if facets in datasets:  # combine new feedback coordinates
+                    args = (datasets[version], dataset)
+                    dataset = xr.combine_by_coords(args, combine_attrs='override')
+            versions[version] = dataset
             del dataset
 
-        # Standardize and concatenate the data
-        # NOTE: Concatenation automatically broadcasts global feedbacks across lons and
-        # lats. Also critical to use 'override' for combine_attrs in case conventions
-        # changed between running feedback calculations on different models.
+        # Standardize and concatenate data
+        # NOTE: To reduce the number of variables this filters out unrequested regions,
+        # periods, and feedback variables. See _update_feedback_terms for details.
+        # NOTE: Integration bounds 'pbot' and 'ptop' are currently based on control
+        # climate data so 'version' coordinate redundant. Simplify below.
         concat, noncat = {}, {}
-        for key, dataset in versions.items():
-            noncats = {name: dataset[name] for name in ('pbot', 'ptop') if name in dataset}  # noqa: E501
-            dataset = _update_feedback_attrs(dataset, **kw_both, **kw_periods)
+        for version, dataset in versions.items():
+            if regions:
+                dataset = dataset.drop_sel(region=regions, errors='ignore')
+            if periods and 'period' in dataset.sizes:
+                dataset = dataset.drop_sel(period=periods, errors='ignore')
+            arrays = {name: dataset[name] for name in ('pbot', 'ptop') if name in dataset}  # noqa: E501
+            dataset = dataset.drop_vars(arrays)
+            dataset = _update_feedback_attrs(dataset, **kw_both)
             dataset = _update_feedback_terms(dataset, **kw_both, **kw_terms)
+            if 'time' in dataset.sizes:
+                dataset = assign_dates(dataset, year=1800)
             for array in dataset.data_vars.values():
                 if '_erf' in array.name or '_ecs' in array.name:
                     array *= scale  # NOTE: array.data *= fails for unloaded data
-            for name, data in noncats.items():
-                if 'plev' in data.dims:  # error in _fluxes_from_anomalies
+            for name, data in arrays.items():  # address _fluxes_from_anomalies bug
+                if 'plev' in data.sizes:
                     data = data.isel(plev=0, drop=True)
-                noncat[name] = data.expand_dims('version')
-            if 'time' in dataset.sizes:
-                if dataset.time.size > 12:
-                    with xr.set_options(keep_attrs=True):
-                        dataset = dataset.groupby('time.month').mean('time', skipna=True)  # noqa: E501
-                dataset = assign_dates(dataset, year=1800)
-            drop = set(noncats) & dataset.keys()
-            dataset = dataset.drop_vars(drop)
-            concat[key] = dataset
-        index = xr.DataArray(
-            pd.MultiIndex.from_tuples(concat, names=VERSION_LEVELS),
-            dims='version',
-            name='version',
-            attrs={'long_name': 'feedback version'},
-        )
+                if name not in noncat:
+                    noncat[name] = data
+            concat[version] = dataset
         dataset = xr.concat(
             concat.values(),
-            dim=index,
+            dim='concat',
             coords='minimal',
             compat='override',
             combine_attrs='override',
         )
-        # dt, t0 = time.time() - t0, time.time()
-        # print(f'Concatenate time: {dt:.2f}')
-
-        # Final changes
-        # TODO: Work around xarray error addding 'non-concatenated' variables
-        # for top and bottom of kernel integration terms.
-        # TODO: Support subtracting global anomaly within get_data() by adding a suffix
-        # to the variable string? Could also try to use existing operation system but
-        # gets tricky with e.g. regressions of global anomalies.
+        dataset = dataset.stack(version=['concat', 'region'])
+        index = tuple(concat)  # original version values
+        index = [(*index[idx], region) for idx, region in dataset.version.values]
+        index = xr.DataArray(
+            pd.MultiIndex.from_tuples(index, names=VERSION_LEVELS),
+            dims='version',
+            name='version',
+            attrs={'long_name': 'feedback version'},
+        )
+        dataset = dataset.assign_coords(version=index)
         dataset = dataset.squeeze()
+        if 'tstd' in dataset:
+            temp = dataset.tstd.climo.add_cell_measures(('width', 'depth'))
+            dataset['tdev'] = anom = dataset.tstd - temp.climo.average('area')
+            anom.attrs.update(units='K', short_name='warming', long_name='relative warming')  # noqa: E501
+        for name, array in noncat.items():
+            dataset[name] = array
         if standardize:
             dataset = _standardize_order(dataset)
-        # for key, array in noncat.items():
-        #     dataset[key] = array
-        if 'tstd' in dataset:
-            data = dataset['tstd']
-            anom = data - data.climo.add_cell_measures().climo.average('area')
-            attrs = dict(units='K', standard_units='K', short_name='warming', long_name='relative warming')  # noqa: E501
-            anom.attrs.update(attrs)
-            dataset['tdev'] = anom  # helper derived variable
-        datasets[group] = dataset
+        datasets[facets] = dataset
 
     if datasets:
         print()
@@ -1387,7 +1358,7 @@ def feedback_datasets(
 
 def feedback_datasets_json(
     *paths,
-    quadruple=True, boundary=None, standardize=True, nonflag=False, **constraints,
+    quadruple=True, boundary=None, nonflag=False, standardize=True, **constraints,
 ):
     """
     Return a dictionary of datasets containing json-provided feedback data.
@@ -1443,7 +1414,7 @@ def feedback_datasets_json(
                 continue
             if model not in constraints.get('model', (model,)):
                 continue
-            for ensemble, data in ensembles.items():
+            for ensemble, group in ensembles.items():
                 key_flagship = (project, 'abrupt-4xCO2', model)
                 ens_default = ENSEMBLES_FLAGSHIP[project, None, None]
                 ens_flagship = ENSEMBLES_FLAGSHIP.get(key_flagship, ens_default)
@@ -1452,9 +1423,9 @@ def feedback_datasets_json(
                     continue
                 if ensemble not in constraints.get('ensemble', (ensemble,)):
                     continue
-                group = (project, model, 'abrupt4xco2', ensemble)
+                facets = (project, model, 'abrupt4xco2', ensemble)
                 dataset = xr.Dataset()
-                for key, value in data.items():
+                for key, value in group.items():
                     name, units = FEEDBACK_SETTINGS[key.lower()]
                     attrs = {'units': units}  # long name assigned below
                     if '_erf' in name or '_ecs' in name:
@@ -1462,23 +1433,23 @@ def feedback_datasets_json(
                     dataset[name] = xr.DataArray(value, attrs=attrs)
                 dataset = dataset.expand_dims(version=1)
                 dataset = dataset.assign_coords(version=index)
-                if group in datasets:
-                    datasets[group].update(dataset)
+                if facets in datasets:
+                    datasets[facets].update(dataset)
                 else:
-                    datasets[group] = dataset
-    for group in tuple(datasets):
-        dataset = datasets[group]
+                    datasets[facets] = dataset
+    for facets in tuple(datasets):
+        dataset = datasets[facets]
         dataset = _update_feedback_attrs(dataset, **kw_both)
         dataset = _update_feedback_terms(dataset, **kw_both, **kw_terms)
         if standardize:
             dataset = _standardize_order(dataset)
-        datasets[group] = dataset
+        datasets[facets] = dataset
     return datasets
 
 
 def feedback_datasets_text(
     *paths,
-    quadruple=True, boundary=None, standardize=True, transient=False, **constraints,
+    quadruple=True, boundary=None, transient=False, standardize=True, **constraints,
 ):
     """
     Return a dictionary of datasets containing text-provided feedback data.
@@ -1491,10 +1462,10 @@ def feedback_datasets_text(
         Whether to adjust parameters to correspond to quadrupled CO$_2$.
     boundary : str, optional
         The boundary components.
-    standardize : bool, optional
-        Whether to standardize the resulting order.
     transient : bool, optional
         Whether to include transient components.
+    standardize : bool, optional
+        Whether to standardize the resulting order.
     **kwargs
         Used to filter and adjust the data. See `feedback_datasets`.
     **constraints
@@ -1549,30 +1520,30 @@ def feedback_datasets_text(
             if not transient and name in transients:
                 continue
             for model in dataset.model.values:
-                group = ('CMIP5', model, 'abrupt4xco2', 'flagship')
+                facets = ('CMIP5', model, 'abrupt4xco2', 'flagship')
                 if model not in constraints.get('model', (model,)):
                     continue
                 if 'flagship' not in constraints.get('ensemble', ('flagship',)):
                     continue
                 if any(lab in model for lab in ('mean', 'deviation', 'uncertainty')):
                     continue
-                data = array.sel(model=model, drop=True)
+                select = array.sel(model=model, drop=True)
                 if units in ('K', 'W m^-2'):  # avoid in-place operation
-                    data = scale * data
-                data.name = name
-                data.attrs.update({'units': units})  # long name assigned below
-                data = data.to_dataset()
-                if group in datasets:  # combine new feedback coordinates
-                    tup = (data, datasets[group])
-                    data = xr.combine_by_coords(tup, combine_attrs='override')
-                datasets[group] = data
-    for group in tuple(datasets):
-        dataset = datasets[group]
+                    select = scale * select
+                select.name = name
+                select.attrs.update({'units': units})  # long name assigned below
+                select = select.to_dataset()
+                if facets in datasets:  # combine new version coordinates
+                    args = (select, datasets[facets])
+                    select = xr.combine_by_coords(args, combine_attrs='override')
+                datasets[facets] = select
+    for facets in tuple(datasets):
+        dataset = datasets[facets]
         dataset = _update_feedback_attrs(dataset, **kw_both)
         dataset = _update_feedback_terms(dataset, **kw_both, **kw_terms)
         if standardize:
             dataset = _standardize_order(dataset)
-        datasets[group] = dataset
+        datasets[facets] = dataset
     return datasets
 
 
@@ -1605,7 +1576,7 @@ def open_dataset(
     **constraints
         Passed to constrain the results.
     """
-    # Open the files
+    # Initial stuff
     # NOTE: Here 'source' refers to either the author of a cmip-tables file or the
     # creator of the kernels used to build custom feedbacks, and 'region' always refers
     # to the denominator. For external feedbacks, the region is always 'globe' and its
@@ -1614,9 +1585,6 @@ def open_dataset(
     # taking the average (see notes -- also tested outdated feedback files directly).
     # So can compare e.g. internal and external feedbacks with ``region='globe'`` and
     # ``area='avg'`` -- this is a no-op for the spatially uniform external feedbacks.
-    # WARNING: Using dataset.update() instead of xr.combine_by_coords() below can
-    # result in silently replacing existing data with NaNs (verified with test). The
-    # latter is required when adding new 'facets' and 'version' coordinate values.
     keys_climate = ('years', 'anomaly', 'ignore', *KEYS_ENERGY, *KEYS_MOIST, *KEYS_TRANSPORT, *KEYS_VERSION)  # noqa: E501
     keys_internal = ('source', 'style', *KEYS_REGIONS, *KEYS_RANGES, *KEYS_PERIODS)
     keys_feedback = ('quadruple', 'boundary', *KEYS_FEEDBACKS)
@@ -1637,6 +1605,11 @@ def open_dataset(
         feedbacks_json = feedbacks
     if feedbacks_text is None:
         feedbacks_text = feedbacks
+
+    # Open the datasets
+    # WARNING: Using dataset.update() instead of xr.combine_by_coords() below can
+    # result in silently replacing existing data with NaNs (verified with test). The
+    # latter is required when adding new 'facets' and 'version' coordinate values.
     for project in map(str.upper, projects):
         print(f'Project: {project}')
         for b, function, dirs, kw in (
@@ -1655,11 +1628,11 @@ def open_dataset(
                 paths = tuple(Path(_).expanduser() / d for _ in bases for d in dirs)
             kwargs = {**constraints, 'project': project, 'standardize': False, **kw}
             parts = function(*paths, **kwargs)
-            for group, data in parts.items():
-                if group in datasets:  # e.g. combine 'version' coordinates
-                    comb = (datasets[group], data)
-                    data = xr.combine_by_coords(comb, combine_attrs='override')
-                datasets[group] = data
+            for facets, dataset in parts.items():
+                if facets in datasets:  # e.g. combine 'version' coordinates
+                    comb = (datasets[facets], dataset)
+                    dataset = xr.combine_by_coords(comb, combine_attrs='override')
+                datasets[facets] = dataset
 
     # Concatenate and standardize datasets
     # NOTE: Critical to use 'override' for combine_attrs in case models
@@ -1668,16 +1641,16 @@ def open_dataset(
     print('Adding missing variables.')
     if datasets:
         print('Model:', end=' ')
-    for group, dataset in tuple(datasets.items()):  # interpolated datasets
-        print(f'{group[1]}_{group[2]}', end=' ')
+    for facets, dataset in tuple(datasets.items()):  # interpolated datasets
+        print(f'{facets[1]}_{facets[2]}', end=' ')
         for name in names.keys() - dataset.data_vars.keys():
-            da = names[name]  # *sample* from another model or project
-            da = xr.full_like(da, np.nan)  # preserve attributes as well
-            if all('version' in dict_ for dict_ in (da.dims, dataset, dataset.sizes)):
-                da = da.isel(version=0, drop=True)
-                da = da.expand_dims(version=dataset.sizes['version'])
-                da = da.assign_coords(version=dataset.version)
-            dataset[name] = da
+            array = names[name]  # *sample* from another model or project
+            array = xr.full_like(array, np.nan)  # preserve attributes as well
+            if all('version' in keys for keys in (array.dims, dataset, dataset.sizes)):
+                array = array.isel(version=0, drop=True)
+                array = array.expand_dims(version=dataset.version.size)
+                array = array.assign_coords(version=dataset.version)
+            dataset[name] = array
     print()
     print('Concatenating datasets.')
     if not datasets:
@@ -1702,6 +1675,6 @@ def open_dataset(
         dataset = _standardize_order(dataset)
     dataset = dataset.climo.standardize_coords(prefix_levels=True)
     dataset = dataset.climo.add_cell_measures(surface=('ps' in dataset))
-    if 'plev_bot' in dataset:  # causes issues as coordinate variable and duplicates ps
+    if 'plev_bot' in dataset:  # created by add_cell_measures()
         dataset = dataset.drop_vars('plev_bot')
     return dataset

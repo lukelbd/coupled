@@ -9,8 +9,8 @@ from pathlib import Path
 from icecream import ic  # noqa: F401
 
 # Global constants
-PART_RENAMES = {'start': 'early50', 'end': 'late50'}
-REGION_ABBREVS = ['globe', 'hemi', 'lat', 'pt', 'aglobe', 'ahemi', 'alat', 'apt']
+PART_RENAMES = {'start': 'early50', 'end': 'late50', 'pt': 'loc', 'apt': 'aloc'}
+REGION_ABBREVS = ['globe', 'hemi', 'lat', 'loc', 'aglobe', 'ahemi', 'alat', 'aloc']
 STARTSTOP_ABBREVS = ['full', 'start', 'end', 'early', 'late', 'early1', 'early2']
 
 # Iterate over figure folders
@@ -25,31 +25,30 @@ for path in sys.argv[1:]:
         raise ValueError(f'Invalid path {str(path)!r}.')
     for previous in paths:
         # Parse the path regions
-        original = [parts.split('-') for parts in previous.stem.split('_')]
-        ridxs = [
-            i for i, parts in enumerate(original)
-            if any(name in REGION_ABBREVS for name in parts)
+        original = [
+            parts.split('-')
+            for parts in previous.stem.split('_')
         ]
-        if len(ridxs) > 1:
-            warnings.warn(f'File {previous.name!r} has ambiguous regions.')
-        if len(ridxs) != 1:
-            continue  # no rearrangement necessary
-
-        # Parse and rename the periods
         groups = [
             [PART_RENAMES.get(part, part) for part in parts]
             for parts in original
+        ]
+        ridxs = [
+            i for i, parts in enumerate(groups)
+            if any(name in REGION_ABBREVS for name in parts)
         ]
         sidxs = [
             i for i, parts in enumerate(groups)
             if any(name in STARTSTOP_ABBREVS for name in parts)
         ]
-        if len(sidxs) > 1:
-            warnings.warn(f'File {previous.name!r} has ambiguous periods.')
-        if len(sidxs) != 1 and groups == original:
-            continue  # no rearrangement necessary
 
         # Update the path
+        if len(ridxs) > 1:
+            warnings.warn(f'File {previous.name!r} has ambiguous regions.')
+        if len(sidxs) > 1:
+            warnings.warn(f'File {previous.name!r} has ambiguous periods.')
+        if groups == original and (len(ridxs) != 1 or len(sidxs) != 1):
+            continue  # no rearrangement necessary
         ridx = ridxs[0] if len(ridxs) == 1 else 1  # always true
         sidx = sidxs[0] if len(sidxs) == 1 else 0
         difference = ridx - sidx

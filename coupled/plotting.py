@@ -20,10 +20,9 @@ import matplotlib.container as mcontainer
 import matplotlib.lines as mlines
 import seaborn as sns
 from climopy import ureg, vreg  # noqa: F401
-from .process import _components_corr, _components_slope, _constrain_response
-from .process import _parse_institute, _parse_project
-from .process import process_data
 from .internals import _capitalize_label, _fit_label, _infer_labels, parse_specs
+from .process import _constrain_response, process_data
+from .reduce import _components_corr, _components_slope, _parse_institute, _parse_project  # noqa: E501
 
 __all__ = ['create_plot']
 

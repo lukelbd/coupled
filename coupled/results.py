@@ -60,27 +60,10 @@ MODELS_SKIP = (
     'FIO-ESM-2-0',
 )
 
-# Levels for the MultiIndex feedback version coordinate
-# NOTE: Currently years for 'ratio' type feedbacks always correspond to the abrupt4xCO2
-# climate average; the pre-industrial climate average is always over the full 150 years.
-VERSION_LEVELS = (
-    'source',
-    'style',
-    'start',  # iniital year of regression or 'forced' climate average
-    'stop',  # final year of regression or 'forced' climate average
-    'region',
-)
-
-# Levels for the MultiIndex coordinate 'facets'.
+# Renaming facets
 # NOTE: Previously renamed piControl and abrupt-4xCO2 to 'control' and 'response'
 # but this was confusing as 'response' sounds like a perturbation (also considered
 # 'unperturbed' and 'perturbed'). Now simply use 'picontrol' and 'abrupt4xco2'.
-FACETS_LEVELS = (
-    'project',
-    'model',
-    'experiment',
-    'ensemble',
-)
 FACETS_RENAME = {
     'piControl': 'picontrol',
     'control-1950': 'control1950',
@@ -88,71 +71,36 @@ FACETS_RENAME = {
     'abrupt-4xCO2': 'abrupt4xco2',
 }
 
-# Climate constants
-# NOTE: For now use the standard 1e3 kg/m3 water density (i.e. snow and ice terms
-# represent melted equivalent depth) but could also use 1e2 kg/m3 snow density where
-# relevant. See: https://www.sciencelearn.org.nz/resources/1391-snow-and-ice-density
-# NOTE: These entries inform the translation from standard unit strings to short
-# names like 'energy flux' and 'energy transport' used in figure functions. In
-# future should group all of these into cfvariables with standard units.
-CLIMATE_SCALES = {  # scaling prior to final unit transformation
-    'prw': 1 / const.rhow,  # water vapor path not precip
-    'pr': 1 / const.rhow,
-    'prl': 1 / const.rhow,  # derived
-    'pri': 1 / const.rhow,
-    'ev': 1 / const.rhow,
-    'evl': 1 / const.rhow,  # derived
-    'evi': 1 / const.rhow,
-    'clwvi': 1 / const.rhow,
-    'cllvi': 1 / const.rhow,  # derived
-    'clivi': 1 / const.rhow,
-}
-CLIMATE_SHORTS = {
-    'K': 'temperature',
-    'hPa': 'pressure',
-    'dam': 'surface height',
-    'mm': 'liquid depth',
-    'mm day^-1': 'accumulation',
-    'm s^-1': 'wind speed',
-    'Pa': 'wind stress',  # default tau units
-    'g kg^-1': 'concentration',
-    'W m^-2': 'flux',
-    'PW': 'transport',
-}
-CLIMATE_UNITS = {
-    'ta': 'K',
-    'ts': 'K',
-    'hus': 'g kg^-1',
-    'huss': 'g kg^-1',
-    'hfls': 'W m^-2',
-    'hfss': 'W m^-2',
-    'prw': 'mm',  # water vapor path not precip
-    'pr': 'mm day^-1',
-    'prl': 'mm day^-1',  # derived
-    'pri': 'mm day^-1',  # renamed
-    'ev': 'mm day^-1',  # renamed
-    'evl': 'mm day^-1',  # derived
-    'evi': 'mm day^-1',  # renamed
-    'clwvi': 'mm',
-    'cllvi': 'mm',  # derived
-    'clivi': 'mm',
-    'clw': 'g kg^-1',
-    'cll': 'g kg^-1',
-    'cli': 'g kg^-1',
-    'ua': 'm s^-1',
-    'va': 'm s^-1',
-    'uas': 'm s^-1',
-    'vas': 'm s^-1',
-    'tauu': 'Pa',
-    'tauv': 'Pa',
-    'pbot': 'hPa',
-    'ptop': 'hPa',
-    'psl': 'hPa',
-    'ps': 'hPa',
-    'zg': 'dam',
-}
+# MultiIndex corodinate settings
+# NOTE: Currently years for 'ratio' type feedbacks always correspond to the abrupt4xCO2
+# climate average; the pre-industrial climate average is always over the full 150 years.
+# TODO: Should instead have 'facets' coordinate for project / model / ensemble and
+# 'parameters' coordinate containing experiment / start / stop / style / region. For
+# circulation data, will have 'ratio' style for year 120-150 abrupt 4xCO2 changes
+# normalized by temperature (e.g. 'rfnt' is net flux change, including forcing) while
+# 'monthly' and 'annual' are pre-industrial or abrupt 4xCO2 regressions against
+# temperature (as with feedback calculations). Will rename 'source' on both to e.g.
+# simply 'internal' or 'external' (or add as distinct feedback-only coordinate) while
+# 'start' 'stop' and 'region' indicate integration or averaging periods and temperature
+# normalization settings. Climatologies will be under variables with no 'parameters'
+# coordinate while normalized sensitivities will have 'lam' suffix as with feedbacks
+# with 'erf' suffix indicating rapid responses. Incredibly ellegant + powerful tool!
+FACETS_LEVELS = (
+    'project',
+    'model',
+    'experiment',
+    'ensemble',
+)
+VERSION_LEVELS = (
+    'source',
+    'style',
+    'start',  # initial year of regression or 'forced' climate average
+    'stop',  # final year of regression or 'forced' climate average
+    'region',
+)
 
 # Feedback constants
+# NOTE: Specify flux boundary with leading prefix e.g. 'slw' or 'tlw'
 # NOTE: These are used to both translate tables from external sources into the more
 # descriptive naming convention, and to translate inputs to plotting functions for
 # convenience (default for each shorthand is to use combined longwave + shortwave toa).
@@ -195,21 +143,64 @@ FEEDBACK_SETTINGS = {
     'err': ('resid_rfnt_lam', 'W m^-2 K^-1'),  # forster definition
     'resid': ('resid_rfnt_lam', 'W m^-2 K^-1'),  # preferred name last (for reverse translation)  # noqa: E501
 }
-
-# Add additional feedback aliases
-# NOTE: This is used for plotting stuff and things
-_feedback_aliases = {alias: name for alias, (name, _) in FEEDBACK_SETTINGS.items()}
+ALIAS_FEEDBACKS = {alias: name for alias, (name, _) in FEEDBACK_SETTINGS.items()}
 ALIAS_FEEDBACKS = {
-    **{f't{alias}': name for alias, name in _feedback_aliases.items()},
-    **{f's{alias}': name.replace('t_', 's_') for alias, name in _feedback_aliases.items()},  # noqa: E501
-    **{f'a{alias}': name.replace('t_', 'a_') for alias, name in _feedback_aliases.items()},  # noqa: E501
-    **_feedback_aliases,
+    **{f't{alias}': name for alias, name in ALIAS_FEEDBACKS.items()},
+    **{f's{alias}': name.replace('t_', 's_') for alias, name in ALIAS_FEEDBACKS.items()},  # noqa: E501
+    **{f'a{alias}': name.replace('t_', 'a_') for alias, name in ALIAS_FEEDBACKS.items()},  # noqa: E501
+    **ALIAS_FEEDBACKS,  # leading characters specify boundary e.g. 'slw'
 }
 FEEDBACK_ALIASES = {value: key for key, value in ALIAS_FEEDBACKS.items()}
+
+# Climate constants
+# NOTE: For now use the standard 1e3 kg/m3 water density (i.e. snow and ice terms
+# represent melted equivalent depth) but could also use 1e2 kg/m3 snow density where
+# relevant. See: https://www.sciencelearn.org.nz/resources/1391-snow-and-ice-density
+# NOTE: These entries inform the translation from standard unit strings to short
+# names like 'energy flux' and 'energy transport' used in figure functions. In
+# future should group all of these into cfvariables with standard units.
+CLIMATE_SCALES = {  # scaling prior to final unit transformation
+    'prw': 1 / const.rhow,  # water vapor path not precip
+    'pr': 1 / const.rhow,
+    'prl': 1 / const.rhow,  # derived
+    'pri': 1 / const.rhow,
+    'ev': 1 / const.rhow,
+    'evl': 1 / const.rhow,  # derived
+    'evi': 1 / const.rhow,
+    'clwvi': 1 / const.rhow,
+    'cllvi': 1 / const.rhow,  # derived
+    'clivi': 1 / const.rhow,
+}
+CLIMATE_SHORTS = {
+    'K': 'temperature',
+    'hPa': 'pressure',
+    'dam': 'surface height',
+    'mm': 'liquid depth',
+    'mm day^-1': 'accumulation',
+    'm s^-1': 'wind speed',
+    'Pa': 'wind stress',  # default tau units
+    'g kg^-1': 'concentration',
+    'W m^-2': 'flux',
+    'PW': 'transport',
+}
+CLIMATE_UNITS = {
+    'K': ('ta', 'ts'),
+    'hPa': ('pbot', 'ptop', 'psl', 'ps'),
+    'dam': ('zg',),
+    'mm': ('prw', 'clwvi', 'cllvi', 'clivi'),
+    'mm day^-1': ('pr', 'prl', 'pri', 'ev', 'evl', 'evi'),  # translated
+    'm s^-1': ('ua', 'va', 'uas', 'vas'),
+    'Pa': ('tauu', 'tauv'),
+    'g kg^-1': ('hus', 'huss', 'clw', 'cll', 'cli'),
+    'W m^-2': ('hfls', 'hfss'),
+    'PW': ('intuadse', 'intvadse', 'intuaw', 'intvaw'),
+}
 
 # Energetics constants
 # NOTE: Here the flux components table was copied from feedbacks.py. Critical
 # to get net fluxes and execute renames before running transport derivations.
+# NOTE: Here the %s is filled in with water, liquid, or ice depending on the
+# component of the particular variable category.
 # NOTE: Rename native surface budget terms to look more like cloud water and
 # ice terms. Then use 'prl'/'prp' and 'evl'/'evp' for ice components.
 ENERGETICS_RENAMES = {
@@ -228,10 +219,6 @@ ENERGETICS_COMPONENTS = {
     'rlnscs': ('rldscs', 'rlus'),  # evaluates to rlus - rldscs (in minus out)
     'rsnscs': ('rsdscs', 'rsuscs'),  # evaluates to rsuscs - rsdscs (in minus out)
 }
-
-# Moisture-related constants
-# NOTE: Here the %s is filled in with water, liquid, or ice depending
-# on the component of the particular variable category.
 MOISTURE_DEPENDENCIES = {
     'hur': ('plev', 'ta', 'hus'),
     'hurs': ('ps', 'ts', 'huss'),
@@ -467,23 +454,24 @@ def _update_climate_units(dataset):
     """
     # NOTE: For converting snow precipitation we assume a simple 10:1 snow:liquid
     # ratio. See: https://www.sciencelearn.org.nz/resources/1391-snow-and-ice-density
-    for variable, unit in CLIMATE_UNITS.items():
-        if variable not in dataset:
-            continue
-        scale = CLIMATE_SCALES.get(variable, 1.0)
-        data = dataset[variable]
-        if ureg.parse_units(unit) == data.climo.units:
-            continue
-        if quantify := not data.climo._is_quantity:
-            with xr.set_options(keep_attrs=True):
-                data = scale * data.climo.quantify()
-        data = data.climo.to_units(unit)
-        if quantify:
-            with xr.set_options(keep_attrs=True):
-                data = data.climo.dequantify()
-        dataset[variable] = data
-    for src in (dataset.data_vars, dataset.coords):
-        for variable, data in src.items():
+    for unit, variables in CLIMATE_UNITS.items():
+        for variable in variables:
+            if variable not in dataset:
+                continue
+            scale = CLIMATE_SCALES.get(variable, 1.0)
+            data = dataset[variable]
+            if ureg.parse_units(unit) == data.climo.units:
+                continue
+            if quantify := not data.climo._is_quantity:
+                with xr.set_options(keep_attrs=True):
+                    data = scale * data.climo.quantify()
+            data = data.climo.to_units(unit)
+            if quantify:
+                with xr.set_options(keep_attrs=True):
+                    data = data.climo.dequantify()
+            dataset[variable] = data
+    for source in (dataset.data_vars, dataset.coords):
+        for variable, data in source.items():
             long = data.attrs.get('long_name', None)
             unit = data.attrs.get('units', None)
             short = CLIMATE_SHORTS.get(unit, long)  # default long name, e.g. longitude
@@ -995,7 +983,7 @@ def _update_feedback_terms(
             continue  # no need to load full wavelength as well
         if not parts_wav and m.group(3) != 'f' and m.group(1) not in parts_keep:
             continue  # ignore full wavelength parts
-        if not parts_erf and 'erf' in key and m.group(1) != '':
+        if not parts_erf and 'erf' in key and (m.group(1) != '' or m.group(6) != ''):
             continue
         keys_keep.add(key)
 
@@ -1035,7 +1023,8 @@ def _update_feedback_terms(
 
 def climate_datasets(
     *paths,
-    years=None, anomaly=True, ignore=None, nodrift=False, standardize=True,
+    years=None, anomaly=True, average=False,
+    ignore=None, nodrift=False, standardize=True,
     **constraints
 ):
     """
@@ -1046,10 +1035,12 @@ def climate_datasets(
     *paths : path-like
         The search paths.
     years : 2-tuple of int
-        The year range.
+        The climate year range.
     anomaly : bool, optional
-        Whether to load 4xCO2 data in anomaly form.
-    ignore : bool, optional
+        Whether to load response data in anomaly form.
+    average : bool, optional
+        Whether to average across the time dimension.
+    ignore : str or sequence, optional
         The variables to optionally ignore.
     nodrift : bool, optional
         Whether to use drift corrections.
@@ -1067,7 +1058,7 @@ def climate_datasets(
     """
     # Initial stuff
     # TODO: Support regressions of each variable onto global temperature to go
-    # along with ratio-style climate responses. Analogous to feedback calculations.
+    # along with ratio-style climate responses. See notes under VERSION_LEVELS.
     # NOTE: Non-flagship simulations can be added with flagship_translate=True
     # as with other processing functions. Ensembles are added in a MultiIndex
     kw_energetics = {key: constraints.pop(key) for key in KEYS_ENERGY if key in constraints}  # noqa: E501
@@ -1097,15 +1088,14 @@ def climate_datasets(
         # NOTE: Critical to overwrite the time coordinates after loading or else xarray
         # coordinate matching will apply all-NaN values for climatolgoies with different
         # base years (e.g. due to control data availability or response calendar diffs).
-        project, model, experiment, ensemble = facets
-        if not data or model in MODELS_SKIP:
-            continue
         for sub, replace in FACETS_RENAME.items():
-            experiment = experiment.replace(sub, replace)
-        range_ = (120, 150) if experiment == 'abrupt4xco2' else (0, 150)
+            facets = tuple(facet.replace(sub, replace) for facet in facets)
+        if not data or facets[1] in MODELS_SKIP:
+            continue
+        range_ = (120, 150) if facets[2] == 'abrupt4xco2' else (0, 150)
         range_ = years if years is not None else range_
         dates = f'{range_[0]:04d}-{range_[1]:04d}-climate{nodrift}'
-        print(f'{model}_{experiment}_{range_[0]:04d}-{range_[1]:04d}', end=' ')
+        print(f'{facets[1]}_{facets[2]}_{range_[0]:04d}-{range_[1]:04d}', end=' ')
         dataset = xr.Dataset()
         for key, paths in data.items():
             variable = key[database.key.index('variable')]
@@ -1115,12 +1105,16 @@ def climate_datasets(
             if len(paths) > 1:
                 print(f'Warning: Skipping ambiguous duplicate paths {list(map(str, paths))}.', end=' ')  # noqa: E501
                 continue
-            array = load_file(paths[0], variable, project=project)
-            array = assign_dates(array, year=1800)  # exactly 12 months required
+            array = load_file(paths[0], variable, project=facets[0])
             descrip = array.attrs.pop('title', variable)  # in case long_name missing
             descrip = array.attrs.pop('long_name', descrip)
             descrip = ' '.join(s if s == 'TOA' else s.lower() for s in descrip.split())
             array.attrs['long_name'] = descrip
+            if 'time' in array.sizes:
+                array = assign_dates(array, year=1800)  # exactly 12 months required
+                if average:
+                    days = array.time.dt.days_in_month.astype(np.float32)
+                    array = array.weighted(days).mean('time', skipna=False, keep_attrs=True)  # noqa: E501
             dataset[variable] = array
 
         # Standardize the data
@@ -1152,21 +1146,19 @@ def climate_datasets(
     if anomaly:
         print('Transforming abrupt 4xCO2 data into anomalies.')
         for facets, dataset in tuple(datasets.items()):
-            project, model, experiment, ensemble = facets
-            if experiment != 'abrupt4xco2':
+            control = (facets[0], facets[1], 'picontrol', facets[3])
+            if facets[2] == 'abrupt4xco2':
                 continue
-            control = (project, model, 'picontrol', ensemble)
-            if control not in datasets:
-                del datasets[facets]
+            if control not in datasets and datasets.pop(facets):  # one line
                 continue
-            dataset0 = datasets[control]
+            climate = datasets[control]
             for name, data in dataset.data_vars.items():
                 if name[:4] in ('ps', 'cell'):
                     continue
-                if name not in dataset0:
+                if name not in climate:
                     dataset = dataset.drop_vars(name)
                 else:  # WARNING: use .data to avoid subtracting coords
-                    data.data -= dataset0[name].data
+                    data.data -= climate[name].data
                     if name == 'ts':
                         data.attrs['long_name'] = 'surface warming'
                         data.attrs['short_name'] = 'warming'
@@ -1184,8 +1176,8 @@ def feedback_datasets(
     quadruple=True, boundary=None, source=None, style=None,
     early=True, late=True, historical=False, delayed=False,
     point=True, latitude=True, hemisphere=False,
-    annual=True, seasonal=True, monthly=False,
-    nodrift=False, standardize=True,
+    annual=True, seasonal=False, monthly=False,
+    average=False, nodrift=False, standardize=True,
     **constraints,
 ):
     """
@@ -1207,6 +1199,8 @@ def feedback_datasets(
         Whether to include or drop extra range feedbacks.
     annual, seasonal, monthly : bool, optional
         Whether to include or drop extra period feedbacks.
+    average : bool, optional
+        Whether to average feedbacks with 'time' dimension.
     nodrift : bool, optional
         Whether to use drift corrections.
     standardize : bool, optional
@@ -1223,7 +1217,8 @@ def feedback_datasets(
     """
     # Initial stuff
     # TODO: Support subtracting global anomaly within get_data() by adding suffix
-    # to the variable string? Tricky in context of e.g. anomaly regressions.
+    # to the variable string or allowing user override of 'relative' key? Tricky in
+    # context of e.g. regressions of anomalies against something not anomalous.
     kw_both = {'quadruple': quadruple, 'boundary': boundary}
     kw_terms = {key: constraints.pop(key) for key in KEYS_FEEDBACKS if key in constraints}  # noqa: E501
     sample = pd.date_range('2000-01-01', '2000-12-01', freq='MS')
@@ -1252,6 +1247,8 @@ def feedback_datasets(
         print('Model:', end=' ')
     for facets, data in database.items():
         # Load the data
+        # TODO: Figure out if lots of filled NaN sectors increase dataset size? Could
+        # try to prevent intersection of 'picontrol' with non-default startstop.
         # NOTE: This accounts for files with dedicated regions indicated in the name,
         # files with numerator and denominator multi-index coordinates, and files with
         # just a denominator region coordinate. Note load_file builds the multi-index.
@@ -1272,6 +1269,8 @@ def feedback_datasets(
             start, stop, source, style, *_ = suffix.split('-')  # ignore -nodrift
             start, stop = map(int, (start, stop))
             version = (source, style, start, stop)
+            if facets[1] == 'CERES':  # prevent bloated 'version' coordinate
+                version = ('eraint', style, 0, 150)
             if sources and source not in sources:
                 continue
             if styles and style not in styles:
@@ -1312,16 +1311,19 @@ def feedback_datasets(
             dataset = dataset.drop_vars(arrays)
             dataset = _update_feedback_attrs(dataset, **kw_both)
             dataset = _update_feedback_terms(dataset, **kw_both, **kw_terms)
-            if 'time' in dataset.sizes:
-                dataset = assign_dates(dataset, year=1800)
             for array in dataset.data_vars.values():
-                if '_erf' in array.name or '_ecs' in array.name:
+                if scale != 1 and any(f'_{s}' in array.name for s in ('erf', 'ecs')):
                     array *= scale  # NOTE: array.data *= fails for unloaded data
             for name, data in arrays.items():  # address _fluxes_from_anomalies bug
                 if 'plev' in data.sizes:
                     data = data.isel(plev=0, drop=True)
                 if name not in noncat:
                     noncat[name] = data
+            if 'time' in dataset.sizes:
+                dataset = assign_dates(dataset, year=1800)
+                if average:  # use assigned dates so results will be consistent
+                    days = dataset.time.dt.days_in_month.astype(np.float32)
+                    dataset = dataset.weighted(days).mean('time', skipna=False, keep_attrs=True)  # noqa: E501
             concat[version] = dataset
         dataset = xr.concat(
             concat.values(),
@@ -1331,20 +1333,16 @@ def feedback_datasets(
             combine_attrs='override',
         )
         dataset = dataset.stack(version=['concat', 'region'])
-        index = tuple(concat)  # original version values
-        index = [(*index[idx], region) for idx, region in dataset.version.values]
-        index = xr.DataArray(
-            pd.MultiIndex.from_tuples(index, names=VERSION_LEVELS),
+        version = tuple(concat)  # original version values
+        version = [(*version[idx], region) for idx, region in dataset.version.values]
+        version = xr.DataArray(
+            pd.MultiIndex.from_tuples(version, names=VERSION_LEVELS),
             dims='version',
             name='version',
             attrs={'long_name': 'feedback version'},
         )
-        dataset = dataset.assign_coords(version=index)
+        dataset = dataset.assign_coords(version=version)
         dataset = dataset.squeeze()
-        if 'tstd' in dataset:
-            temp = dataset.tstd.climo.add_cell_measures(('width', 'depth'))
-            dataset['tdev'] = anom = dataset.tstd - temp.climo.average('area')
-            anom.attrs.update(units='K', short_name='warming', long_name='relative warming')  # noqa: E501
         for name, array in noncat.items():
             dataset[name] = array
         if standardize:
@@ -1400,9 +1398,9 @@ def feedback_datasets_json(
     for file in sorted(file for path in paths for file in path.glob('cmip*.json')):
         source = file.stem.split('_')[1]
         print(f'External file: {file.name}')
-        index = (source, 'annual', 'globe', 0, 150)
-        index = xr.DataArray(
-            pd.MultiIndex.from_tuples([index], names=VERSION_LEVELS),
+        version = (source, 'annual', 0, 150, 'globe')
+        version = xr.DataArray(
+            pd.MultiIndex.from_tuples([version], names=VERSION_LEVELS),
             dims='version',
             name='version',
             attrs={'long_name': 'feedback version'},
@@ -1428,11 +1426,11 @@ def feedback_datasets_json(
                 for key, value in group.items():
                     name, units = FEEDBACK_SETTINGS[key.lower()]
                     attrs = {'units': units}  # long name assigned below
-                    if '_erf' in name or '_ecs' in name:
+                    if scale != 1 and any(f'_{s}' in name for s in ('erf', 'ecs')):
                         value = scale * value
                     dataset[name] = xr.DataArray(value, attrs=attrs)
                 dataset = dataset.expand_dims(version=1)
-                dataset = dataset.assign_coords(version=index)
+                dataset = dataset.assign_coords(version=version)
                 if facets in datasets:
                     datasets[facets].update(dataset)
                 else:
@@ -1493,9 +1491,9 @@ def feedback_datasets_text(
         if source == 'zelinka':
             continue
         print(f'External file: {file.name}')
-        index = (source, 'annual', 'globe', 0, 150)
-        index = xr.DataArray(
-            pd.MultiIndex.from_tuples([index], names=VERSION_LEVELS),
+        version = (source, 'annual', 0, 150, 'globe')
+        version = xr.DataArray(
+            pd.MultiIndex.from_tuples([version], names=VERSION_LEVELS),
             dims='version',
             name='version',
             attrs={'long_name': 'feedback version'},
@@ -1511,7 +1509,7 @@ def feedback_datasets_text(
         table.index.name = 'model'
         dataset = table.to_xarray()
         dataset = dataset.expand_dims(version=1)
-        dataset = dataset.assign_coords(version=index)
+        dataset = dataset.assign_coords(version=version)
         scale = 0.5 if any('4x' in key for key in dataset.data_vars) else 1.0
         scale = 2 * scale if quadruple else scale
         for key, array in dataset.data_vars.items():
@@ -1528,7 +1526,7 @@ def feedback_datasets_text(
                 if any(lab in model for lab in ('mean', 'deviation', 'uncertainty')):
                     continue
                 select = array.sel(model=model, drop=True)
-                if units in ('K', 'W m^-2'):  # avoid in-place operation
+                if scale != 1 and units in ('K', 'W m^-2'):  # avoid in-place operation
                     select = scale * select
                 select.name = name
                 select.attrs.update({'units': units})  # long name assigned below
@@ -1551,8 +1549,8 @@ def open_dataset(
     project=None,
     climate=True,
     feedbacks=True,
-    feedbacks_json=None,
-    feedbacks_text=None,
+    feedbacks_json=False,
+    feedbacks_text=False,
     standardize=True,
     **constraints,
 ):
@@ -1585,26 +1583,23 @@ def open_dataset(
     # taking the average (see notes -- also tested outdated feedback files directly).
     # So can compare e.g. internal and external feedbacks with ``region='globe'`` and
     # ``area='avg'`` -- this is a no-op for the spatially uniform external feedbacks.
+    keys_internal = ('nodrift', 'average')  # whether to average over months
     keys_climate = ('years', 'anomaly', 'ignore', *KEYS_ENERGY, *KEYS_MOIST, *KEYS_TRANSPORT, *KEYS_VERSION)  # noqa: E501
-    keys_internal = ('source', 'style', *KEYS_REGIONS, *KEYS_RANGES, *KEYS_PERIODS)
+    keys_version = ('source', 'style', *KEYS_REGIONS, *KEYS_RANGES, *KEYS_PERIODS)
     keys_feedback = ('quadruple', 'boundary', *KEYS_FEEDBACKS)
     kw_json = {'nonflag': constraints.pop('nonflag', False)}
     kw_text = {'transient': constraints.pop('transient', False)}
-    kw_nodrift = {k: constraints.pop(k) for k in ('nodrift',) if k in constraints}
-    kw_climate = {k: constraints.pop(k) for k in keys_climate if k in constraints}
     kw_internal = {k: constraints.pop(k) for k in keys_internal if k in constraints}
+    kw_climate = {k: constraints.pop(k) for k in keys_climate if k in constraints}
+    kw_version = {k: constraints.pop(k) for k in keys_version if k in constraints}
     kw_feedback = {k: constraints.pop(k) for k in keys_feedback if k in constraints}
-    kw_internal = {**kw_internal, **kw_feedback}  # slightly simpler
+    kw_version = {**kw_version, **kw_feedback}  # slightly simpler
     dirs_table = ('cmip-tables',)
     dirs_climate = ('cmip-climate',)
     dirs_feedback = ('cmip-feedbacks', 'ceres-feedbacks')
     bases = ('~/data', '~/scratch')
     datasets = {}
     projects = project.split(',') if isinstance(project, str) else ('cmip5', 'cmip6')
-    if feedbacks_json is None:
-        feedbacks_json = feedbacks
-    if feedbacks_text is None:
-        feedbacks_text = feedbacks
 
     # Open the datasets
     # WARNING: Using dataset.update() instead of xr.combine_by_coords() below can
@@ -1613,8 +1608,8 @@ def open_dataset(
     for project in map(str.upper, projects):
         print(f'Project: {project}')
         for b, function, dirs, kw in (
-            (climate, climate_datasets, dirs_climate, {**kw_climate, **kw_nodrift}),
-            (feedbacks, feedback_datasets, dirs_feedback, {**kw_internal, **kw_nodrift}),  # noqa: E501
+            (climate, climate_datasets, dirs_climate, {**kw_climate, **kw_internal}),
+            (feedbacks, feedback_datasets, dirs_feedback, {**kw_version, **kw_internal}),  # noqa: E501
             (feedbacks_json, feedback_datasets_json, dirs_table, {**kw_json, **kw_feedback}),  # noqa: E501
             (feedbacks_text, feedback_datasets_text, dirs_table, {**kw_text, **kw_feedback}),  # noqa: E501
         ):
@@ -1655,7 +1650,7 @@ def open_dataset(
     print('Concatenating datasets.')
     if not datasets:
         raise ValueError('No datasets found.')
-    index = xr.DataArray(
+    facets = xr.DataArray(
         pd.MultiIndex.from_tuples(datasets, names=FACETS_LEVELS),
         dims='facets',
         name='facets',
@@ -1663,7 +1658,7 @@ def open_dataset(
     )
     dataset = xr.concat(
         datasets.values(),
-        dim=index,
+        dim=facets,
         coords='minimal',
         compat='override',
         combine_attrs='override',

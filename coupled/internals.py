@@ -24,7 +24,7 @@ WRAP_SCALE = 1.8
 # Keywords for inter-model reduction methods
 # NOTE: Here 'hemisphere' is not passed to reduce() but handled directly
 KEYS_VARIABLE = (
-    'hemi', 'hemisphere', 'standardize',
+    'hemi', 'hemisphere', 'quantify', 'standardize',
 )
 KEYS_METHOD = (  # skip 'spatial' because used in apply_reduce
     'method', 'std', 'pctile', 'invert', 'normalize',
@@ -40,21 +40,8 @@ REGEX_SPLIT = re.compile(  # ignore e.g. leading positive and negative signs
 )
 
 # Path naming and reduction defaults
-# NOTE: New format will specify either 'monthly' or 'annual'
-DEFAULTS_REDUCE = {
-    'experiment': 'picontrol',
-    'ensemble': 'flagship',
-    'period': 'ann',
-    'time': 'avg',
-}
-DEFAULTS_VERSION = {
-    'experiment': 'abrupt4xco2',
-    'source': 'eraint',
-    'style': 'slope',
-    'start': 0,
-    'stop': 150,
-    'region': 'globe',
-}
+# NOTE: New format will prefer either 'monthly' or 'annual'. To prevent overwriting
+# old results keep 'slope' as the default (i.e. omitted) value when generating paths.
 DEFAULTS_PATH = {
     'project': 'cmip',  # ignore if passed
     'ensemble': 'flagship',

@@ -589,7 +589,6 @@ def feedback_breakdown(
         kwargs = {'gridskip': None, 'ncols': len(names)}
     else:  # custom arrangement
         kwargs = {'gridskip': gridskip, 'ncols': maxcols}
-    ic(names, gridskip)
     return names, kwargs
 
 

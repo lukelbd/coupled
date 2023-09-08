@@ -298,30 +298,30 @@ def _parse_project(data, project=None):
     )
     if not project.startswith('cmip'):
         raise ValueError(f'Invalid project indicator {project}. Must contain cmip.')
-    _, num = project.split('cmip')
-    imax = max(1, len(num))
-    if imax > 4:
-        raise ValueError(f'Invalid project indicator {project}. Up to 4 numbers allowed.')  # noqa: E501
+    _, number = project.split('cmip')
+    digits = max(1, len(number))
+    if digits > 4:
+        raise ValueError(f'Invalid project indicator {project}. Up to 4 digits allowed.')  # noqa: E501
     funcs = []  # permit e.g. cmip6556 or inst6556
-    for i in range(0, imax, 2):
-        n = num[i:i + 2]
-        if not n:
+    for idx in range(0, digits, 2):
+        num = number[idx:idx + 2]
+        if not num:
             func = lambda key: True  # noqa: U100
-        elif n in ('5', '6'):
-            func = lambda key: key[0][-1] == n
-        elif n in ('65', '66', '56', '55'):
-            b = True if len(set(n)) == 2 else False
-            o = '6' if n[0] == '5' else '5'
-            func = lambda key, boo=b, num=n, opp=o: (
-                num[0] == key[0][-1]
-                and boo == any(
+        elif num in ('5', '6'):
+            func = lambda key: key[0][-1] == num
+        elif num in ('65', '66', '56', '55'):
+            other = '6' if num[0] == '5' else '5'
+            both = len(set(num)) == 2
+            func = lambda key, iboth=both, inum=num, iother=other: (
+                inum[0] == key[0][-1]
+                and iboth == any(
                     name_to_inst.get((key[0], key[1]), object())
                     == name_to_inst.get((other[0], other[1]), object())
-                    for other in data.facets.values if opp == other[0][-1]
+                    for other in data.facets.values if iother == other[0][-1]
                 )
             )
         else:
-            raise ValueError(f'Invalid project number {n!r}.')
+            raise ValueError(f'Invalid project number {num!r}.')
         funcs.append(func)
     func = lambda key: any(func(key) for func in funcs)
     func.name = project  # WARNING: critical for process_data() detection of 'all_projs'
@@ -353,11 +353,12 @@ def _parse_institute(data, institute=None):
     # supported for special weighted facet-averages and bar or scatter plots.
     inst_to_label = INSTITUTES_LABELS.copy()  # see also _parse_constraints
     model_to_inst = MODELS_INSTITUTES.copy()
+    model_to_inst['CMIP6', 'CERES'] = 'CERES'  # observations placeholder
     if not institute:
         filt = lambda key: True  # noqa: U100
     elif institute == 'avg':
         insts = [
-            model_to_inst.get((key[0], key[1]), 'U')
+            model_to_inst.get((key[0], key[1]), 'UNKNOWN')
             for key in data.facets.values
         ]
         facets = [
@@ -374,7 +375,7 @@ def _parse_institute(data, institute=None):
         inst_to_model = {  # NOTE: flagship models are ordered last in list
             (proj, inst): model for (proj, model), inst in model_to_inst.items()
         }
-        filt = lambda key: (
+        filt = lambda key: (  # true if model is flagship member of its institute
             key[1] == inst_to_model.get((key[0], model_to_inst.get((key[0], key[1]))))
         )
         filt.name = institute  # unnecessary but why not
@@ -382,7 +383,7 @@ def _parse_institute(data, institute=None):
         label_to_inst = {
             abbrv: inst for inst, abbrv in inst_to_label.items()
         }
-        filt = lambda key: (
+        filt = lambda key: (  # true if input institute or label matches model institute
             label_to_inst.get(institute, institute) == model_to_inst.get((key[0], key[1]))  # noqa: E501
         )
         filt.name = institute  # unnecessary but why not
@@ -712,35 +713,46 @@ def apply_reduce(data, attrs=None, **kwargs):
         The data array.
     """
     # Apply facet reductions and grouped averages
-    # TODO: Might consider adding 'institute' multiindex so e.g. .groupby('institute')
-    # is possible... then again would not reduce complexity because would need to
-    # load files in special non-alphabetical order to enable selecting 'flaghip'
-    # models with e.g. something like .sel(institute=-1)... so don't bother for now.
-    # WARNING: Critical to do this at end since .groupby() does not seem to handle
-    # cell measures that vary across models i.e. cell_height() used for averages.
+    # TODO: In future will add 'institute' MultiIndex level (see also results.py).
+    # Should replace parsers with a function that does basic project and institute
+    # selections (note e.g. 'cmip65' is already an institute-based selection so should
+    # be in same function anyway), then modify _method_single() and _method_double()
+    # to support either insitute-averaging preceding the facet operations or using
+    # weights .groupby(grouper) + 1 / xr.ones_like(facets).groupby(grouper).sum(). Both
+    # will need a 'grouper' made by e.g. dropping the model level. Could use simliar
+    # method to get ensemble average across individual model versions (similar to
+    # other papers e.g. Caldwell or Brient maybe that used multiple versions?)
+    # NOTE: Much faster to delay institute averaging to facet reduction stage since
+    # simple selections will have already been made. Also makes more sense.
     institute = kwargs.pop('institute', None)  # apply after end
     project = kwargs.pop('project', None)  # apply after end
-    if institute is not None:  # WARNING: critical this comes first
-        institute = _parse_institute(data, institute)
-        if callable(institute):  # facets filter function
-            facets = list(filter(institute, data.facets.values))
+    facets = data.indexes.get('facets', pd.Index([]))
+    long_name = '' if facets is None else data.facets.attrs.get('long_name', '')
+    long_name = long_name or 'source facets'  # default name
+    if facets is not None and len(facets.names) >= 2:
+        if institute is not None and 'institute' not in long_name:
+            institute = _parse_institute(data, institute)
+            if callable(institute):  # select models based on their institutes
+                facets = list(filter(institute, data.facets.values))
+                data = data.sel(facets=facets)
+            else:  # TODO: group inside separate function?
+                height = data.coords.get('cell_height', None)
+                data = data.groupby(institute).mean(skipna=False, keep_attrs=True)
+                if height is not None and 'facets' in height.dims:  # varies by model
+                    height = height.groupby(institute).mean(skipna=False, keep_attrs=True)  # noqa: E501
+                    data.coords['cell_height'] = height
+                facets = data.indexes['facets']  # WARNING: xarray bug drops level names
+                facets.names = institute.indexes['facets'].names
+                long_name = 'source institute'  # see bottom of this function
+                data = data.climo.replace_coords(facets=facets)  # use restored levels
+                data.facets.attrs.update({'long_name': long_name})
+        if project is not None:
+            project = _parse_project(data, project)  # see _parse_project
+            facets = list(filter(project, data.facets.values))
             data = data.sel(facets=facets)
-        else:  # TODO: group inside separate function?
-            height = data.coords.get('cell_height', None)
-            data = data.groupby(institute).mean(skipna=False, keep_attrs=True)
-            if height is not None and 'facets' in height.dims:  # also varies by model!
-                height = height.groupby(institute).mean(skipna=False, keep_attrs=True)
-                data.coords['cell_height'] = height
-            dict_ = institute.facets.attrs  # WARNING: avoid overwriting input attrs
-            facets = data.indexes['facets']  # WARNING: xarray bug drops level names
-            facets.names = institute.indexes['facets'].names
-            facets = xr.DataArray(facets, name='facets', dims='facets', attrs=dict_)
-            data = data.assign_coords(facets=facets)  # assign with restored levels
-    if project is not None:  # see _parse_project
-        project = _parse_project(data, project)
-        facets = list(filter(project, data.facets.values))
-        data = data.sel(facets=facets)
-        data = data.reset_index('project', drop=True)  # models are unique
+            projs = sorted(set(data.project.values))
+            if len(projs) == 1:  # drop, helps shorten e.g. scatter plot labels
+                data = data.reset_index('project', drop=True)  # note model names unique
 
     # Apply time reductions and grouped averages
     # TODO: Replace 'average_periods' with this and normalize by annual temperature.
@@ -797,13 +809,13 @@ def apply_reduce(data, attrs=None, **kwargs):
                 styles = [style for style in ('monthly', 'annual') if style in styles]
             if len(styles) > 0:
                 defaults['style'] = styles.pop()
-        for key, value in defaults.items():  # apply default reductions
+        for dim, value in defaults.items():  # apply default reductions
             if 'startstop' in kw:  # inside loop for aesthetics only
                 kw['start'], kw['stop'] = kw.pop('startstop')
-            if key in kw and kw[key] is None and key != 'time':
-                kw[key] = value  # typically use 'None' as default placeholder
+            if dim in kw and kw[dim] is None and dim != 'time':
+                kw[dim] = value  # typically use 'None' as default placeholder
             else:  # for 'time' use 'None' to bypass operation
-                kw.setdefault(key, value)
+                kw.setdefault(dim, value)
         if 'version' in data.coords:
             experiment, region, period = kw['experiment'], kw['region'], kw['period']
             if period[0] == 'a' and period != 'ann':  # abrupt-only period
@@ -820,23 +832,23 @@ def apply_reduce(data, attrs=None, **kwargs):
         # to prevent _parse_specs from merging e.g. average and non-average selections.
         # WARNING: Sometimes multi-index reductions can eliminate previously valid
         # coords, so critical to iterate one-by-one and validate selections each time.
-        for key, value in sorted(kw.items(), key=sorter):
+        for dim, value in sorted(kw.items(), key=sorter):
             opts = [*data.sizes, 'area', 'volume', 'spatial']
             opts.extend(level for idx in data.indexes.values() for level in idx.names)
             dims = data.sizes.keys() & {'lon', 'lat', 'plev'}
-            if key not in opts or value is None:
+            if dim not in opts or value is None:
                 continue
-            if key in spatial_ignore and kw.get('spatial', None):
+            if dim in spatial_ignore and kw.get('spatial', None):
                 continue
-            if key == 'area' and not dims - {'plev'} or key == 'volume' and not dims:
+            if dim == 'area' and not dims - {'plev'} or dim == 'volume' and not dims:
                 continue
-            if key == 'area':
+            if dim == 'area':
                 region = AREA_REGIONS.get(value, None)
                 if region is not None:
                     data, value = data.climo.truncate(region), 'avg'
                 elif value != 'avg':
                     raise ValueError(f'Unknown averaging region {value!r}.')
-            if key == 'time' and 'time' in data.sizes:  # manual weighted average
+            if dim == 'time' and 'time' in data.sizes:  # manual weighted average
                 if value == 'avg':
                     days = data.time.dt.days_in_month.astype(data.dtype)
                     with xr.set_options(keep_attrs=True):  # average over entire record
@@ -844,27 +856,28 @@ def apply_reduce(data, attrs=None, **kwargs):
                 elif value is not None:
                     raise ValueError(f'Unknown time reduction method {time!r}.')
                 continue
-            if key in data.coords and not isinstance(value, (str, tuple)):
-                unit = data.coords[key].climo.units
+            if dim in data.coords and not isinstance(value, (str, tuple)):
+                unit = data.coords[dim].climo.units
                 if isinstance(value, ureg.Quantity):
                     value = value.to(unit)
                 else:
                     value = ureg.Quantity(value, unit)
-            data = data.climo.reduce({key: value}, method='interp')
+            data = data.climo.reduce({dim: value}, method='interp')
             data = data.squeeze()
-            if key not in data.coords:
-                data.coords[key] = value  # converts to data array
-                data.coords[key] = data.coords[key].climo.dequantify()
-            for multi, levels in zip(('facets', 'version'), (FACETS_LEVELS, VERSION_LEVELS)):  # noqa: E501
-                if multi in data.coords:  # multi-index still present
+            if dim not in data.coords:
+                data.coords[dim] = value  # converts to data array
+                data.coords[dim] = data.coords[dim].climo.dequantify()
+            for dim, levels in zip(('facets', 'version'), (FACETS_LEVELS, VERSION_LEVELS)):  # noqa: E501
+                if dim in data.coords:  # multi-index still present
                     continue
                 levels = data.sizes.keys() & set(levels)  # remaining level
                 if not levels:  # no remaining levels (e.g. scalar)
                     continue
                 coord = data.coords[level := levels.pop()]
                 index = pd.MultiIndex.from_arrays((coord.values,), names=(level,))
-                data = data.rename({level: multi})
-                data = data.assign_coords({multi: index})
+                data = data.rename({level: dim})
+                data = data.assign_coords({dim: index})
+                data.facets.attrs['long_name'] = long_name
 
         # Return after optionally ensuring settings
         # TODO: Check if name or attributes ever do go missing?

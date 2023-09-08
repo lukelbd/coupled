@@ -2,7 +2,6 @@
 """
 Processing utilities used by plotting functions.
 """
-import functools
 import itertools
 import math
 import re
@@ -230,6 +229,11 @@ def _derive_data(dataset, name, **kwargs):  # noqa: E501
     # TODO: This is ad hoc implementation of cfvariable-like scheme for quickly
     # retrieving names. In future should implement these as derivations with
     # standardized cfvariable properties when derivation scheme is more sophisticated.
+    # NOTE: Previously had quadruple=True default option to load all feedbacks as
+    # quadrupled versions, but meant same variable name could have different meaning
+    # depending on input arguments. Now implement scaling as a derivation below and
+    # add explicit indicator if '2x' or '4x' is specified. Preserve default of always
+    # *displaying* the unscaled experiment results by translating 'erf' or 'ecs' below.
     signs = search = replace = None
     product = relative = False
     regex = REGEX_FLUX  # always use this regex
@@ -240,21 +244,9 @@ def _derive_data(dataset, name, **kwargs):  # noqa: E501
         head, _, wav, net, bnd, sky = flux.groups()
         trad, adj = subs(regex, r'pl\2\3\4\5\6', r'pl*\2\3\4\5\6')  # see below
         *_, param = name.split('_')
-    if 'ecs2x' in name:  # default behavior is to store 2xCO2, but load 4xCO2
-        parts = name.replace('ecs2x', 'ecs')
-        signs = 0.5
-    elif 'ecs4x' in name:  # default behavior is to store 2xCO2, but load 4xCO2
-        parts = name.replace('ecs4x', 'ecs')
-        signs = 1.0
-    elif name == 'rluscs' or name == 'rsdtcs':
-        parts = name[:-2]  # all-sky is same as clear-sky
-        signs = 1.0
-    elif name == 'tabs':
-        parts, product = ('tpat', 'rfnt_ecs'), True
-        attrs.update(units='K', long_name='effective warming')
-    elif name == 'tdev':  # TODO: define other 'relative' variables?
-        parts, relative = 'tstd', True
-        attrs.update(units='K', long_name='relative warming')
+    if 'rluscs' in name or 'rsdtcs' in name:
+        parts = name.replace('rluscs', 'rlus')  # all-sky is same as clear-sky
+        parts = parts.replace('rsdtcs', 'rsdt')  # all-sky is same as clear-sky
     elif 'total' in name:
         parts = subs(re.compile('total'), 'lse', 'dse', 'ocean')
         search, replace = 'latent', 'total'
@@ -264,16 +256,29 @@ def _derive_data(dataset, name, **kwargs):  # noqa: E501
     elif 'dse' in name:  # possibly missing dry term e.g. dry stationary
         parts = subs(re.compile('dse'), 'hse', 'gse')
         search, replace = 'sensible', 'dry'
-    elif param in ('ts', 'ta'):  # equilibrium temperature metric!
-        ratio = name.replace(f'_{param}', '_ratio')  # actual minus feedback-implied
-        parts, signs, product = (param, ratio), (1, -1), True
+    elif name == 'tabs':
+        parts, product = ('tpat', 'rfnt_ecs'), True
+        attrs.update(units='K', long_name='effective warming')
+    elif name == 'tdev':  # TODO: define other 'relative' variables?
+        parts, relative = 'tstd', True
+        attrs.update(units='K', long_name='relative warming')
+    elif param == 'ts' or param == 'ta':  # eqtemp = temp - (temp - eqtemp) from below
+        delta = name.replace('_' + param, '_dt')  # climate minus implied deviation
+        parts, signs, product = (param, delta), (1, -1), False
         search, replace = 'temperature', 'equilibrium temperature'
-    elif param == 'ratio':  # helper for equilibrium temperature metric!
-        rad = name.replace('_ratio', '').replace(f'{head}_', '')
-        lam = name.replace('_ratio', '_lam')
-        parts, signs, product = (rad, lam), (1, -1), False
+    elif param == 'dt':  # temp - eqtemp anomaly inferred from feedback
+        denom = name.replace('_dt', '_lam')  # denominator
+        numer = name.replace('_dt', '').replace(head + '_', '')
+        parts, signs, product = (numer, denom), (1, -1), True
         search, replace = 'flux', 'temperature'
         attrs.update(units='K', long_name='temperature difference')
+    elif re.search(temp := r'(ecs|erf)(?:([0-9.-]+)x)?', name):
+        default = 4  # display 4xCO2 by default when no scale is specified
+        scale = re.search(temp, name).group(2)
+        signs = np.log2(float(scale or default))
+        parts = subs(re.compile(temp), r'\1x')  # prevents recursion (see _find_data)
+        search = re.compile(r'\A')  # prepend to existing label
+        replace = rf'{scale}$\\times$CO$_2$ ' if scale else ''
     elif head == 'atm' and (trad in dataset or adj in dataset):
         if trad in dataset:
             parts = (trad, *subs(regex, r'lr\2\3\4\5\6', r'hus\2\3\4\5\6'))
@@ -425,26 +430,36 @@ def _find_data(
     data : xarray.DataArray
         The result. If `attr` is not ``None`` this is an empty array.
     """
+    # WARNING: Critical to only apply .reduce() operations to variables required for
+    # derivation or else takes too long. After climopy refactoring this will be taken
+    # into account automatically and derivations will require explicitly specifying
+    # the dependencies upon registration (no more retrieveing inside the function).
     # NOTE: Here apply_reduce will automatically perform default selections for certain
     # dimensions (only carry out when requesting data). Also gets net flux (longwave
     # plus shortwave), atmospheric flux (top-of-atmosphere plus surface), cloud effect
     # (all-sky minus clear-sky), radiative response (full minus effective forcing),
     # net imbalance (downwelling minus upwelling), and various transport terms.
+    internal = 'ecsx' in name or 'erfx' in name  # internal request for actual data
+    retrieve = internal or 'ecs' not in name and 'erf' not in name
+    if internal:  # see _derive_data(), default scaling has been applied
+        name = name.replace('ecsx', 'ecs').replace('erfx', 'erf')
     name = ALIAS_FEEDBACKS.get(name, name)
-    deps = VARIABLE_DEPENDENCIES.get(name, None)  # supported climopy derivation
     attrs = attrs or {}
-    if name in dataset:  # variable or coordinate
+    if retrieve and name in dataset:
         data = dataset[name]
-    elif name not in dataset.climo:  # custom coupled-model derivation
+    elif not retrieve or name not in dataset.climo:  # coupled-model derivation
         data = _derive_data(dataset, name, attr=attr, **kwargs)
-    else:  # any registered climopy derivation
+    elif name in VARIABLE_DEPENDENCIES:  # any registered climopy derivation
         var = vreg[name]  # specific supported derivation
         keys = ('short_name', 'long_name', 'standard_units')
+        deps = set(VARIABLE_DEPENDENCIES[name])  # climopy derivation dependencies
         attrs.update({attr: getattr(var, attr) for attr in keys})
         if attr:  # TODO: throughout utilities permit cfvariable attributes
             data = xr.DataArray([], name=name)
         else:  # derive below with get()
             data = dataset.drop_vars(dataset.data_vars.keys() - set(deps))
+    else:  # note in future will
+        raise RuntimeError(f'Climopy derivation {name} has unknown dependencies.')
     if not attr:  # carry out reductions
         data = apply_reduce(data, **kwargs)
         if 'plev' in data.coords:  # TODO: make derivations compatible with plev
@@ -720,11 +735,12 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
     # Align and restore coordinates
     # WARNING: In some xarray versions seems _method_double with conflicting scalar
     # coordinates will keep the first one instead of discarding. So overwrite below.
-    # NOTE: Xarray automatically drops non-matching scalar coordinates (similar to
-    # vector coordinate matching utilities) so try to restore them below.
-    # NOTE: Commented code at bottom verifies that global average regressions of
-    # regional pre-industrial feedbacks onto global pre-industrial feedbacks equal 1
-    # even though there are broad positive regions with much larger magnitudes.
+    # NOTE: Xarray automatically drops non-matching scalar coordinates (similar
+    # to vector coordinate matching utilities) so try to restore them below.
+    # NOTE: Global average regressions of local pre-industrial feedbacks onto global
+    # pre-industrial feedbacks equal one despite regions with much larger magnitudes.
+    # if args[0].sizes.keys() & {'lon', 'lat'}:  # ensure average is one
+    #     ic(kws_process, args[0].climo.average('area').item())
     args = xr.align(*args)  # re-align after summation
     if len(args) == len(kws_input):  # one or two (e.g. scatter)
         for arg, kw_input in zip(args, kws_input):
@@ -747,6 +763,4 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
             for key, value in kw_input.items():  # e.g. regress lat on feedback map
                 if key not in arg.sizes:
                     arg.coords[key] = value
-    # if args[0].sizes.keys() & {'lon', 'lat'}:
-    #     ic(kws_process, args[0].climo.average('area').item())
     return args, method, kwargs

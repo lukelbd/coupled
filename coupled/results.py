@@ -44,7 +44,7 @@ REGEX_TRANSPORT = re.compile(r'(mse|total)')
 # feedback files but for climate data simply load monthly data, average later.
 KEYS_PERIODS = ('annual', 'seasonal', 'monthly')
 KEYS_REGIONS = ('point', 'latitude', 'hemisphere')
-KEYS_RANGES = ('early', 'late', 'historical', 'alternative')
+KEYS_RANGES = ('early', 'late', 'delayed', 'historical')
 KEYS_FEEDBACKS = ('parts_erf', 'parts_wav', 'parts_clear', 'parts_kernels', 'parts_planck', 'parts_relative', 'parts_absolute')  # noqa: E501
 KEYS_ENERGY = ('drop_clear', 'drop_directions', 'skip_solar')
 KEYS_TRANSPORT = ('parts_local', 'parts_eddies', 'parts_static', 'parts_fluxes')
@@ -74,17 +74,16 @@ FACETS_RENAME = {
 # MultiIndex corodinate settings
 # NOTE: Currently years for 'ratio' type feedbacks always correspond to the abrupt4xCO2
 # climate average; the pre-industrial climate average is always over the full 150 years.
-# TODO: Should instead have 'facets' coordinate for project / model / ensemble and
-# 'parameters' coordinate containing experiment / start / stop / style / region. For
+# TODO: Should have 'facets' coordinate with project / institute / model / ensemble
+# and 'parameters' coordinate with experiment / start / stop / style / region. For
 # circulation data, will have 'ratio' style for year 120-150 abrupt 4xCO2 changes
-# normalized by temperature (e.g. 'rfnt' is net flux change, including forcing) while
-# 'monthly' and 'annual' are pre-industrial or abrupt 4xCO2 regressions against
-# temperature (as with feedback calculations). Will rename 'source' on both to e.g.
-# simply 'internal' or 'external' (or add as distinct feedback-only coordinate) while
-# 'start' 'stop' and 'region' indicate integration or averaging periods and temperature
-# normalization settings. Climatologies will be under variables with no 'parameters'
-# coordinate while normalized sensitivities will have 'lam' suffix as with feedbacks
-# with 'erf' suffix indicating rapid responses. Incredibly ellegant + powerful tool!
+# normalized by temperature  while 'monthly' and 'annual' are pre-industrial or abrupt
+# 4xCO2 regressions against temperature (as with feedback calculations). Will rename
+# 'source' on both to e.g. simply 'internal' or 'external' (or add as distinct
+# feedback-only coordinate) while 'start' 'stop' and 'region' indicate integration or
+# averaging periods and temperature normalization settings. Climatologies will be under
+# variables with no 'parameters' coordinate while normalized sensitivities will have
+# 'lam' suffix as with feedbacks with 'erf' suffix indicating rapid responses.
 FACETS_LEVELS = (
     'project',
     'model',
@@ -783,9 +782,7 @@ def _update_climate_transport(
     return dataset
 
 
-def _update_feedback_attrs(
-    dataset, quadruple=True, boundary=None,
-):
+def _update_feedback_attrs(dataset, boundary=None):
     """
     Adjust feedback term attributes before plotting.
 
@@ -793,16 +790,12 @@ def _update_feedback_attrs(
     ----------
     dataset : xarray.Dataset
         The dataset.
-    quadruple : bool, optional
-        Whether to label climate sensitivity assuming doubled or quadrupled CO$_2$.
     boundary : {'t', 's', 'a'}, optional
         The boundari(es) to load. If one is passed then the indicator is stripped.
     annual, seasonal, monthly : bool, optoinal
         Whether to load different periods of data.
     """
     # Flux metadata repairs
-    # NOTE: Scaling of forcing or climate sensitivity terms for doubled or quadrupled
-    # CO2 is handled by individual loading functions. Here just add a label indication.
     # NOTE: This drops pre-loaded climate sensitivity parameters, and only
     # keeps the boundary indicator if more than one boundary was requested.
     options = set(boundary or 't')
@@ -810,8 +803,6 @@ def _update_feedback_attrs(
     wavelengths = ('full', 'longwave', 'shortwave')
     iter_ = itertools.product(boundaries, wavelengths, FEEDBACK_DESCRIPTIONS.items())
     for boundary, wavelength, (component, descrip) in iter_:
-        rad = f'r{wavelength[0].lower()}n{boundary[0].lower()}'
-        scale = '' if quadruple else r'2$\times$CO$_2$'
         for suffix, outdated, short in (
             ('lam', 'lambda', 'feedback'),
             ('erf', 'erf2x', 'forcing'),
@@ -823,10 +814,11 @@ def _update_feedback_attrs(
                 tail = descrip if descrip else 'effective'
             else:
                 tail = descrip if descrip else 'net'
+            flux = f'r{wavelength[0].lower()}n{boundary[0].lower()}'
             if component in ('', 'cs'):
-                prefix = f'{rad}{component}'
+                prefix = f'{flux}{component}'
             else:
-                prefix = f'{component}_{rad}'
+                prefix = f'{component}_{flux}'
             name = f'{prefix}_{suffix}'
             outdated = f'{prefix}_{outdated}'
             if outdated in dataset:
@@ -834,9 +826,8 @@ def _update_feedback_attrs(
             if name not in dataset:
                 continue
             data = dataset[name]
-            spec = scale if suffix in ('erf', 'ecs') else ''
             head = boundary if len(options) > 1 else ''
-            long = f'{spec} {head} {tail} {short}'
+            long = f'{head} {tail} {short}'
             long = re.sub('  +', ' ', long).strip()
             data.attrs['long_name'] = long
             data.attrs['short_name'] = short
@@ -877,8 +868,8 @@ def _update_feedback_attrs(
 
 
 def _update_feedback_terms(
-    dataset, quadruple=True, boundary=None, parts_clear=True, parts_kernels=True,
-    parts_planck=None, parts_relative=None, parts_absolute=None, parts_erf=False, parts_wav=False,  # noqa: E501
+    dataset, boundary=None, parts_clear=True, parts_kernels=True, parts_planck=None,
+    parts_relative=None, parts_absolute=None, parts_erf=False, parts_wav=False,
 ):
     """
     Add net cloud effect and net atmospheric feedback terms, possibly filter out
@@ -888,8 +879,6 @@ def _update_feedback_terms(
     ----------
     dataset : xarray.Dataset
         The dataset.
-    quadruple : bool, optional
-        Whether to label forcing and sensitivity assuming doubled or quadrupled CO$_2$.
     boundary : {'t', 's', 'a'}, optional
         The boundari(es) to load. Pass a tuple or longer string for more than one.
     parts_clear : bool, optional
@@ -924,7 +913,7 @@ def _update_feedback_terms(
     parts_ignore += () if parts_kernels else ('cl', 'alb', 'resid')
 
     # Iterate over variables
-    # NOTE: This previously included much more but has mostly been moved to get_data().
+    # NOTE: Previously this included much more but has mostly been moved to get_data().
     # Idea is to calculate on-the-fly whenever possible unless the component is almost
     # never needed on its own (e.g. shortwave component of 'hur', 'pl*', or 'lr*').
     keys_keep = {'pbot', 'ptop', 'tstd', 'tpat', 'tabs'}
@@ -996,9 +985,8 @@ def _update_feedback_terms(
     for numer, denom in zip(numers, denoms):
         if all(name in dataset for name in (*numer, *denom)):  # noqa: E501
             break
-    scale = '' if quadruple else r'2$\times$CO$_2$ '  # avoid 'abrupt 4xCO2 4xCO2'
     attrs = {'units': 'K', 'short_name': 'climate sensitivity'}
-    long_name = f'{scale}effective climate sensitivity'
+    long_name = 'effective climate sensitivity'
     if numer and denom and 'rfnt_ecs' not in dataset:
         with xr.set_options(keep_attrs=True):
             numer = sum(dataset[key] for key in numer)
@@ -1012,7 +1000,7 @@ def _update_feedback_terms(
             numer = (numer * wgts).sum('time', skipna=False)
             denom = (denom * wgts).sum('time', skipna=False)
         dataset['rfnt_ecs'] = -1 * numer / denom
-        dataset['rfnt_ecs'].attrs.update(attrs)
+        dataset['rfnt_ecs'].attrs.update(attrs)  # 2xCO2 sensitivity from 2xCO2 forcing
 
     # Return filtered dataset
     drop = dataset.data_vars.keys() - keys_keep - {'rfnt_ecs'}
@@ -1075,7 +1063,7 @@ def climate_datasets(
     print(f'Climate files: <dates>-climate{nodrift}')
     print(f'Number of climate file groups: {len(database)}.')
 
-    # Generate file lists
+    # Open datasets for concatenation
     # WARNING: Critical to place time averaging after transport calculations so that
     # time-covariance of surface pressure and near-surface flux terms is factored
     # in (otherwise would need to include cell heights before averaging).
@@ -1173,7 +1161,7 @@ def climate_datasets(
 
 def feedback_datasets(
     *paths,
-    quadruple=True, boundary=None, source=None, style=None,
+    boundary=None, source=None, style=None,
     early=True, late=True, historical=False, delayed=False,
     point=True, latitude=True, hemisphere=False,
     annual=True, seasonal=False, monthly=False,
@@ -1187,8 +1175,6 @@ def feedback_datasets(
     ----------
     *path : path-like
         The search paths.
-    quadruple : bool, optional
-        Whether to adjust parameters to correspond to quadrupled CO$_2$.
     boundary : bool or str, optional
         The boundaries to include.
     source, style : str or sequence, optional
@@ -1219,7 +1205,6 @@ def feedback_datasets(
     # TODO: Support subtracting global anomaly within get_data() by adding suffix
     # to the variable string or allowing user override of 'relative' key? Tricky in
     # context of e.g. regressions of anomalies against something not anomalous.
-    kw_both = {'quadruple': quadruple, 'boundary': boundary}
     kw_terms = {key: constraints.pop(key) for key in KEYS_FEEDBACKS if key in constraints}  # noqa: E501
     sample = pd.date_range('2000-01-01', '2000-12-01', freq='MS')
     regions = [(point, 'point'), (latitude, 'latitude'), (hemisphere, 'hemisphere')]
@@ -1230,16 +1215,21 @@ def feedback_datasets(
     if not monthly:
         periods.extend(sample.strftime('%b').str.lower().values)
 
-    # Generate file lists
+    # Open datasets for concatenation
     # WARNING: Recent xarray versions produce bugs when running xr.concat or
     # xr.update with multi-index. See: https://github.com/pydata/xarray/issues/7695
+    # NOTE: Current xr.concat() version loads arrays into memory. Might figure out how
+    # to make all load_file() and below utilities compatible with an open_mfdataset()
+    # implementation. Would require switching to workflow where below annual averaging
+    # is removed, and we repeat 'monthly' style feedbacks along 'annual' style time
+    # dimension on concatenation, but not sure if open_mfdataset supports this? Could
+    # also switch to dask arrays. See: https://github.com/pydata/xarray/issues/4628
     files, *_ = glob_files(*paths, project=constraints.get('project', None))
-    constraints['variable'] = 'feedbacks'  # TODO: similar for climate_datasets
+    constraints['variable'] = 'feedbacks'  # TODO: similar 'climate_Amon' dataset files
     database = Database(files, FACETS_LEVELS, flagship_translate=True, **constraints)
     sources = (source,) if isinstance(source, str) else tuple(source or ())
     styles = (style,) if isinstance(style, str) else tuple(style or ())
     nodrift = nodrift and '-nodrift' or ''
-    scale = 2.0 if quadruple else 1.0  # TODO: possibly change convention
     datasets = {}
     print(f'Feedback files: <source>-<style>{nodrift}')
     print(f'Number of feedback file groups: {len(database)}.')
@@ -1309,11 +1299,8 @@ def feedback_datasets(
                 dataset = dataset.drop_sel(period=periods, errors='ignore')
             arrays = {name: dataset[name] for name in ('pbot', 'ptop') if name in dataset}  # noqa: E501
             dataset = dataset.drop_vars(arrays)
-            dataset = _update_feedback_attrs(dataset, **kw_both)
-            dataset = _update_feedback_terms(dataset, **kw_both, **kw_terms)
-            for array in dataset.data_vars.values():
-                if scale != 1 and any(f'_{s}' in array.name for s in ('erf', 'ecs')):
-                    array *= scale  # NOTE: array.data *= fails for unloaded data
+            dataset = _update_feedback_attrs(dataset, boundary=boundary)
+            dataset = _update_feedback_terms(dataset, boundary=boundary, **kw_terms)
             for name, data in arrays.items():  # address _fluxes_from_anomalies bug
                 if 'plev' in data.sizes:
                     data = data.isel(plev=0, drop=True)
@@ -1339,7 +1326,7 @@ def feedback_datasets(
             pd.MultiIndex.from_tuples(version, names=VERSION_LEVELS),
             dims='version',
             name='version',
-            attrs={'long_name': 'feedback version'},
+            attrs={'long_name': 'feedback settings'},
         )
         dataset = dataset.assign_coords(version=version)
         dataset = dataset.squeeze()
@@ -1355,8 +1342,7 @@ def feedback_datasets(
 
 
 def feedback_datasets_json(
-    *paths,
-    quadruple=True, boundary=None, nonflag=False, standardize=True, **constraints,
+    *paths, boundary=None, nonflag=False, standardize=True, **constraints,
 ):
     """
     Return a dictionary of datasets containing json-provided feedback data.
@@ -1365,8 +1351,6 @@ def feedback_datasets_json(
     ----------
     *paths : path-like, optional
         The base path(s).
-    quadruple : bool, optional
-        Whether to adjust parameters to correspond to quadrupled CO$_2$.
     boundary : str, optional
         The boundary components.
     standardize : bool, optional
@@ -1383,15 +1367,13 @@ def feedback_datasets_json(
     datasets : dict
         A dictionary of datasets.
     """
-    # NOTE: When combinining with 'open_dataset' the non-descriptive long names
-    # here should be overwritten by long names from custom feedbacks.
-    kw_both = {'quadruple': quadruple, 'boundary': boundary}
+    # NOTE: Use non-descriptive long names here but when combining with custom feedbacks
+    # in open_dataset() should be overwritten by more descriptive long names.
     kw_terms = {key: constraints.pop(key) for key in KEYS_FEEDBACKS if key in constraints}  # noqa: E501
     paths = paths or ('~/data/cmip-tables',)
     paths = tuple(Path(path).expanduser() for path in paths)
     boundary = boundary or 't'
     project, constraints = _parse_constraints(reverse=True, **constraints)
-    scale = 2.0 if quadruple else 1.0
     datasets = {}
     if 't' not in boundary:  # only top-of-atmosphere feedbacks available
         return datasets
@@ -1426,8 +1408,6 @@ def feedback_datasets_json(
                 for key, value in group.items():
                     name, units = FEEDBACK_SETTINGS[key.lower()]
                     attrs = {'units': units}  # long name assigned below
-                    if scale != 1 and any(f'_{s}' in name for s in ('erf', 'ecs')):
-                        value = scale * value
                     dataset[name] = xr.DataArray(value, attrs=attrs)
                 dataset = dataset.expand_dims(version=1)
                 dataset = dataset.assign_coords(version=version)
@@ -1437,8 +1417,8 @@ def feedback_datasets_json(
                     datasets[facets] = dataset
     for facets in tuple(datasets):
         dataset = datasets[facets]
-        dataset = _update_feedback_attrs(dataset, **kw_both)
-        dataset = _update_feedback_terms(dataset, **kw_both, **kw_terms)
+        dataset = _update_feedback_attrs(dataset, boundary=boundary)
+        dataset = _update_feedback_terms(dataset, boundary=boundary, **kw_terms)
         if standardize:
             dataset = _standardize_order(dataset)
         datasets[facets] = dataset
@@ -1446,8 +1426,7 @@ def feedback_datasets_json(
 
 
 def feedback_datasets_text(
-    *paths,
-    quadruple=True, boundary=None, transient=False, standardize=True, **constraints,
+    *paths, boundary=None, transient=False, standardize=True, **constraints,
 ):
     """
     Return a dictionary of datasets containing text-provided feedback data.
@@ -1456,8 +1435,6 @@ def feedback_datasets_text(
     ----------
     *paths : path-like, optional
         The base path(s).
-    quadruple : bool, optional
-        Whether to adjust parameters to correspond to quadrupled CO$_2$.
     boundary : str, optional
         The boundary components.
     transient : bool, optional
@@ -1477,7 +1454,6 @@ def feedback_datasets_text(
     # NOTE: The Zelinka, Geoffry, and Forster papers and sources only specify a
     # CO2 multiple of '2x' or '4x' in the forcing entry and just say 'ecs' for the
     # climate sensitivity. So detect the multiple by scanning all keys in the table.
-    kw_both = {'quadruple': quadruple, 'boundary': boundary}
     kw_terms = {key: constraints.pop(key) for key in KEYS_FEEDBACKS if key in constraints}  # noqa: E501
     paths = paths or ('~/data/cmip-tables',)
     paths = tuple(Path(path).expanduser() for path in paths)
@@ -1511,7 +1487,6 @@ def feedback_datasets_text(
         dataset = dataset.expand_dims(version=1)
         dataset = dataset.assign_coords(version=version)
         scale = 0.5 if any('4x' in key for key in dataset.data_vars) else 1.0
-        scale = 2 * scale if quadruple else scale
         for key, array in dataset.data_vars.items():
             name, units = FEEDBACK_SETTINGS[key.lower()]
             transients = ('rfnt_tcr', 'rfnt_rho', 'rfnt_kap')
@@ -1537,8 +1512,8 @@ def feedback_datasets_text(
                 datasets[facets] = select
     for facets in tuple(datasets):
         dataset = datasets[facets]
-        dataset = _update_feedback_attrs(dataset, **kw_both)
-        dataset = _update_feedback_terms(dataset, **kw_both, **kw_terms)
+        dataset = _update_feedback_attrs(dataset, boundary=boundary)
+        dataset = _update_feedback_terms(dataset, boundary=boundary, **kw_terms)
         if standardize:
             dataset = _standardize_order(dataset)
         datasets[facets] = dataset
@@ -1575,6 +1550,8 @@ def open_dataset(
         Passed to constrain the results.
     """
     # Initial stuff
+    # TODO: Support loading with .open_mfdataset() or else .open_dataset() followed
+    # by .concat() that permits lazy loading of component variables.
     # NOTE: Here 'source' refers to either the author of a cmip-tables file or the
     # creator of the kernels used to build custom feedbacks, and 'region' always refers
     # to the denominator. For external feedbacks, the region is always 'globe' and its
@@ -1583,17 +1560,16 @@ def open_dataset(
     # taking the average (see notes -- also tested outdated feedback files directly).
     # So can compare e.g. internal and external feedbacks with ``region='globe'`` and
     # ``area='avg'`` -- this is a no-op for the spatially uniform external feedbacks.
-    keys_internal = ('nodrift', 'average')  # whether to average over months
-    keys_climate = ('years', 'anomaly', 'ignore', *KEYS_ENERGY, *KEYS_MOIST, *KEYS_TRANSPORT, *KEYS_VERSION)  # noqa: E501
-    keys_version = ('source', 'style', *KEYS_REGIONS, *KEYS_RANGES, *KEYS_PERIODS)
-    keys_feedback = ('quadruple', 'boundary', *KEYS_FEEDBACKS)
     kw_json = {'nonflag': constraints.pop('nonflag', False)}
     kw_text = {'transient': constraints.pop('transient', False)}
-    kw_internal = {k: constraints.pop(k) for k in keys_internal if k in constraints}
+    keys_datasets = ('nodrift', 'average')  # whether to average over months
+    keys_climate = ('years', 'anomaly', 'ignore', *KEYS_ENERGY, *KEYS_MOIST, *KEYS_TRANSPORT, *KEYS_VERSION)  # noqa: E501
+    keys_version = ('source', 'style', *KEYS_REGIONS, *KEYS_RANGES, *KEYS_PERIODS)
+    keys_feedback = ('boundary', *KEYS_FEEDBACKS)  # passed to term processors
+    kw_dataset = {k: constraints.pop(k) for k in keys_datasets if k in constraints}
     kw_climate = {k: constraints.pop(k) for k in keys_climate if k in constraints}
     kw_version = {k: constraints.pop(k) for k in keys_version if k in constraints}
     kw_feedback = {k: constraints.pop(k) for k in keys_feedback if k in constraints}
-    kw_version = {**kw_version, **kw_feedback}  # slightly simpler
     dirs_table = ('cmip-tables',)
     dirs_climate = ('cmip-climate',)
     dirs_feedback = ('cmip-feedbacks', 'ceres-feedbacks')
@@ -1608,8 +1584,8 @@ def open_dataset(
     for project in map(str.upper, projects):
         print(f'Project: {project}')
         for b, function, dirs, kw in (
-            (climate, climate_datasets, dirs_climate, {**kw_climate, **kw_internal}),
-            (feedbacks, feedback_datasets, dirs_feedback, {**kw_version, **kw_internal}),  # noqa: E501
+            (climate, climate_datasets, dirs_climate, {**kw_climate, **kw_dataset}),
+            (feedbacks, feedback_datasets, dirs_feedback, {**kw_version, **kw_feedback, **kw_dataset}),  # noqa: E501
             (feedbacks_json, feedback_datasets_json, dirs_table, {**kw_json, **kw_feedback}),  # noqa: E501
             (feedbacks_text, feedback_datasets_text, dirs_table, {**kw_text, **kw_feedback}),  # noqa: E501
         ):
@@ -1654,7 +1630,7 @@ def open_dataset(
         pd.MultiIndex.from_tuples(datasets, names=FACETS_LEVELS),
         dims='facets',
         name='facets',
-        attrs={'long_name': 'source facets'},
+        attrs={'long_name': 'source settings'},
     )
     dataset = xr.concat(
         datasets.values(),

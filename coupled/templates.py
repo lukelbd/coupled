@@ -478,5 +478,3 @@ def relationship_rows(data, method=None, **kwargs):
             results.append(result)
     result = results[0] if len(results) == 1 else results
     return result
-
-

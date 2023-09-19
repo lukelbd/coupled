@@ -51,6 +51,8 @@ TRANSPORT_BREAKDOWNS = {
 }
 FEEDBACK_BREAKDOWNS = {
     # Three-variable
+    'ecs': ('net', 'erf', 'ecs'),  # shorthand for sensitivity=True forcing=True
+    'erf': ('net', 'ecs', 'erf'),  # shorthand for sensitivity=True forcing=True
     'net': ('net', 'sw', 'lw'),
     'atm': ('net', 'cld', 'atm'),
     'ncl': ('net', 'cld', 'ncl'),
@@ -73,14 +75,20 @@ FEEDBACK_BREAKDOWNS = {
     'cre_cs': ('net', 'cre', 'swcre', 'lwcre', 'cs'),
     'wav_resid': ('net', 'swcld', 'lwcld', 'resid', 'atm'),
     'wav_alb': ('net', 'swcld', 'lwcld', 'alb', 'atm'),
+    'atm_pl': ('atm', 'pl*', 'lr*', 'rh', 'alb'),
+    'ncl_pl': ('ncl', 'pl*', 'lr*', 'rh', 'resid'),
+    'ncl_alb': ('ncl', 'lr*', 'rh', 'alb', 'resid'),
+    # Sensitivity components
+    'tstd_ncl': ('tstd', 'net', 'swcld', 'lwcld', 'ncl'),
+    'tpat_ncl': ('tpat', 'net', 'swcld', 'lwcld', 'ncl'),
+    'tstd_cs': ('tstd', 'net', 'swcre', 'lwcre', 'cs'),
+    'tpat_cs': ('tpat', 'net', 'swcre', 'lwcre', 'cs'),
     'tstd_cld': ('tstd', 'net', 'cld', 'swcld', 'lwcld'),
     'tpat_cld': ('tpat', 'net', 'cld', 'swcld', 'lwcld'),
     'tstd_cre': ('tstd', 'net', 'cre', 'swcre', 'lwcre'),
     'tpat_cre': ('tpat', 'net', 'cre', 'swcre', 'lwcre'),
     'ecs_cld': ('ecs', 'net', 'cld', 'swcld', 'lwcld'),
-    'atm_pl': ('atm', 'pl*', 'lr*', 'rh', 'alb'),
-    'ncl_pl': ('ncl', 'pl*', 'lr*', 'rh', 'resid'),
-    'ncl_alb': ('ncl', 'lr*', 'rh', 'alb', 'resid'),
+    'ecs_cre': ('ecs', 'net', 'cre', 'swcre', 'lwcre'),
     # Additional variables
     'hus': ('net', 'resid', 'cld', 'swcld', 'lwcld', 'alb', 'atm', 'wv', 'lr', 'pl'),
     'hur': ('net', 'resid', 'cld', 'swcld', 'lwcld', 'alb', 'atm', 'rh', 'lr*', 'pl*'),
@@ -212,7 +220,7 @@ def generate_specs(pairs=None, product=None, outer='breakdown', maxcols=None, **
         keys per multiplicand e.g. ``product=(('experiment', 'color'), 'project')``.
     outer : str or list of str, optional
         The kwargs for the outer plotting specs. Can include multiple keys per
-        multiplicand e.g. ``outer=(('breakdown', 'cycle'), ('project', 'experiment'))``.
+        multiplicand e.g. ``outer=(('breakdown', 'color'), ('project', 'experiment'))``.
     **kwargs : item or list of item, optional
         The reduce specifications. These can be scalar strings or tuples for generating
         comparisons across columns or within subplots. Can also append ``1`` or ``2``
@@ -281,7 +289,7 @@ def generate_specs(pairs=None, product=None, outer='breakdown', maxcols=None, **
         for key in keys:
             if key in pairs:
                 raise ValueError(f'Keyword {key} cannot be in both outer and pairs.')
-            if key == 'cycle':  # generally joined with e.g. 'breakdown'
+            if key == 'color':  # generally joined with e.g. 'breakdown'
                 kw['color'] = kwargs.pop(key, plotting.CYCLE_DEFAULT)  # ignore defaults
             elif key in kw_plot:
                 kw[key] = kw_plot.pop(key)
@@ -336,10 +344,10 @@ def generate_specs(pairs=None, product=None, outer='breakdown', maxcols=None, **
 def feedback_breakdown(
     breakdown=None,
     component=None,
+    sensitivity=False,
+    forcing=False,
     feedbacks=True,
     adjusts=False,
-    forcing=False,
-    sensitivity=False,
     maxcols=None,
     ncols=None,
 ):
@@ -353,8 +361,10 @@ def feedback_breakdown(
         The breakdown preset to use.
     component : str, optional
         The individual component to use.
-    feedbacks, adjusts, forcing, sensitivity : bool, optional
-        Whether to include various components.
+    sensitivity, forcing : bool, optional
+        Whether to include net sensitivity and forcing.
+    feedbacks, adjusts : bool, optional
+        Whether to include feedback and forcing adjustment components.
     maxcols : int, default: 4
         The maximum number of columns (influences order of the specs).
     ncols : int
@@ -393,7 +403,7 @@ def feedback_breakdown(
     if len(lams) == 1 or len(lams) == 2:  # user input breakdowns
         gridskip = None
         names, iflat = init_names(maxcols)
-        for i, name in enumerate(component):  # assign possibly correlation tuples!
+        for i, name in enumerate(components):  # assign possibly correlation tuples!
             iflat[i] = name
 
     # Three variable
@@ -585,7 +595,8 @@ def feedback_breakdown(
     # Remove all-none segments and determine gridskip
     # NOTE: This flattens if there are fewer names than originally requested maxcols
     # or if maxcols == 1 was passed e.g. for summary_rows() feedbacks along rows.
-    # TODO: Consider re-implementing automatic application of color cycle
+    # TODO: Consider re-implementing automatic application of color cycle for
+    # specific variable names as with transport.
     # colors = {'ecs': 'gray', 'erf': 'gray', 'lam': 'gray'}
     # names = [FEEDBACK_TRANSLATIONS.get(name, (name,))[0] for name in names]
     # cycle = [colors[name[-3:]] + '7' for name in names]

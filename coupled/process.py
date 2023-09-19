@@ -83,32 +83,30 @@ VARIABLE_DEPENDENCIES = {
 
 # Define additional variables
 # TODO: Use this approach for flux addition terms and other stuff
-with warnings.catch_warnings():
+def equator_pole_delta(self, name):  # noqa: E302
+    temp, _ = name.split('_')
+    temp = self[temp]  # also quantifies
+    if temp.name == 'ta':
+        temp = temp.sel(lev=850)  # traditional heat transport pressure
+    equator = temp.sel(lat=slice(0, 10)).climo.average('area')
+    pole = temp.sel(lat=slice(60, 90)).climo.average('area')
+    return equator - pole
+def equator_pole_diffusivity(self, name):  # noqa: E302
+    temp, _ = name.split('_')
+    delta = f'{temp}_grad'
+    delta = self.get(delta)
+    transport = self['lset'] + self['dset']  # moist not directly available
+    transport = transport.sel(lat=slice(0, 90)).climo.average('area')
+    return transport / delta
+with warnings.catch_warnings():  # noqa: E305
     # Add definitions
     warnings.simplefilter('ignore')
     vreg.define('ta_grad', 'equator-pole air temperature difference', 'K')
     vreg.define('ts_grad', 'equator-pole surface temperature difference', 'K')
     vreg.define('ta_diff', 'bulk energy transport diffusivity', 'PW / K')
     vreg.define('ts_diff', 'bulk energy transport surface diffusivity', 'PW / K')
-
-    @climo.register_derivation(re.compile(r'\A(ta|ts)_grad\Z'))
-    def equator_pole_delta(self, name):
-        temp, _ = name.split('_')
-        temp = self[temp]  # also quantifies
-        if temp.name == 'ta':
-            temp = temp.sel(lev=850)  # traditional heat transport pressure
-        equator = temp.sel(lat=slice(0, 10)).climo.average('area')
-        pole = temp.sel(lat=slice(60, 90)).climo.average('area')
-        return equator - pole
-
-    @climo.register_derivation(re.compile(r'\A(ta|ts)_diff\Z'))
-    def equator_pole_diffusivity(self, name):
-        temp, _ = name.split('_')
-        delta = f'{temp}_grad'
-        delta = self.get(delta)
-        transport = self['lset'] + self['dset']  # moist not directly available
-        transport = transport.sel(lat=slice(0, 90)).climo.average('area')
-        return transport / delta
+    climo.register_derivation(re.compile(r'\A(ta|ts)_grad\Z'))(equator_pole_delta)
+    climo.register_derivation(re.compile(r'\A(ta|ts)_diff\Z'))(equator_pole_diffusivity)
 
 
 def _constrain_response(
@@ -760,7 +758,9 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
         for key in keys:
             values = tuple(kw.get(key, None) for kw in kws_input)
             value = values[0]
-            if len(values) == 2 and values[0] != values[1]:
+            dtype = np.asarray(getattr(value, 'magnitude', value)).dtype
+            isnan = np.issubdtype(dtype, float) and np.isnan(value)
+            if not isnan and len(values) == 2 and values[0] != values[1]:
                 value = np.array(None, dtype=object)
                 value[...] = tuple(values)
             kw_input[key] = value

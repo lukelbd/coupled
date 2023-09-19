@@ -24,7 +24,7 @@ from .internals import _capitalize_label, _fit_label, _infer_labels, parse_specs
 from .process import _constrain_response, process_data
 from .reduce import _components_corr, _components_slope, _parse_institute, _parse_project  # noqa: E501
 
-__all__ = ['create_plot']
+__all__ = ['generate_plot']
 
 # Default configuration settings
 # See: https://agu.org/Publish-with-AGU/Publish/Author-Resources/Graphic-Requirements
@@ -264,7 +264,7 @@ def _get_coords(*args, units=True, tuples=False):
     result : dict of list
         The resulting coordinates.
     """
-    # NOTE: This is used in both _combine_commands and in create_plot for assigning
+    # NOTE: This is used in both _combine_commands and in generate_plot for assigning
     # groups of shared colormaps and legends based on coordinates.
     attrs = ('name', 'units') if units else ('name',)
     keys = list(attrs)
@@ -310,7 +310,7 @@ def _get_flagships(data):
     elif 'institute' in data.coords:
         bools = [data.coords['institute'].item() == 'flagship'] * data.facets.size
     else:
-        filt = _parse_institute(data, 'flagship')
+        filt = _parse_institute('flagship')
         bools = []
         names = data.indexes['facets'].names
         if 'project' not in names and 'project' not in data.coords:
@@ -342,8 +342,8 @@ def _get_projects(data):
     elif 'facets' not in data.coords:
         raise ValueError('Facets coordinate is missing.')
     else:
-        filt65 = _parse_project(data, 'cmip65')
-        filt66 = _parse_project(data, 'cmip66')
+        filt65 = _parse_project(data.facets.values, 'cmip65')
+        filt66 = _parse_project(data.facets.values, 'cmip66')
         projects = []
         for facet in data.facets.values:
             if filt66(facet):
@@ -499,6 +499,7 @@ def _auto_guide(*axs, loc=None, figurespan=False, cbarlength=None, cbarwrap=None
     """
     # Infer gridspec location of axes
     # WARNING: This all must come after axes are drawn and content is plotted inside.
+    # Otherwise position will be wrong.
     fig = axs[0].figure
     axs = pplt.SubplotGrid(axs)  # then select
     rows = tuple(zip(*(ax._get_topmost_axes()._range_subplotspec('y') for ax in axs)))
@@ -610,23 +611,28 @@ def _auto_props(data, kw_collection):
         The default marker properties.
     """
     # Get derived coordinates
+    # WARNING: Previously tried np.repeat([(0, 0, 150)], data.size) for periods
+    # but expanded the values and resulted in N x 3. Stick to lists instead.
     # NOTE: This preserves project/institute styling across bar/box/regression
     # plots by default, but respecting user-input alpha/color/hatch etc.
     def _get_lists(values, options, default=None):  # noqa: E306
         values = list(values)  # from arbitrary iterable
         if len(values) == 1:
-            values = np.repeat(values, data.size)
+            values = [values[0] for _ in range(data.size)]
         result = [options.get(value, default) for value in values]
         if len(set(result)) <= 1:
             result = [default] * len(values)
         return result
-    multicolor = kw_collection.other.get('multicolor', False)
     cycle = kw_collection.other.get('cycle', None)
-    markersize = 0.1 * pplt.rc.fontsize ** 2  # default reference scatter marker size
+    others = []  # other coordinates for color cycle
     linewidth = 0.6 * pplt.rc.metawidth  # default reference bar line width
-    others, special = [], ('project', 'institute', 'experiment', 'start', 'stop')
+    markersize = 0.1 * pplt.rc.fontsize ** 2  # default reference scatter marker size
+    multicolor = kw_collection.other.get('multicolor', False)
+    special = ('project', 'institute')  # no special color
+    special += (('experiment', 'start', 'stop') if multicolor else ())
     for key in (idx := data.indexes[data.dims[0]]):  # 'facets' or 'components'
-        others.append(tuple(k for n, k in zip(idx.names, key) if n not in special))
+        other = tuple(key for name, key in zip(idx.names, key) if name not in special)
+        others.append(other)
     if 'facets' in data.sizes:  # others == 'model', do not want unique colors!
         flagship = _get_flagships(data)
         project = _get_projects(data)
@@ -657,48 +663,73 @@ def _auto_props(data, kw_collection):
     projs = [int(opt[4] if opt and len(opt) in (5, 6) else 0) for opt in project]
     groups = [int(opt[4:] if opt and len(opt) in (5, 6) else 0) for opt in project]
 
-    # Declare settings associated with coordinates
-    # TODO: Add back coloring by projects instead of name or experiment
-    color, order = others, ()  # default is to use non-special indices in order
-    edge, hatch = groups, groups
+    # Settings associated with coordinates
+    # NOTE: Here 'cycle' used for groups without other settings by default.
+    # periods = periods * (len(perturbs) if len(periods) == 1 else 1)
+    perturbs = perturbs * (len(periods) if len(perturbs) == 1 else 1)
+    tuples = list(zip(perturbs, *zip(*periods)))
+    cycle = CYCLE_DEFAULT if cycle is None else pplt.get_colors(cycle)
+    control = [(0, 0, 150)]
+    early = [(1, 0, 20), (1, 0, 50), (1, 2, 20), (1, 2, 50)]
+    late = [(1, 20, 150), (1, 100, 150)]
+    full = [(1, 0, 150), (1, 2, 150)]
     sizes = {False: 0.50 * markersize, True: 1.5 * markersize}  # institute
-    edge1 = {(1, 0, 20): 'gray8', (1, 0, 50): 'gray8'}  # used below
-    edge2 = {(1, 20, 150): 'gray9', (1, 100, 150): 'gray9', (1, 0, 150): 'gray9'}
-    edges, hatches = {66: 'gray3'}, {66: 'xxxxxx'}  # default
-    hatch0 = {(0, 0, 150): 'xxxxxx'}  # separate
-    hatch1 = {(1, 0, 20): 'ooo', (1, 0, 50): 'ooo'}
-    hatch2 = {(1, 20, 150): '...', (1, 100, 150): '...', (1, 0, 150): '...'}
-    # hatch0 = {(0, 0, 150): 'xxxxxx'}  # separate
-    # hatch1 = {(1, 0, 20): 'xxxxxx', (1, 0, 50): 'xxxxxx'}
-    # hatch2 = {(1, 20, 150): 'xxx', (1, 100, 150): 'xxx', (1, 0, 150): 'xxx'}
-    alpha, alphas, fades = projs, {5: 0.3}, {False: 0.85, True: 1}  # use fading
-    if len(set(perturbs)) != 1 or len(set(periods)) != 1:
-        perturbs = perturbs * (len(periods) if len(perturbs) == 1 else 1)
-        # periods = periods * (len(perturbs) if len(periods) == 1 else 1)
-        tuples = list(zip(perturbs, *zip(*periods)))
-        if multicolor:  # multiple colors for start stop
-            color = tuples
-            order = [(1, 0, 20), (1, 0, 50), (1, 20, 150), (1, 100, 150), (1, 0, 150), (0, 0, 150)]  # noqa: E501
-        else:  # WARNING: requires no non-matching project
+    edge1 = {key: 'gray8' for key in early}  # early groups
+    edge2 = {key: 'gray9' for key in (*late, *full)}
+    hatch0 = {key: 'xxxxxx' for key in control}  # unperturbed
+    hatch1 = {key: 'ooo' for key in early}
+    hatch2 = {key: '...' for key in (*late, *full)}
+    edge, edges = groups, {66: 'gray3'}  # default edges
+    hatch, hatches = groups, {66: 'xxxxxx'}  # default hatches
+    alpha, alphas = projs, {5: 0.3}  # default alpha
+    fade, fades = flagship, {False: 0.85, True: 1}  # flagship status
+    # hatch0 = {key: 'xxxxxx' for key in control}  # alternative
+    # hatch1 = {key: 'xxxxxx' for key in early}
+    # hatch2 = {key: 'xxx' for key in (*late, *full)}
+
+    # Special settings dependent on input coordinates
+    # NOTE: Here ignore input 'cycle' if multicolor was passed. Careful to support
+    # both _combine_commands() regression bars/violins and distribution bar plots.
+    if not multicolor:
+        color = others
+        # seen = set(order)  # previously used for 'multicolor'
+        # colors = [key for key in order if key in color]
+        # colors.extend((key for key in color if key not in seen and not seen.add(key)))
+        seen = set()  # record auto-generated color names
+        colors = [key for key in others if key not in seen and not seen.add(key)]
+        colors = {key: cycle[i % len(cycle)] for i, key in enumerate(colors)}
+        if len(set(tuples)) > 1:  # use hatching for early/late or experiment instead
             edge, hatch = tuples, tuples
+            alpha, alphas = groups, {5: 0.3, 56: 0.3, 65: 0.6}
             edges = edge1 if 0 not in perturbs else {**edge1, **edge2}
-            hatches = hatch1 if 0 not in perturbs else hatch0 if len(set(periods)) == 1 else {**hatch1, **hatch2}  # noqa: E501
-            alpha, alphas = groups, {**alphas, 56: 0.3, 65: 0.6}
+            hatch1 = {} if ('20-0', '150-20') in periods else hatch1
+            hatches = hatch1 if 0 not in perturbs else hatch0  # early hatching
+            hatches = hatches if len(set(periods)) == 1 else {**hatch1, **hatch2}
+    else:
+        color = tuples
+        # order = [*carly, *late, *full, *control]
+        edge, hatch = groups, groups
+        colors = {}
+        if len(set(tuples)) == 1:  # e.g. cmip5 vs. cmip6 regressions
+            colors[tuples[0]] = 'gray6'
+            colors.update({key: 'pink7' for key in (*early, *late, *full)})
+        elif not set(tuples) & set(early):  # no early-late partition
+            colors.update({key: 'cyan7' for key in control})
+            colors.update({key: 'pink7' for key in (*late, *full)})
+        else:  # early-late partition
+            colors.update({key: 'gray6' for key in control})
+            colors.update({key: 'cyan7' for key in early})
+            colors.update({key: 'pink7' for key in (*late, *full)})
 
     # Infer default properties from standardized coordinates
     # NOTE: Alternative settings are commented out below. Also tried varying
     # edge widths but really really impossible to be useful for bar plots.
-    seen = set(order)  # below automatically assign colors to unspecified keys
-    cycle = CYCLE_DEFAULT if cycle is None else pplt.get_colors(cycle)
-    colors = [key for key in order if key in color]
-    colors.extend((key for key in color if key not in seen and not seen.add(key)))
-    colors = {key: cycle[i % len(cycle)] for i, key in enumerate(colors)}
     colors = _get_lists(color, colors, default=None)
     edges = _get_lists(edge, edges, default='black')
     hatches = _get_lists(hatch, hatches, default=None)
-    sizes = _get_lists(flagship, sizes, default=markersize)
+    sizes = _get_lists(fade, sizes, default=markersize)
     alphas = _get_lists(alpha, alphas, default=1.0)
-    fades = _get_lists(flagship, fades, default=1.0)
+    fades = _get_lists(fade, fades, default=1.0)
     alphas = [a - (1 - f) * a ** 0.1 for a, f in zip(alphas, fades)]
     kw_patch = {'alpha': alphas, 'hatch': hatches, 'edgecolor': edges, 'linewidth': linewidth}  # noqa: E501
     kw_scatter = {'alpha': alphas, 'sizes': sizes}
@@ -875,7 +906,7 @@ def _combine_commands(dataset, arguments, kws_collection):
         raise RuntimeError(f'Unexpected combination of argument counts {nargs}.')
     if (nargs := nargs.pop()) not in (1, 2):
         raise RuntimeError(f'Unexpected number of arguments {nargs}.')
-    non_feedback = (ureg.parse_units('K'), ureg.parse_units('W m^-2'))
+    non_feedback = (ureg.K, ureg.K / ureg.K, ureg.W / ureg.m ** 2)
     kw_collection = copy.deepcopy(kws_collection[0])  # deep copy of namedtuple
     for kw, field in itertools.product(kws_collection, kws_collection[0]._fields):
         getattr(kw_collection, field).update(getattr(kw, field))
@@ -888,13 +919,13 @@ def _combine_commands(dataset, arguments, kws_collection):
         units = [arg.climo.units for arg in args]
         for i, iunits in enumerate(units):
             arg = args[i]
-            if iunits in non_feedback:
+            if iunits in non_feedback and arg.name not in ('ts', 'tstd', 'tdev'):
                 arg = 0.5 * arg  # halve the spread
                 arg.attrs.clear()  # defer to feedback labels
                 if np.all(np.abs(args[i]) < 0.1):  # pre-industrial forcing/sensitivity
                     arg = xr.zeros_like(arg)
                 elif ureg.parse_units('W m^-2 K^-1') in units:
-                    arg = arg - 3  # adjust abrupt4xco2 sensitivity or forcing to 2xco2
+                    arg = arg - 4  # adjust abrupt4xco2 sensitivity or forcing to 2xco2
                 args[i] = arg
     else:
         # Get regression data. To facillitate putting feedback and sensitivity
@@ -906,7 +937,7 @@ def _combine_commands(dataset, arguments, kws_collection):
         kw_collection.command['width'] = 1.0  # ignore staggered bars
         kw_collection.command['absolute_width'] = True
         for iargs, iunits in zip(arguments, units):  # merge into slope estimators
-            keys = sorted(set(key for iarg in iargs for key in iarg.coords))
+            keys = sorted(set(key for arg in iargs for key in arg.coords))
             dim = iargs[0].dims[0]
             pct = [50, 95] if correlation else [50, 95]  # very certain normally
             cmd = _components_corr if correlation else _components_slope
@@ -921,14 +952,12 @@ def _combine_commands(dataset, arguments, kws_collection):
                 data.attrs['units'] = f'{iargs[1].units} / ({iargs[0].units})'
                 data.attrs['short_name'] = 'regression coefficient'
             for key in keys:
-                if any(key in iarg.sizes for iarg in iargs):  # non-scalar
+                if any(key in arg.sizes for arg in iargs):  # non-scalar
                     continue
                 if key in ('facets', 'version'):  # multi-index
                     continue
                 value = np.array(None, dtype=object)  # NOTE: copied from process_data
-                coords = tuple(
-                    iarg.coords[key].item() for iarg in iargs if key in iarg.coords
-                )
+                coords = [arg.coords[key].item() for arg in iargs if key in arg.coords]
                 if len(coords) == 1 or coords[0] == coords[1] or coords[0] is np.nan:
                     value = coords[0]
                 elif key in ('start', 'stop'):  # WARNING: kludge for constraints
@@ -1037,14 +1066,18 @@ def _combine_commands(dataset, arguments, kws_collection):
         kw_collection.axes.update(kw_axes)
 
     # Concatenate arrays
+    # WARNING: np.array([(1, 2), (3, 4)], dtype=object) will create 2D array with
+    # tuples along rows instead of ragged arrays. Use proplot workaround below.
     # NOTE: Only 'project' and 'institute' levels of 'components' are used elsewhere
     keys = ('short_prefix', 'short_suffix', 'short_name', 'units')
     attrs = {key: val for arg in args for key, val in arg.attrs.items() if key in keys}
     locs = np.array(locs or np.arange(len(kws_inner)), dtype=float)
     if nargs == 1:  # violin plot arguments
-        values = np.array([tuple(arg.values) for arg in args], dtype=object)
+        values = np.empty(len(args), dtype=object)
+        values[...] = [tuple(arg.values) for arg in args]
     else:
-        values = np.array([arg.item() for arg in args])
+        values = [arg.item() for arg in args]
+        values = np.array(values)
     name = args[0].name
     index = pd.MultiIndex.from_arrays(list(kw_vector.values()), names=list(kw_vector))
     coords = {'components': index, **kw_scalar}
@@ -1143,12 +1176,10 @@ def _infer_commands(
     # it... also grouped bar plots would need to be merged into 2D array.
     iax = ax
     geom = geom or (1, 1, 0)  # total subplotspec geometry
-    if sizes:
-        pass
-    elif len(arguments) > 1:  # concatenate and add label coordinates
+    if not sizes and len(arguments) > 1:  # concatenate and add label coordinates
         args, kw_collection = _combine_commands(dataset, arguments, kws_collection)
         arguments, kws_collection = (args,), (kw_collection,)
-    else:
+    elif not sizes:
         for *_, arg in arguments:
             labels = [{'project': value} for value in _get_projects(arg)]
             if 'facets' not in arg.dims:
@@ -1177,22 +1208,24 @@ def _infer_commands(
         fig.auto_layout(tight=False)  # TODO: commit on master
 
     # Get commands and default keyword args
-    # NOTE: This implements automatic settings for projects and institutes
+    # NOTE: This applies fixed properties for project and institute selections. Also
+    # applies color cycle to remaining attributes not otherwise assigned property.
     kw_other = {}
     for kw_collection in kws_collection:
         kw_other.update(kw_collection.other)
+    lines = len(sizes) < 2 and len(arguments) > 1  # multicolor line plots
     cycle = kw_other.get('cycle')
     cycle = pplt.get_colors(cycle) if cycle else CYCLE_DEFAULT
     contours = []  # contour keywords
     contours.append({'color': 'gray8'})  # WARNING: ls=None disables negative dash
     contours.append({'color': 'gray3', 'linestyle': ':'})
     results, colors, units = [], {}, {}
-    for num, (args, kw_collection) in enumerate(zip(arguments, kws_collection)):
+    for idx, (args, kw_collection) in enumerate(zip(arguments, kws_collection)):
         iunits = args[-1].attrs.get('units', None)  # independent variable units
-        if len(sizes) < 2 and len(arguments) > 1:  # line plot cycle colors
-            kw_collection.command.setdefault('color', cycle[num % len(cycle)])
         icolor = kw_collection.command.get('color', None)
-        if len(sizes) < 2 and num > 0 and iunits not in units:
+        if lines:  # scalar plot cycle colors
+            icolor = kw_collection.command.setdefault('color', cycle[idx % len(cycle)])
+        if lines and idx > 0 and iunits not in units:
             value = colors.get(ax, ())  # number of colors used so far
             value = value.pop() if len(value) == 1 else 'k'
             axis = 'y' if 'plev' in sizes else 'x'
@@ -1200,8 +1233,8 @@ def _infer_commands(
             iax = getattr(ax, f'alt{axis}')(**{f'{axis}color': icolor})
         command, guide, args, kw_collection = _auto_command(
             args, kw_collection,  # keyword arg colleciton
-            shading=(num == 0),  # shade first plot only
-            contour=contours[max(0, min(num - 1, len(contours) - 1))],
+            shading=(idx == 0),  # shade first plot only
+            contour=contours[max(0, min(idx - 1, len(contours) - 1))],
         )
         results.append((iax, command, guide, args, kw_collection))
         colors.setdefault(ax, set()).add(icolor)  # colors plotted per axes
@@ -1670,6 +1703,7 @@ def _violin_data(locs, data, kw_collection, color=None, **kwargs):
         The updated keyword arguments.
     """
     # Infer labels and colors
+    # TODO: Replace this with proplot violin plot once refactor is finished.
     # NOTE: Seaborn cannot handle custom violin positions. So use fake data to achieve
     # the same effective spacing. See https://stackoverflow.com/a/52729348/4970632
     kw_collection = copy.deepcopy(kw_collection)
@@ -1716,7 +1750,7 @@ def _violin_data(locs, data, kw_collection, color=None, **kwargs):
     return data, kw_collection
 
 
-def create_plot(
+def generate_plot(
     dataset,
     rowspecs=None,
     colspecs=None,
@@ -1811,7 +1845,7 @@ def create_plot(
     rxlim, rylim : float or 2-tuple, optional
         Relative x and y axis limits to apply to groups of shared or standardized axes.
     save : path-like, optional
-        The save folder base location. Stored inside a `figures` subfolder.
+        Save folder base location. Stored inside a `figures` subfolder.
     suffix : str, optional
         Optional suffix to append to the default path label.
     **kw_specs
@@ -1890,7 +1924,7 @@ def create_plot(
     if suffix:
         pathlabel = f'{pathlabel}_{suffix}'
     if save:  # default figure path
-        print('Path:', repr(f'{indicator}_{pathlabel}'))
+        print('Path:', repr(pathlabel), repr(indicator))
 
     # Generate data arrays and queued plotting commands
     # NOTE: Critical to disable 'grouping' so that e.g. colorbars or legends that
@@ -1913,7 +1947,6 @@ def create_plot(
         geometry = (grows, gcols, num)
         ikws_process, ikws_collection, title = count_items[count - 1]
         imethods, icommands, arguments, kws_collection = [], [], [], []
-        # ic(ikws_process, ikws_collection)
         for kw_process, kw_collection in zip(ikws_process, ikws_collection):
             args, method, default = process_data(
                 dataset, *kw_process, attrs=kw_collection.attrs.copy()
@@ -2001,7 +2034,7 @@ def create_plot(
             if step is not None and not np.isscalar(step):
                 kw_levels.update(levels=step)
             # Infer color levels
-            # ic(command, argskip, len(arguments), len(args), args[0].name, kw_levels)
+            # NOTE: This ensures consistent levels across gridspec slots
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore')  # proplot and cmap runtime warnings
                 levels, vmin, vmax, norm, norm_kw, _ = axs[0]._parse_level_vals(*args, **kw_levels)  # noqa: E501
@@ -2236,19 +2269,20 @@ def create_plot(
     rowkey = 'rightlabels' if labelright else 'leftlabels'
     colkey = 'bottomlabels' if labelbottom else 'toplabels'
     fig.format(figtitle=figtitle, **{rowkey: rowlabels, colkey: collabels})
-    if save:
-        methods, commands = '-'.join(methods), '-'.join(commands)
-        if save is True:
-            path = Path()
-        else:
-            path = Path(save).expanduser()
-        figs = path / 'figures'
-        if figs.is_dir():
-            path = figs
+    if save:  # save path
+        path = Path('' if save is True else save)
+        path = path.expanduser().resolve()
+        if path.name in ('notebooks', 'meetings', 'manuscripts'):
+            path = path.parent  # parent project directory
+        path = path / 'figures'
+        if not path.is_dir():
+            raise ValueError(f'Path {str(path)!r} does not exist.')
+        methods = '-'.join(methods)  # prepend methods
+        commands = '-'.join(commands)  # append commands
         if path.is_dir():
-            path = path / '_'.join((methods, commands, indicator, pathlabel))
-        w, h = fig.get_size_inches()
-        s = f'{w:.1f}x{h:.1f}in'  # figure size
-        print(f'Saving ({s}): {path.parent.parent.name}/{path.parent.name}/{path.name}')
+            path = path / '_'.join((methods, pathlabel, commands, indicator))
+        figwidth, figheight = fig.get_size_inches()
+        figsize = f'{figwidth:.1f}x{figheight:.1f}in'  # figure size
+        print(f'Saving ({figsize}): ~/{path.relative_to(Path.home())}')
         fig.save(path)  # optional extension
     return fig, fig.subplotgrid

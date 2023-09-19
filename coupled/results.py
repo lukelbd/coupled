@@ -77,13 +77,15 @@ FACETS_RENAME = {
 # TODO: Should have 'facets' coordinate with project / institute / model / ensemble
 # and 'parameters' coordinate with experiment / start / stop / style / region. For
 # circulation data, will have 'ratio' style for year 120-150 abrupt 4xCO2 changes
-# normalized by temperature  while 'monthly' and 'annual' are pre-industrial or abrupt
+# normalized by temperature while 'monthly' and 'annual' are pre-industrial or abrupt
 # 4xCO2 regressions against temperature (as with feedback calculations). Will rename
 # 'source' on both to e.g. simply 'internal' or 'external' (or add as distinct
 # feedback-only coordinate) while 'start' 'stop' and 'region' indicate integration or
 # averaging periods and temperature normalization settings. Climatologies will be under
 # variables with no 'parameters' coordinate while normalized sensitivities will have
-# 'lam' suffix as with feedbacks with 'erf' suffix indicating rapid responses.
+# 'lam' suffix as with feedbacks with 'erf' suffix indicating rapid adjustments.
+FACETS_NAME = 'source settings'
+VERSION_NAME = 'feedback settings'
 FACETS_LEVELS = (
     'project',
     'model',
@@ -985,8 +987,9 @@ def _update_feedback_terms(
     for numer, denom in zip(numers, denoms):
         if all(name in dataset for name in (*numer, *denom)):  # noqa: E501
             break
-    attrs = {'units': 'K', 'short_name': 'climate sensitivity'}
+    short_name = 'climate sensitivity'
     long_name = 'effective climate sensitivity'
+    attrs = {'units': 'K', 'short_name': short_name, 'long_name': long_name}
     if numer and denom and 'rfnt_ecs' not in dataset:
         with xr.set_options(keep_attrs=True):
             numer = sum(dataset[key] for key in numer)
@@ -1010,10 +1013,8 @@ def _update_feedback_terms(
 
 
 def climate_datasets(
-    *paths,
-    years=None, anomaly=True, average=False,
-    ignore=None, nodrift=False, standardize=True,
-    **constraints
+    *paths, years=None, anomaly=True, average=False,
+    ignore=None, nodrift=False, standardize=True, **constraints
 ):
     """
     Return a dictionary of datasets containing processed files.
@@ -1135,7 +1136,7 @@ def climate_datasets(
         print('Transforming abrupt 4xCO2 data into anomalies.')
         for facets, dataset in tuple(datasets.items()):
             control = (facets[0], facets[1], 'picontrol', facets[3])
-            if facets[2] == 'abrupt4xco2':
+            if facets[2] != 'abrupt4xco2':
                 continue
             if control not in datasets and datasets.pop(facets):  # one line
                 continue
@@ -1209,7 +1210,7 @@ def feedback_datasets(
     sample = pd.date_range('2000-01-01', '2000-12-01', freq='MS')
     regions = [(point, 'point'), (latitude, 'latitude'), (hemisphere, 'hemisphere')]
     regions = [region for b, region in regions if not b]  # whether to drop
-    periods = ['ann'] if annual else []
+    periods = [] if annual else ['ann']  # dropped selections
     if not seasonal:
         periods.extend(('djf', 'mam', 'jja', 'son'))
     if not monthly:
@@ -1326,7 +1327,7 @@ def feedback_datasets(
             pd.MultiIndex.from_tuples(version, names=VERSION_LEVELS),
             dims='version',
             name='version',
-            attrs={'long_name': 'feedback settings'},
+            attrs={'long_name': VERSION_NAME},
         )
         dataset = dataset.assign_coords(version=version)
         dataset = dataset.squeeze()
@@ -1630,7 +1631,7 @@ def open_dataset(
         pd.MultiIndex.from_tuples(datasets, names=FACETS_LEVELS),
         dims='facets',
         name='facets',
-        attrs={'long_name': 'source settings'},
+        attrs={'long_name': FACETS_NAME},
     )
     dataset = xr.concat(
         datasets.values(),

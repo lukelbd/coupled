@@ -144,12 +144,14 @@ TRANSLATE_PATHS = {
     ('experiment', 'picontrol'): 'pictl',
     ('experiment', 'abrupt4xco2'): '4xco2',
     ('startstop', (0, 150)): 'full',
+    ('startstop', (1, 150)): 'full1',
+    ('startstop', (2, 150)): 'full2',
     ('startstop', (0, 20)): 'early',
-    ('startstop', (20, 150)): 'late',
-    ('startstop', (0, 50)): 'early50',  # NOTE: used as 'historical' analogue in lit
-    ('startstop', (100, 150)): 'late50',  # NOTE: used as 'historical' analogue in lit
     ('startstop', (1, 20)): 'early1',
     ('startstop', (2, 20)): 'early2',
+    ('startstop', (0, 50)): 'early50',
+    ('startstop', (20, 150)): 'late',
+    ('startstop', (100, 150)): 'late50',
     ('region', 'point'): 'loc',
     ('region', 'latitude'): 'lat',
     ('region', 'hemisphere'): 'hemi',
@@ -1089,7 +1091,7 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
         kws_collection.append(ikws_collection)
 
     # Infer figure label and grid labels
-    # TODO: Combine column count determination here with create_plot()?
+    # TODO: Combine column count determination here with generate_plot()?
     ncols = len(colspecs) if len(colspecs) > 1 else len(rowspecs) if len(rowspecs) > 1 else 3  # noqa: E501
     figwidth = ncols * refwidth + 0.3 * refwidth * (ncols - 1)
     figlabel = _infer_labels(
@@ -1109,7 +1111,7 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
     if len(rowspecs) == 1 and len(colspecs) == 1:
         gridlabels = None
     elif len(rowspecs) > 1 and len(colspecs) > 1:
-        gridlabels = tuple(gridlabels)  # NOTE: tuple critical for create_plot
+        gridlabels = tuple(gridlabels)  # NOTE: tuple critical for generate_plot
     elif len(rowspecs) > 1:
         gridlabels = [_fit_label(label, **kw_fit) for label in gridlabels[0]]
     else:

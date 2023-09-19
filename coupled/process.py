@@ -208,7 +208,7 @@ def _constrain_response(
     return observations, alternative, constrained
 
 
-def _derive_data(dataset, name, **kwargs):  # noqa: E501
+def _derive_data(dataset, name, scaled=False, **kwargs):  # noqa: E501
     """
     Get or derive the variable or its attribute.
 
@@ -218,6 +218,8 @@ def _derive_data(dataset, name, **kwargs):  # noqa: E501
         The source dataset.
     name : str
         The requested variable.
+    scaled : bool, optional
+        Whether ecs/erf data has been scaled.
     **kwargs
         Additional reduction instructions.
 
@@ -239,10 +241,10 @@ def _derive_data(dataset, name, **kwargs):  # noqa: E501
     regex = REGEX_FLUX  # always use this regex
     attrs = {}  # attribute overrides
     subs = lambda reg, *ss: tuple(reg.sub(s, name).strip('_') for s in ss)
-    head = wav = net = bnd = sky = trad = adj = param = 'NA'
+    head = wav = net = bnd = sky = trad = adjust = param = 'NA'
     if flux := regex.search(name):
         head, _, wav, net, bnd, sky = flux.groups()
-        trad, adj = subs(regex, r'pl\2\3\4\5\6', r'pl*\2\3\4\5\6')  # see below
+        trad, adjust = subs(regex, r'pl\2\3\4\5\6', r'pl*\2\3\4\5\6')  # see below
         *_, param = name.split('_')
     if 'rluscs' in name or 'rsdtcs' in name:
         parts = name.replace('rluscs', 'rlus')  # all-sky is same as clear-sky
@@ -256,12 +258,13 @@ def _derive_data(dataset, name, **kwargs):  # noqa: E501
     elif 'dse' in name:  # possibly missing dry term e.g. dry stationary
         parts = subs(re.compile('dse'), 'hse', 'gse')
         search, replace = 'sensible', 'dry'
-    elif name == 'tabs':
-        parts, product = ('tpat', 'rfnt_ecs'), True
-        attrs.update(units='K', long_name='effective warming')
     elif name == 'tdev':  # TODO: define other 'relative' variables?
         parts, relative = 'tstd', True
         attrs.update(units='K', long_name='relative warming')
+    elif name == 'tabs':
+        parts, product = ('tpat', 'ecs'), True
+        attrs.update(units='K', long_name='effective warming')
+        kwargs.update(scaled=False)
     elif param == 'ts' or param == 'ta':  # eqtemp = temp - (temp - eqtemp) from below
         delta = name.replace('_' + param, '_dt')  # climate minus implied deviation
         parts, signs, product = (param, delta), (1, -1), False
@@ -272,18 +275,20 @@ def _derive_data(dataset, name, **kwargs):  # noqa: E501
         parts, signs, product = (numer, denom), (1, -1), True
         search, replace = 'flux', 'temperature'
         attrs.update(units='K', long_name='temperature difference')
-    elif re.search(temp := r'(ecs|erf)(?:([0-9.-]+)x)?', name):
+    elif not scaled and re.search(temp := r'(ecs|erf)(?:([0-9.-]+)x)?', name):
         default = 4  # display 4xCO2 by default when no scale is specified
         scale = re.search(temp, name).group(2)
         signs = np.log2(float(scale or default))
-        parts = subs(re.compile(temp), r'\1x')  # prevents recursion (see _find_data)
+        parts = subs(re.compile(temp), r'\1')
         search = re.compile(r'\A')  # prepend to existing label
         replace = rf'{scale}$\\times$CO$_2$ ' if scale else ''
-    elif head == 'atm' and (trad in dataset or adj in dataset):
+    elif head == 'atm':
         if trad in dataset:
             parts = (trad, *subs(regex, r'lr\2\3\4\5\6', r'hus\2\3\4\5\6'))
+        elif adjust in dataset:
+            parts = (adjust, *subs(regex, r'lr*\2\3\4\5\6', r'hur\2\3\4\5\6'))
         else:
-            parts = (adj, *subs(regex, r'lr*\2\3\4\5\6', r'hur\2\3\4\5\6'))
+            raise ValueError("Missing non-cloud components for 'atm' feedback.")
         search = re.compile(r'(adjusted\s+)?Planck')
         replace = 'temperature + humidity'
     elif head == 'ncl':
@@ -294,7 +299,7 @@ def _derive_data(dataset, name, **kwargs):  # noqa: E501
         parts = subs(regex, r'\1\2\3\4\5cs', r'\1\2\3\4\5')
         search, replace = 'clear-sky', 'cloud'
         signs = (-1, 1)
-    elif bnd == 'a':
+    elif bnd == 'a':  # net atmosheric (surface and TOA are positive into atmosphere)
         parts = subs(regex, r'\1\2\3\4t\6', r'\1\2\3\4s\6')
         search, replace = 'TOA', 'atmospheric'
         signs = (1, 1)
@@ -307,10 +312,9 @@ def _derive_data(dataset, name, **kwargs):  # noqa: E501
         signs = (1, -1)
         search, replace = 'flux', 'response'
     elif wav == 'f':  # WARNING: critical to add wavelengths last
-        wavs = [
-            wav[0] for wav, names in FEEDBACK_DEPENDENCIES[head].items()
-            if names or head == ''  # not a kernel
-        ]
+        deps = {'longwave': True, 'shortwave': True}  # e.g. atm_rfnt depends on both
+        deps = FEEDBACK_DEPENDENCIES.get(head, deps)
+        wavs = [wav[0] for wav, names in deps.items() if names or head == '']
         patterns = [rf'\1\2{wav}\4\5\6' for wav in wavs]
         parts = subs(regex, *patterns)
         search = re.compile('(longwave|shortwave) ')
@@ -326,7 +330,8 @@ def _derive_data(dataset, name, **kwargs):  # noqa: E501
     else:
         opts = ', '.join(s for s in dataset.data_vars if regex.search(s))
         raise ValueError(f'Missing flux variable {name}. Options are: {opts}.')
-    kwargs.update(product=product, relative=relative)  # declared here
+    kwargs.setdefault('scaled', True)  # see 'tabs'
+    kwargs.update(product=product, relative=relative)
     data = _operate_data(dataset, parts, signs, search, replace, **kwargs)
     data.attrs.update(attrs)  # manual attribute overrides
     data.name = name
@@ -371,9 +376,7 @@ def _operate_data(
     signs = (1,) * len(names) if signs is None else np.atleast_1d(signs).tolist()
     if len(signs) != len(names):
         raise RuntimeError('Length mismatch between signs and names.')
-    if attr is not None:  # not running derivation, just need attributes on first array
-        names = names[:1]
-    names = names if attr is None else names[:1]
+    names = names if attr is None else names[:1]  # may just need first array attrs
     datas = [_find_data(dataset, name, attr=attr, **kwargs) for name in names]
     if not relative or attr is not None:
         bases = (1 if product else 0,) * len(names)
@@ -381,7 +384,9 @@ def _operate_data(
         bases = [data.climo.average('area') for data in datas]
     with xr.set_options(keep_attrs=True):
         parts = zip(datas, signs, bases)
-        if product:  # get products or ratios
+        if attr is not None or len(datas) == 1 and signs[0] == 1 and not relative:
+            data = datas[0]
+        elif product:  # get products or ratios
             data = math.prod(data ** sign / base for data, sign, base in parts)
         else:  # get sums or differences
             data = sum(sign * data - base for data, sign, base in parts)
@@ -401,7 +406,8 @@ def _operate_data(
 
 
 def _find_data(
-    dataset, name, attr=None, attrs=None, hemi=None, quantify=False, standardize=True, **kwargs  # noqa: E501
+    dataset, name, attr=None, attrs=None, hemi=None,
+    scaled=False, quantify=False, standardize=True, **kwargs
 ):
     """
     Find or derive the variable or variable attribute.
@@ -418,6 +424,8 @@ def _find_data(
         The variable attribute overrides.
     hemi : str, optional
         The hemisphere to select.
+    scaled : bool, optional
+        Whether ecs/erf data has been scaled.
     quantify : bool, optional
         Whether to quantify the data.
     standardize : str, optional
@@ -439,16 +447,13 @@ def _find_data(
     # plus shortwave), atmospheric flux (top-of-atmosphere plus surface), cloud effect
     # (all-sky minus clear-sky), radiative response (full minus effective forcing),
     # net imbalance (downwelling minus upwelling), and various transport terms.
-    internal = 'ecsx' in name or 'erfx' in name  # internal request for actual data
-    retrieve = internal or 'ecs' not in name and 'erf' not in name
-    if internal:  # see _derive_data(), default scaling has been applied
-        name = name.replace('ecsx', 'ecs').replace('erfx', 'erf')
     name = ALIAS_FEEDBACKS.get(name, name)
     attrs = attrs or {}
-    if retrieve and name in dataset:
+    scaled = scaled or 'ecs' not in name and 'erf' not in name
+    if scaled and name in dataset:
         data = dataset[name]
-    elif not retrieve or name not in dataset.climo:  # coupled-model derivation
-        data = _derive_data(dataset, name, attr=attr, **kwargs)
+    elif not scaled or name not in dataset.climo:  # coupled-model derivation
+        data = _derive_data(dataset, name, attr=attr, scaled=scaled, **kwargs)
     elif name in VARIABLE_DEPENDENCIES:  # any registered climopy derivation
         var = vreg[name]  # specific supported derivation
         keys = ('short_name', 'long_name', 'standard_units')
@@ -744,9 +749,10 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
     args = xr.align(*args)  # re-align after summation
     if len(args) == len(kws_input):  # one or two (e.g. scatter)
         for arg, kw_input in zip(args, kws_input):
+            names = [name for index in arg.indexes.values() for name in index.names]
             arg.attrs.update(attrs)
             for key, value in kw_input.items():
-                if key not in arg.sizes:
+                if key not in names and key not in arg.sizes:
                     arg.coords[key] = value
     else:  # create 2-tuple coordinates
         keys = sorted(set(key for kw in kws_input for key in kw))

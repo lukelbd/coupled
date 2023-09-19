@@ -13,15 +13,15 @@ from icecream import ic  # noqa: F401
 from coupled.results import ALIAS_FEEDBACKS
 
 __all__ = [
-    'create_specs',
-    'split_specs',
+    'generate_specs',
+    'divide_specs',
     'feedback_breakdown',
     'transport_breakdown',
 ]
 
 
 # Variable and selection keywords
-# NOTE: These can be passed as vectors to create_specs for combining along rows or cols
+# NOTE: These can be passed as vectors to generate_specs for combining along rows/cols.
 # TODO: Remove 'base' kludge and permit vectors specifications on each side of pair.
 KEYS_BREAK = (
     'breakdown', 'component', 'feedbacks', 'adjusts', 'forcing', 'sensitivity', 'transport'  # noqa: E501
@@ -54,32 +54,46 @@ FEEDBACK_BREAKDOWNS = {
     'net': ('net', 'sw', 'lw'),
     'atm': ('net', 'cld', 'atm'),
     'ncl': ('net', 'cld', 'ncl'),
-    'wav': ('net', 'swcld', 'lwcld'),
-    'cld': ('cld', 'swcld', 'lwcld'),  # special case!
+    'cld': ('cld', 'swcld', 'lwcld'),  # special case
+    'cre': ('cre', 'swcre', 'lwcre'),  # special case
+    'wav_cld': ('net', 'swcld', 'lwcld'),
+    'wav_cre': ('net', 'swcre', 'lwcre'),
     # Four-variable
-    'alb': ('net', 'cld', 'alb', 'atm'),
-    'cld_wav': ('net', 'cld', 'swcld', 'lwcld'),
-    'atm_res': ('net', 'cld', 'resid', 'atm'),
-    'atm_wav': ('net', 'swcld', 'lwcld', 'atm'),
-    'ncl_wav': ('net', 'swcld', 'lwcld', 'ncl'),
+    'atm_resid': ('net', 'cld', 'resid', 'atm'),
+    'atm_alb': ('net', 'cld', 'alb', 'atm'),
+    'cld_net': ('net', 'cld', 'swcld', 'lwcld'),
+    'cre_net': ('net', 'cld', 'swcld', 'lwcld'),
+    'wav_atm': ('net', 'swcld', 'lwcld', 'atm'),
+    'wav_ncl': ('net', 'swcld', 'lwcld', 'ncl'),
+    'wav_cs': ('net', 'swcre', 'lwcre', 'cs'),
     # Five-variable
-    'res': ('net', 'cld', 'alb', 'atm', 'resid'),
-    'res_wav': ('net', 'swcld', 'lwcld', 'resid', 'atm'),
-    'alb_wav': ('net', 'swcld', 'lwcld', 'alb', 'atm'),
-    'atm_cld': ('net', 'cld', 'swcld', 'lwcld', 'atm'),
-    'ncl_cld': ('net', 'cld', 'swcld', 'lwcld', 'ncl'),
+    'resid': ('net', 'cld', 'alb', 'atm', 'resid'),
+    'cld_atm': ('net', 'cld', 'swcld', 'lwcld', 'atm'),
+    'cld_ncl': ('net', 'cld', 'swcld', 'lwcld', 'ncl'),
+    'cre_cs': ('net', 'cre', 'swcre', 'lwcre', 'cs'),
+    'wav_resid': ('net', 'swcld', 'lwcld', 'resid', 'atm'),
+    'wav_alb': ('net', 'swcld', 'lwcld', 'alb', 'atm'),
+    'tstd_cld': ('tstd', 'net', 'cld', 'swcld', 'lwcld'),
+    'tpat_cld': ('tpat', 'net', 'cld', 'swcld', 'lwcld'),
+    'tstd_cre': ('tstd', 'net', 'cre', 'swcre', 'lwcre'),
+    'tpat_cre': ('tpat', 'net', 'cre', 'swcre', 'lwcre'),
+    'ecs_cld': ('ecs', 'net', 'cld', 'swcld', 'lwcld'),
+    'atm_pl': ('atm', 'pl*', 'lr*', 'rh', 'alb'),
+    'ncl_pl': ('ncl', 'pl*', 'lr*', 'rh', 'resid'),
+    'ncl_alb': ('ncl', 'lr*', 'rh', 'alb', 'resid'),
     # Additional variables
     'hus': ('net', 'resid', 'cld', 'swcld', 'lwcld', 'alb', 'atm', 'wv', 'lr', 'pl'),
     'hur': ('net', 'resid', 'cld', 'swcld', 'lwcld', 'alb', 'atm', 'rh', 'lr*', 'pl*'),
     'all': ('net', 'cld', 'swcld', 'lwcld', 'atm', 'alb', 'resid', 'wv', 'rh', 'lr', 'lr*', 'pl', 'pl*'),  # noqa: E501
-    'alb_cld': ('net', 'cld', 'swcld', 'lwcld', 'atm', 'alb'),  # TODO support
-    'res_cld': ('net', 'cld', 'swcld', 'lwcld', 'atm', 'resid'),  # TODO: support
+    'cld_alb': ('net', 'cld', 'swcld', 'lwcld', 'atm', 'alb'),  # TODO support
+    'cld_resid': ('net', 'cld', 'swcld', 'lwcld', 'atm', 'resid'),  # TODO: support
+    'ncl_resid': ('ncl', 'pl*', 'lr*', 'rh', 'alb', 'resid'),  # TODO: support
 }
 
 
-def _create_dicts(*kws, expand=True, check=True):
+def _generate_dicts(*kws, expand=True, check=True):
     """
-    Helper function to create dictionaries.
+    Helper function to generate dictionaries from lists.
 
     Parameters
     ----------
@@ -116,144 +130,9 @@ def _create_dicts(*kws, expand=True, check=True):
     return results[0] if len(results) == 1 else results
 
 
-def create_specs(pairs=None, product=None, outer='breakdown', maxcols=None, **kwargs):
+def divide_specs(key, specs, **kwargs):
     """
-    Create feedback and variable specifications based on input keywords.
-
-    Parameters
-    ----------
-    pairs : str or list of str, optional
-        The coordinate name(s) to be used for feedback constraints. These can
-        also be generated using combination of ``'name'`` and ``'breakdown'``.
-    product : tuple of str or list of str, optional
-        The list-like kwargs to combine with `itertools.product`. Can include multiple
-        keys per multiplicand e.g. ``product=(('experiment', 'color'), 'project')``.
-    outer : str or list of str, optional
-        The kwargs for the outer plotting specs. Can include multiple keys per
-        multiplicand e.g. ``outer=(('breakdown', 'cycle'), ('project', 'experiment'))``.
-    **kwargs : item or list of item, optional
-        The reduce specifications. These can be scalar strings or tuples for generating
-        comparisons across columns or within subplots. Can also append ``1`` or ``2``
-        to apply to one side of a subplot spec correlation pair.
-
-    Returns
-    -------
-    *kws_outer : lists of dict
-        List of plot specs for rows and/or columns.
-    *kws_pair : list of dict
-        List of plot specs suitable for each pair item.
-    kwargs : dict
-        The remaining keywords with auto-updated `maxcols` and `gridskip`.
-    """
-    # Retrieve breakdown variable names
-    # NOTE: Critical to keep 'maxcols' separate so it can be passed on if we
-    # are not using a maxcols-modifying 'breakdown' function.
-    # NOTE: Here permit generating lists of names and default keyword arguments from
-    # shorthand 'breakdown' keys. Default is to generate feedback components with
-    # e.g. create_specs(breakdown='all') but generate transport components if
-    # 'transport' is passed with e.g. create_specs(breakdown='all', transport='t')
-    outer = (outer,) if isinstance(outer, str) else outer or ()
-    outer = [[keys] if isinstance(keys, str) else list(keys) for keys in outer]
-    ncols = kwargs.get('ncols', None)
-    maxcols = 1 if ncols else maxcols  # disable special arrangements
-    kw_break = {key: kwargs.pop(key) for key in tuple(kwargs) if key in KEYS_BREAK}
-    if len(outer) > 2:  # only ever used for rows and columns
-        raise ValueError('Too many outer variables specified.')
-    if 'transport' in kw_break:  # transport breakdown
-        breakdown, kw_default = transport_breakdown(maxcols=maxcols, **kw_break)
-        kw_default = {**kw_default, 'proj_kw': {'lon_0': 0}}
-    elif kw_break:  # non-empty breakdown
-        breakdown, kw_default = feedback_breakdown(maxcols=maxcols, **kw_break)
-        kw_default = {**kw_default, 'proj_kw': {'lon_0': 210}}
-    elif any(f'name{s}' in kwargs for s in ('', 1, 2)):  # explicit name
-        breakdown = None
-        kw_default = {'ncols': ncols or maxcols}
-    else:
-        raise ValueError('Neither variable name nor breakdown was specified.')
-    idxs = [i for i, keys in enumerate(outer) if 'breakdown' in keys or 'component' in keys]  # noqa: E501
-    kws_pair = [{}, {}]
-    kws_outer = [{} for i in range(len(outer))]
-    for key, value in kw_default.items():
-        kwargs.setdefault(key, value)
-    if not breakdown:
-        pass
-    elif not idxs:
-        kws_pair[0]['name'] = kws_pair[1]['name'] = breakdown
-    else:
-        kws_outer[idxs[0]]['name'] = breakdown
-
-    # Assign separate plot spec dictionaries
-    # WARNING: Numpy arrays should be used for e.g. scalar level lists or color values
-    # and tuples or lists should be used for vectors of settings across subplots.
-    # NOTE: Here 'outer' is used to specify different reduce instructions across rows
-    # or columns. For example: correlate with feedback parts in rows, create_specs(
-    # name='psl', breakdown='net'); or correlate with parts (plus others) in subplots,
-    # create_specs(name='psl', breakdown='net', outer=None, experiment=('picontrol', 'abrupt4xco2')).  # noqa: E501
-    pairs = pairs or ()
-    pairs = (pairs,) if isinstance(pairs, str) else tuple(pairs)
-    kw_plot = {
-        key: list(item) if isinstance(item := kwargs.pop(key), (list, tuple)) else (item,)  # noqa: E501
-        for key in tuple(kwargs) if key in KEYS_PLOT
-    }
-    for keys, kw in zip(outer, kws_outer):
-        for key in keys:
-            if key in pairs:
-                raise ValueError(f'Keyword {key} cannot be in both outer and pairs.')
-            if key == 'cycle':  # generally joined with e.g. 'breakdown'
-                kw['color'] = kwargs.pop(key, plotting.CYCLE_DEFAULT)  # ignore defaults
-            elif key in kw_plot:
-                kw[key] = kw_plot.pop(key)
-    for key in pairs:  # specifications for pairs
-        if values := kw_plot.get(key):
-            if not np.iterable(values) or len(values) != 2:
-                raise ValueError(f'Coordinate pair {key} must be a length-2 tuple.')
-            for kw, value in zip(kws_pair, kw_plot.pop(key)):
-                kw[key] = list(value) if isinstance(value, (tuple, list)) else [value]
-    sentinel = object()  # see below
-    spatial = ('lon', 'lat', 'plev', 'area')
-    kws_pair[0].update(kw_plot)  # remaining scalars or vectors
-    kws_pair[1].update(kw_plot)
-    for key in KEYS_PLOT:  # add scalar versions
-        value = kwargs.pop(f'{key}1', sentinel)  # ignore none iteration placeholders
-        is_vector = isinstance(value, (tuple, list))
-        if value is not sentinel and (key in spatial or value is not None):
-            if len(outer) > 0 and key in outer[0] and is_vector:
-                kws_outer[0].update({key: value})  # e.g. outer=('name', 'name')
-            else:
-                kws_pair[0].update({key: value if is_vector else (value,)})
-        value = kwargs.pop(f'{key}2', sentinel)
-        is_vector = isinstance(value, (tuple, list))
-        if value is not sentinel and (key in spatial or value is not None):
-            if len(outer) > 1 and key in outer[1] and is_vector:
-                kws_outer[1].update({key: value})
-            else:
-                kws_pair[1].update({key: value if is_vector else (value,)})
-
-    # Convert reduce vector iterables to dictionaries
-    # NOTE: This also builds optional Cartesian products between lists of keywords
-    # specified by 'product' keyword. Others are enforced to have same length.
-    # NOTE: Above, scalar 'kwargs' are kept in place for simplicity, but still need
-    # to repeat scalar (name, breakdown) or manual scalar correlation pair items.
-    product = product or ()
-    product = [[keys] if isinstance(keys, str) else list(keys) for keys in product]
-    for dict_ in (*kws_outer, *kws_pair):
-        kws = []
-        for keys in product:
-            if any(key in dict_ for key in keys):
-                kw = {key: dict_.pop(key) for key in keys if key in dict_}
-                kws.append(_create_dicts(kw, expand=False))
-        keys = [key for kw in kws for key in kw]
-        values = itertools.product(*(zip(*kw.values()) for kw in kws))
-        values = [[v for val in vals for v in val] for vals in values]
-        dict_.update({key: vals for key, vals in zip(keys, zip(*values))})
-    kws_outer = tuple(map(_create_dicts, kws_outer))
-    kws_pair = _create_dicts(*kws_pair)
-    return *kws_outer, *kws_pair, kwargs
-
-
-def split_specs(key, specs, **kwargs):
-    """
-    Split feedback and variable specification lists.
+    Divide feedback and variable specification lists.
 
     Parameters
     ----------
@@ -319,6 +198,141 @@ def split_specs(key, specs, **kwargs):
         yield subs, kwargs
 
 
+def generate_specs(pairs=None, product=None, outer='breakdown', maxcols=None, **kwargs):
+    """
+    Generate feedback and variable specifications based on input keywords.
+
+    Parameters
+    ----------
+    pairs : str or list of str, optional
+        The coordinate name(s) to be used for feedback constraints. These can
+        also be generated using combination of ``'name'`` and ``'breakdown'``.
+    product : tuple of str or list of str, optional
+        The list-like kwargs to combine with `itertools.product`. Can include multiple
+        keys per multiplicand e.g. ``product=(('experiment', 'color'), 'project')``.
+    outer : str or list of str, optional
+        The kwargs for the outer plotting specs. Can include multiple keys per
+        multiplicand e.g. ``outer=(('breakdown', 'cycle'), ('project', 'experiment'))``.
+    **kwargs : item or list of item, optional
+        The reduce specifications. These can be scalar strings or tuples for generating
+        comparisons across columns or within subplots. Can also append ``1`` or ``2``
+        to apply to one side of a subplot spec correlation pair.
+
+    Returns
+    -------
+    *kws_outer : lists of dict
+        List of plot specs for rows and/or columns.
+    *kws_pair : list of dict
+        List of plot specs suitable for each pair item.
+    kwargs : dict
+        The remaining keywords with auto-updated `maxcols` and `gridskip`.
+    """
+    # Retrieve breakdown variable names
+    # NOTE: Critical to keep 'maxcols' separate so it can be passed on if we
+    # are not using a maxcols-modifying 'breakdown' function.
+    # NOTE: Here permit generating lists of names and default keyword arguments from
+    # shorthand 'breakdown' keys. Default is to generate feedback components with
+    # e.g. generate_specs(breakdown='all') but generate transport components if
+    # 'transport' is passed with e.g. generate_specs(breakdown='all', transport='t')
+    outer = (outer,) if isinstance(outer, str) else outer or ()
+    outer = [[keys] if isinstance(keys, str) else list(keys) for keys in outer]
+    ncols = kwargs.get('ncols', None)
+    maxcols = 1 if ncols else maxcols  # disable special arrangements
+    kw_break = {key: kwargs.pop(key) for key in tuple(kwargs) if key in KEYS_BREAK}
+    if len(outer) > 2:  # only ever used for rows and columns
+        raise ValueError('Too many outer variables specified.')
+    if 'transport' in kw_break:  # transport breakdown
+        breakdown, kw_default = transport_breakdown(maxcols=maxcols, **kw_break)
+        kw_default = {**kw_default, 'proj_kw': {'lon_0': 0}}
+    elif kw_break:  # non-empty breakdown
+        breakdown, kw_default = feedback_breakdown(maxcols=maxcols, **kw_break)
+        kw_default = {**kw_default, 'proj_kw': {'lon_0': 210}}
+    elif any(f'name{s}' in kwargs for s in ('', 1, 2)):  # explicit name
+        breakdown = None
+        kw_default = {'ncols': ncols or maxcols}
+    else:
+        raise ValueError('Neither variable name nor breakdown was specified.')
+    idxs = [i for i, keys in enumerate(outer) if 'breakdown' in keys or 'component' in keys]  # noqa: E501
+    kws_pair = [{}, {}]
+    kws_outer = [{} for i in range(len(outer))]
+    for key, value in kw_default.items():
+        kwargs.setdefault(key, value)
+    if not breakdown:
+        pass
+    elif not idxs:
+        kws_pair[0]['name'] = kws_pair[1]['name'] = breakdown
+    else:
+        kws_outer[idxs[0]]['name'] = breakdown
+
+    # Assign separate plot spec dictionaries
+    # WARNING: Numpy arrays should be used for e.g. scalar level lists or color values
+    # and tuples or lists should be used for vectors of settings across subplots.
+    # NOTE: Here 'outer' is used to specify different reduce instructions across rows
+    # or columns. For example: correlate with feedback parts in rows, generate_specs(
+    # name='psl', breakdown='net'); or correlate with parts (plus others) in subplots,
+    # generate_specs(name='psl', breakdown='net', outer=None, experiment=('picontrol', 'abrupt4xco2')).  # noqa: E501
+    pairs = pairs or ()
+    pairs = (pairs,) if isinstance(pairs, str) else tuple(pairs)
+    kw_plot = {
+        key: list(item) if isinstance(item := kwargs.pop(key), (list, tuple)) else (item,)  # noqa: E501
+        for key in tuple(kwargs) if key in KEYS_PLOT
+    }
+    for keys, kw in zip(outer, kws_outer):
+        for key in keys:
+            if key in pairs:
+                raise ValueError(f'Keyword {key} cannot be in both outer and pairs.')
+            if key == 'cycle':  # generally joined with e.g. 'breakdown'
+                kw['color'] = kwargs.pop(key, plotting.CYCLE_DEFAULT)  # ignore defaults
+            elif key in kw_plot:
+                kw[key] = kw_plot.pop(key)
+    for key in pairs:  # specifications for pairs
+        if values := kw_plot.get(key):
+            if not np.iterable(values) or len(values) != 2:
+                raise ValueError(f'Coordinate pair {key} must be a length-2 tuple.')
+            for kw, value in zip(kws_pair, kw_plot.pop(key)):
+                kw[key] = list(value) if isinstance(value, (tuple, list)) else [value]
+    sentinel = object()  # see below
+    spatial = ('lon', 'lat', 'plev', 'area')
+    kws_pair[0].update(kw_plot)  # remaining scalars or vectors
+    kws_pair[1].update(kw_plot)
+    for key in KEYS_PLOT:  # add scalar versions
+        value = kwargs.pop(f'{key}1', sentinel)  # ignore none iteration placeholders
+        is_vector = isinstance(value, (tuple, list))
+        if value is not sentinel and (key in spatial or value is not None):
+            if len(outer) > 0 and key in outer[0] and is_vector:
+                kws_outer[0].update({key: value})  # e.g. outer=('name', 'name')
+            else:
+                kws_pair[0].update({key: value if is_vector else (value,)})
+        value = kwargs.pop(f'{key}2', sentinel)
+        is_vector = isinstance(value, (tuple, list))
+        if value is not sentinel and (key in spatial or value is not None):
+            if len(outer) > 1 and key in outer[1] and is_vector:
+                kws_outer[1].update({key: value})
+            else:
+                kws_pair[1].update({key: value if is_vector else (value,)})
+
+    # Convert reduce vector iterables to dictionaries
+    # NOTE: This also builds optional Cartesian products between lists of keywords
+    # specified by 'product' keyword. Others are enforced to have same length.
+    # NOTE: Above, scalar 'kwargs' are kept in place for simplicity, but still need
+    # to repeat scalar (name, breakdown) or manual scalar correlation pair items.
+    product = product or ()
+    product = [[keys] if isinstance(keys, str) else list(keys) for keys in product]
+    for dict_ in (*kws_outer, *kws_pair):
+        kws = []
+        for keys in product:  # then skip if absent
+            if any(key in dict_ for key in keys):
+                kw = {key: dict_.pop(key) for key in keys if key in dict_}
+                kws.append(_generate_dicts(kw, expand=False))
+        keys = [key for kw in kws for key in kw]
+        values = itertools.product(*(zip(*kw.values()) for kw in kws))
+        values = [[v for val in vals for v in val] for vals in values]
+        dict_.update({key: vals for key, vals in zip(keys, zip(*values))})
+    kws_outer = tuple(map(_generate_dicts, kws_outer))
+    kws_pair = _generate_dicts(*kws_pair)
+    return *kws_outer, *kws_pair, kwargs
+
+
 def feedback_breakdown(
     breakdown=None,
     component=None,
@@ -374,7 +388,7 @@ def feedback_breakdown(
     # Generate plot layouts
     # NOTE: This is relevant for general_subplots() style figures when we wrap have
     # wrapped rows or columns of components but not as useful for e.g. summary_rows()
-    lams = [ALIAS_FEEDBACKS[name] for name in components]
+    lams = [ALIAS_FEEDBACKS.get(name, name) for name in components]
     erfs = [name.replace('_lam', '_erf') for name in lams]
     if len(lams) == 1 or len(lams) == 2:  # user input breakdowns
         gridskip = None
@@ -449,7 +463,7 @@ def feedback_breakdown(
 
     # Five variable
     # NOTE: Includes net-cld-alb-atm-resid and net-swcld-lwcld-atm-resid
-    elif len(lams) == 5:
+    elif len(lams) in (5, 6):
         if maxcols == 2:
             names, iflat = init_names(maxcols)
             if sensitivity:

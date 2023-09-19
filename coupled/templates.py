@@ -11,16 +11,14 @@ from climopy import ureg, vreg  # noqa: F401
 from coupled import plotting, _warn_coupled
 from icecream import ic  # noqa: F401
 
-from .translate import create_specs, split_specs
+from .translate import generate_specs, divide_specs
 
 __all__ = [
-    'general_subplots',
-    'summary_rows',
+    'scalar_grid',
+    'pattern_rows',
     'constraint_rows',
-    'components_rows',
+    'relationship_rows',
 ]
-
-SAVE = Path(__file__).parent.parent
 
 # Variable and selection keywords
 # NOTE: See also specs.py key lists
@@ -203,9 +201,9 @@ def _scale_warming(dataset, source='~/scratch/cmip-processed'):
     return dataset
 
 
-def general_subplots(data, forward=True, save=True, **kwargs):
+def scalar_grid(data, forward=True, **kwargs):
     """
-    Plot multiple single-variable results per subplot (e.g. bars, boxes, lines).
+    Plot scalar results in each grid slot (e.g. bars, boxes, lines).
 
     Parameters
     ----------
@@ -213,19 +211,16 @@ def general_subplots(data, forward=True, save=True, **kwargs):
         The source dataset.
     forward : bool, optional
         Whether to apply name pair forward or backward.
-    save : bool, optional
-        Whether to save the result.
     rowsplit, colsplit : optional
-        Passed to `split_specs`.
+        Passed to `divide_specs`.
     **kwargs
-        Passed to `create_specs`.
+        Passed to `generate_specs`.
     """
     # NOTE: In constraint_rows() support e.g. name=('ts', None) combined with
     # breakdown='cld' or component=('swcld', 'lwcld') because the latter vector
     # is placed in outer specs while the former is placed in subspecs. However here
     # often need to vectorize breakdown inside subspecs (e.g. bar plots with many
     # feedback components) so approach is e.g. name='ts' and forward=True or False.
-    defaults = {'save': SAVE} if save else {}
     names = ('name', 'breakdown', 'component')
     compare = sum(bool(kwargs.get(key)) for key in names) > 1  # noqa: E501
     spread = kwargs.get('method', None) in ('std', 'var', 'cov', 'slope')
@@ -236,12 +231,13 @@ def general_subplots(data, forward=True, save=True, **kwargs):
         figspecs = [rowspecs, colspecs]
         subspecs1 = subspecs2 = {}
     else:
-        *figspecs, subspecs1, subspecs2, kwargs = create_specs(**kwargs)
+        *figspecs, subspecs1, subspecs2, kwargs = generate_specs(**kwargs)
         rowspecs = figspecs[0] if len(figspecs) > 0 else [{}]
         colspecs = figspecs[1] if len(figspecs) > 1 else [{}]
     name = kwargs.pop('name', None)
     results = []
-    for rowspecs, kwargs in split_specs('row', rowspecs, **kwargs):
+    for rowspecs, kwargs in divide_specs('row', rowspecs, **kwargs):
+        defaults = {}
         if globe and not compare and not spread and subspecs1 == subspecs2:
             kws = (*subspecs1, *subspecs2, kwargs)
             projects = set(kw['project'] for kw in kws if 'project' in kw)
@@ -267,14 +263,75 @@ def general_subplots(data, forward=True, save=True, **kwargs):
                     spec = ({**rspec, **spec1}, {**rspec, **spec2})
                 ispecs.append(spec)
             rspecs.append(ispecs or [rspec])
-        for cspecs, kwargs in split_specs('col', colspecs, **kwargs):
-            result = plotting.create_plot(data, rspecs, cspecs, **kwargs)
+        for cspecs, kwargs in divide_specs('col', colspecs, **kwargs):
+            result = plotting.generate_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results
     return result
 
 
-def constraint_rows(data, method=None, contours=True, hatching=True, save=True, **kwargs):  # noqa: E501
+def pattern_rows(data, method=None, shading=True, contours=True, **kwargs):
+    """
+    Plot averages and standard deviations per row (e.g. maps).
+
+    Parameters
+    ----------
+    data : xarray.Dataset
+        The source dataset.
+    method : bool, optional
+        The single-variable method to use.
+    shading : bool, optional
+        Whether to include shading.
+    contours : bool, optional
+        Whether to include reference contours.
+    rowsplit, colsplit : optional
+        Passed to `divide_specs`.
+    **kwargs
+        Passed to `generate_specs`.
+    """
+    # NOTE: For simplicity pass scalar 'outer' and other vectors are used in columns.
+    if not isinstance(method := method or 'avg', str):
+        method1, method2 = method
+    elif method in ('avg', 'med'):
+        method1, method2 = method, 'std'
+    elif method in ('std', 'var', 'pctile'):
+        method1, method2 = method, 'avg'
+    else:
+        raise ValueError(f'Invalid pattern_rows() method {method!r}.')
+    if 'breakdown' not in kwargs and 'component' not in kwargs and 'outer' not in kwargs:  # noqa: E501
+        raise RuntimeError
+    rowspecs, colspecs, *_, kwargs = generate_specs(maxcols=1, **kwargs)
+    kw_shading = {'method': method1} if shading is True else dict(shading or {})
+    kw_shading.update({key: kwargs.pop(key) for key in KEYS_SHADING if key in kwargs})
+    kw_contour = {'method': method2} if contours is True else dict(contours or {})
+    kw_contour.update({key: kwargs.pop(key) for key in KEYS_CONTOUR if key in kwargs})
+    results = []
+    for rowspecs, kwargs in divide_specs('row', rowspecs, **kwargs):
+        rspecs = []
+        for rspec in rowspecs:
+            kw = {key: val for key, val in rspec.items() if key not in KEYS_CONTOUR}
+            spec = [{**kw, **kw_shading}]
+            if contours:
+                kw = {key: val for key, val in rspec.items() if key not in KEYS_SHADING}
+                spec.append({**kw, **kw_contour})
+            rspecs.append(spec)
+        cspecs = []  # NOTE: irrelevant keywords for non-cmap figures are ignored
+        for cspec in colspecs:
+            kw = {key: val for key, val in cspec.items() if key not in KEYS_CONTOUR}
+            spec = [{**kw, **kw_shading}]  # noqa: E501
+            if contours:
+                kw = {key: val for key, val in cspec.items() if key not in KEYS_SHADING}
+                spec.append({**kw, **kw_contour})
+            cspecs.append(spec)
+        for cspecs, kwargs in divide_specs('col', cspecs, **kwargs):
+            # ic(rspecs, cspecs)
+            result = plotting.generate_plot(data, rspecs, cspecs, **kwargs)
+            results.append(result)
+    result = results[0] if len(results) == 1 else results
+    return result
+
+
+def constraint_rows(data, method=None, contours=True, hatching=True, **kwargs):
     """
     Plot two quantifications of constraint relationship per row (e.g. maps).
 
@@ -288,12 +345,10 @@ def constraint_rows(data, method=None, contours=True, hatching=True, save=True, 
         Whether to include reference averages.
     hatching : bool optional
         Whether to include correlation hatching.
-    save : bool, optional
-        Whether to save the result.
     rowsplit, colsplit : optional
-        Passed to `split_specs`.
+        Passed to `divide_specs`.
     **kwargs
-        Passed to `create_specs`.
+        Passed to `generate_specs`.
 
     Other Parameters
     ----------------
@@ -305,12 +360,10 @@ def constraint_rows(data, method=None, contours=True, hatching=True, save=True, 
     # TODO: Remove 'base' keyword kludge and support two pairs of outer arrays
     if 'breakdown' not in kwargs and 'component' not in kwargs and 'outer' not in kwargs:  # noqa: E501
         raise RuntimeError
-    rowspecs, *colspecs, subspecs1, subspecs2, kwargs = create_specs(maxcols=1, **kwargs)  # noqa: E501
+    rowspecs, *colspecs, subspecs1, subspecs2, kwargs = generate_specs(maxcols=1, **kwargs)  # noqa: E501
     if len(subspecs1) != 1 or len(subspecs2) != 1:
         raise ValueError(f'Too many constraints {subspecs1} and {subspecs2}. Check outer argument.')  # noqa: E501
     (subspec1,), (subspec2,) = subspecs1, subspecs2
-    defaults = {'save': SAVE} if save else {}
-    kwargs = {**defaults, **kwargs}
     pattern = kwargs.pop('pattern', None)  # TODO: remove kludge
     kw_shading = {key: kwargs.pop(key) for key in KEYS_SHADING if key in kwargs}
     kw_contour = {key: kwargs.pop(key) for key in KEYS_CONTOUR if key in kwargs}
@@ -328,7 +381,7 @@ def constraint_rows(data, method=None, contours=True, hatching=True, save=True, 
         colspecs = [{}]
     results = []
     warming = ('tpat', 'tstd', 'tdev', 'tabs', 'ecs')
-    for rowspecs, kwargs in split_specs('row', rowspecs, **kwargs):
+    for rowspecs, kwargs in divide_specs('row', rowspecs, **kwargs):
         rspecs = []
         for rspec in rowspecs:  # WARNING: critical to put overrides in row specs
             kw1, kw2 = {**rspec, **subspec1}, {**rspec, **subspec2}
@@ -373,14 +426,14 @@ def constraint_rows(data, method=None, contours=True, hatching=True, save=True, 
                 spec.append(({**kw, **ikw1}, {**kw, **ikw2}))
             cspecs.append(spec)
         # ic(cspecs, rspecs, kwargs)
-        for cspecs, kwargs in split_specs('col', cspecs, **kwargs):
-            result = plotting.create_plot(data, rspecs, cspecs, **kwargs)
+        for cspecs, kwargs in divide_specs('col', cspecs, **kwargs):
+            result = plotting.generate_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results
     return result
 
 
-def components_rows(data, method=None, save=True, **kwargs):
+def relationship_rows(data, method=None, **kwargs):
     """
     Plot average of constraint components and their relationship per row (e.g. maps).
 
@@ -390,21 +443,17 @@ def components_rows(data, method=None, save=True, **kwargs):
         The source dataset.
     method : bool, optional
         The two-variable method to use.
-    save : bool, optional
-        Whether to save the result.
     rowsplit, colsplit : optional
-        Passed to `split_specs`.
+        Passed to `divide_specs`.
     **kwargs
-        Passed to `create_specs`.
+        Passed to `generate_specs`.
     """
     # TODO: Update this. It is out of date with constraint_rows.
     if 'breakdown' not in kwargs and 'component' not in kwargs and 'outer' not in kwargs:  # noqa: E501
         raise RuntimeError
-    rowspecs, colspecs1, colspecs2, kwargs = create_specs(maxcols=1, **kwargs)
+    rowspecs, colspecs1, colspecs2, kwargs = generate_specs(maxcols=1, **kwargs)
     if len(colspecs1) != 1 or len(colspecs2) != 1:
         raise ValueError(f'Too many constraints {colspecs1} and {colspecs2}. Check outer argument.')  # noqa: E501
-    defaults = {'save': SAVE} if save else {}
-    kwargs = {**defaults, **kwargs}
     label, methods, hatches, levels = _constraint_props(method=method)
     kwargs['collabels'] = [None, None, label]
     rplots = (
@@ -416,81 +465,18 @@ def components_rows(data, method=None, save=True, **kwargs):
         {'method': methods[1], 'levels': levels, 'hatches': hatches, 'colors': 'none'},
     )
     results = []
-    for rowspecs, kwargs in split_specs('row', rowspecs, **kwargs):
+    for rowspecs, kwargs in divide_specs('row', rowspecs, **kwargs):
         rspecs = rowspecs  # possibly none
         colspecs = [
             [{**colspecs1[0], **spec} for spec in rplots],
             [{**colspecs2[0], **spec} for spec in rplots],
             [({**colspecs1[0], **spec}, {**colspecs2[1], **spec}) for spec in cplots]
         ]
-        for cspecs, kwargs in split_specs('col', colspecs, **kwargs):
+        for cspecs, kwargs in divide_specs('col', colspecs, **kwargs):
             # ic(rspecs, cspecs)
-            result = plotting.create_plot(data, rspecs, cspecs, **kwargs)
+            result = plotting.generate_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results
     return result
 
 
-def summary_rows(data, method=None, shading=True, contours=True, save=True, **kwargs):
-    """
-    Plot averages and standard deviations per row (e.g. maps).
-
-    Parameters
-    ----------
-    data : xarray.Dataset
-        The source dataset.
-    method : bool, optional
-        The single-variable method to use.
-    shading : bool, optional
-        Whether to include shading.
-    contours : bool, optional
-        Whether to include reference contours.
-    save : bool, optional
-        Whether to save the result.
-    rowsplit, colsplit : optional
-        Passed to `split_specs`.
-    **kwargs
-        Passed to `create_specs`.
-    """
-    # NOTE: For simplicity pass scalar 'outer' and other vectors are used in columns.
-    if not isinstance(method := method or 'avg', str):
-        method1, method2 = method
-    elif method in ('avg', 'med'):
-        method1, method2 = method, 'std'
-    elif method in ('std', 'var', 'pctile'):
-        method1, method2 = method, 'avg'
-    else:
-        raise ValueError(f'Invalid summary_rows() method {method!r}.')
-    if 'breakdown' not in kwargs and 'component' not in kwargs and 'outer' not in kwargs:  # noqa: E501
-        raise RuntimeError
-    rowspecs, colspecs, *_, kwargs = create_specs(maxcols=1, **kwargs)
-    defaults = {'save': SAVE} if save else {}
-    kwargs = {**defaults, **kwargs}
-    kw_shading = {'method': method1} if shading is True else dict(shading or {})
-    kw_shading.update({key: kwargs.pop(key) for key in KEYS_SHADING if key in kwargs})
-    kw_contour = {'method': method2} if contours is True else dict(contours or {})
-    kw_contour.update({key: kwargs.pop(key) for key in KEYS_CONTOUR if key in kwargs})
-    results = []
-    for rowspecs, kwargs in split_specs('row', rowspecs, **kwargs):
-        rspecs = []
-        for rspec in rowspecs:
-            kw = {key: val for key, val in rspec.items() if key not in KEYS_CONTOUR}
-            spec = [{**kw, **kw_shading}]
-            if contours:
-                kw = {key: val for key, val in rspec.items() if key not in KEYS_SHADING}
-                spec.append({**kw, **kw_contour})
-            rspecs.append(spec)
-        cspecs = []  # NOTE: irrelevant keywords for non-cmap figures are ignored
-        for cspec in colspecs:
-            kw = {key: val for key, val in cspec.items() if key not in KEYS_CONTOUR}
-            spec = [{**kw, **kw_shading}]  # noqa: E501
-            if contours:
-                kw = {key: val for key, val in cspec.items() if key not in KEYS_SHADING}
-                spec.append({**kw, **kw_contour})
-            cspecs.append(spec)
-        for cspecs, kwargs in split_specs('col', cspecs, **kwargs):
-            # ic(rspecs, cspecs)
-            result = plotting.create_plot(data, rspecs, cspecs, **kwargs)
-            results.append(result)
-    result = results[0] if len(results) == 1 else results
-    return result

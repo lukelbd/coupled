@@ -20,8 +20,8 @@ import matplotlib.container as mcontainer
 import matplotlib.lines as mlines
 import seaborn as sns
 from climopy import ureg, vreg  # noqa: F401
-from .internals import _capitalize_label, _fit_label, _infer_labels, parse_specs
-from .process import _constrain_response, process_data
+from .internals import _format_label, _split_label, get_labels, parse_specs
+from .process import _constrain_data, process_data
 from .reduce import _components_corr, _components_slope, _parse_institute, _parse_project  # noqa: E501
 
 __all__ = ['generate_plot']
@@ -53,6 +53,8 @@ CONFIG_SETTINGS = {
 pplt.rc.update(CONFIG_SETTINGS)
 
 # Default color cycle
+# NOTE: Cycle designed for variable breakdowns 'net', 'cld', 'swcld', 'lwcld', 'cs'. In
+# future should rethink or remove this cycle.
 CYCLE_DEFAULT = [
     f'{color}6' if color == 'gray' else f'{color}7'
     for color in (
@@ -669,7 +671,8 @@ def _auto_props(data, kw_collection):
     # NOTE: Here 'cycle' used for groups without other settings by default.
     # periods = periods * (len(perturbs) if len(periods) == 1 else 1)
     perturbs = perturbs * (len(periods) if len(perturbs) == 1 else 1)
-    tuples = list(zip(perturbs, *zip(*periods)))
+    periods = periods * (len(perturbs) if len(periods) == 1 else 1)
+    options = list(zip(perturbs, *zip(*periods)))
     cycle = CYCLE_DEFAULT if cycle is None else pplt.get_colors(cycle)
     delta = 0 if perturbs[0] == 0 and len(set(perturbs)) == 1 else 1
     control = [(0, 0, 150)]
@@ -695,28 +698,26 @@ def _auto_props(data, kw_collection):
     # NOTE: Here ignore input 'cycle' if multicolor was passed. Careful to support
     # both _combine_commands() regression bars/violins and distribution bar plots.
     if not multicolor:
-        color = others
         # seen = set(order)  # previously used for 'multicolor'
         # colors = [key for key in order if key in color]
         # colors.extend((key for key in color if key not in seen and not seen.add(key)))
         seen = set()  # record auto-generated color names
+        color = others
         colors = [key for key in others if key not in seen and not seen.add(key)]
         colors = {key: cycle[i % len(cycle)] for i, key in enumerate(colors)}
-        if len(set(tuples)) > 1:  # use hatching for early/late or experiment instead
-            edge, hatch = tuples, tuples
+        if len(set(options)) > 1:  # use hatching for early/late or experiment instead
+            edge, hatch = options, options
             alpha, alphas = groups, {5: 0.3, 56: 0.3, 65: 0.6}
             edges = {} if len(set(periods)) == 1 else {**edge1, **edge2}
-            hatches = hatch0 if len(set(periods)) == 1 else hatch1  # early hatching
-            hatches = hatches if len(set(periods)) == 1 else {**hatch1, **hatch2}
+            hatches = hatch0 if len(set(periods)) == 1 else {**hatch1, **hatch2}
     else:
-        color = tuples
         # order = [*carly, *late, *full, *control]
+        color = options
         edge, hatch = groups, groups
         colors = {}
-        if len(set(tuples)) == 1:  # e.g. cmip5 vs. cmip6 regressions
-            colors[tuples[0]] = 'gray6'
-            colors.update({key: 'pink7' for key in (*early, *late, *full)})
-        elif not set(tuples) & set(early):  # no early-late partition
+        if len(set(options)) == 1:  # e.g. cmip5 vs. cmip6 regressions
+            colors[options[0]] = 'gray6'
+        elif not set(options) & set(early):  # no early-late partition
             colors.update({key: 'cyan7' for key in control})
             colors.update({key: 'pink7' for key in (*late, *full)})
         else:  # early-late partition
@@ -1045,10 +1046,10 @@ def _combine_commands(dataset, arguments, kws_collection):
     refwidth = pplt.units(refwidth or pplt.rc['subplots.refwidth'], 'in')
     refwidth *= 1.0 / len(groups)  # scale spacing by total number of groups
     kw_infer = dict(identical=False, long_names=True, title_case=False)
-    labels_inner = _infer_labels(
+    labels_inner = get_labels(
         dataset, *kws_inner, refwidth=np.inf, skip_names=True, **kw_infer,
     )
-    labels_outer = kw_collection.command.pop('labels', None) or _infer_labels(
+    labels_outer = kw_collection.command.pop('labels', None) or get_labels(
         dataset, *kw_groups, refwidth=refwidth, skip_names=False, **kw_infer,
     )
     if len(labels_outer) != len(kw_groups):
@@ -1187,7 +1188,7 @@ def _infer_commands(
         elif 'facets' in arguments[0][-1].dims:
             arg = arguments[0][-1]
             labels = [{'project': value} for value in _get_projects(arg)]
-            labels = _infer_labels(dataset, *labels, identical=False)
+            labels = get_labels(dataset, *labels, identical=False)
             arg.coords['annotation'] = ('facets', arg.model.values)
             if all(bool(label) for label in labels):
                 arg.coords['label'] = ('facets', labels)
@@ -1336,7 +1337,7 @@ def _setup_axes(ax, *args, command=None):
             else:
                 width, height = ax._get_size_inches()  # all axes present by now
             size = width if s == 'x' else height
-            label = _fit_label(data.climo.cfvariable.short_label, refwidth=size)
+            label = _split_label(data.climo.cfvariable.short_label, refwidth=size)
             ax.format(**{f'{s}label': label})  # include share settings
         units.append(unit)
     return units
@@ -1519,29 +1520,37 @@ def _setup_scatter(
         c = 'red' if not constraint else c  # line fit color
         ax.plot(datax, fit, c=c, ls='-', lw=1.5 * pplt.rc.metawidth)
         ax.area(datax, fit_lower.squeeze(), fit_upper.squeeze(), c=c, a=0.3, lw=0)
-        ax.format(lltitle=label)  # add annotation
-        if constraint is not None:
-            constraint = 'cld' if constraint is True else constraint
-            xcolor, ycolor = 'cyan7', 'pink7'  # TODO: fix colors?
-            xs, ys1, ys2 = _constrain_response(
-                data0, data1, graphical=graphical, constraint=constraint,
-            )
-            xmin, xmean, xmax = xs
-            ymin1, ymean, ymax1 = ys1
-            ymin2, ymean, ymax2 = ys2
-            xmin0, xmax0 = np.percentile(data0, [2.5, 97.5])
-            ymin0, ymax0 = np.percentile(data1, [2.5, 97.5])
-            args = ([xmean, xmean], [ymin2 - 20, ymean])
-            # for x0 in (xmin0, xmax0):  # unconstrained bounds
-            #     ax.axvline(x0, color=xcolor, alpha=0.5, ls='--', lw=1)
-            ax.axvspan(xmin, xmax, color=xcolor, alpha=0.2, lw=0)
-            ax.add_artist(mlines.Line2D(*args, color=xcolor, lw=1))
-            args = ([xmin - 20, xmean], [ymean, ymean])
-            # for y0 in (ymin0, ymax0):  # unconstrained bounds
-            #     ax.axhline(y0, color=ycolor, alpha=0.5, ls='--', lw=1)
-            ax.axhspan(ymin2, ymax2, color=ycolor, alpha=0.1, lw=0)
-            ax.axhspan(ymin1, ymax1, color=ycolor, alpha=0.2, lw=0)
-            ax.add_artist(mlines.Line2D(*args, color=ycolor, lw=1))
+        ax.format(lltitle=label)  # variance explained annotation
+
+    # Add constraint indicator
+    # NOTE: Include shading region both with and without regression uncertainty
+    # plus dashed lines indicating unconstrained and constrained uncertainty.
+    if constraint is not None:
+        pctile = 95  # default percentile
+        bounds = [50 - 0.5 * pctile, 50 + 0.5 * pctile]
+        constraint = 'cld' if constraint is True else constraint
+        xcolor, ycolor = 'cyan7', 'pink7'  # TODO: fix colors?
+        xs, ys1, ys2 = _constrain_data(
+            data0, data1, graphical=graphical, constraint=constraint, pctile=pctile,
+        )
+        xmin, xmean, xmax = xs
+        ymin1, ymean, ymax1 = ys1
+        ymin2, ymean, ymax2 = ys2
+        xmin0, xmax0 = np.percentile(data0, bounds)
+        ymin0, ymax0 = np.percentile(data1, bounds)
+        args = ([xmean, xmean], [ymin2 - 20, ymean])
+        ax.axvspan(xmin, xmax, color=xcolor, alpha=0.2, lw=0)
+        ax.add_artist(mlines.Line2D(*args, color=xcolor, lw=1))
+        args = ([xmin - 20, xmean], [ymean, ymean])
+        for y0 in (ymin0, ymax0):  # unconstrained bounds
+            ax.axhline(y0, color=collection[0].get_color(), alpha=0.5, ls='--', lw=0.7)
+        # for x0 in (xmin0, xmax0):  # unconstrained bounds
+        #     ax.axvline(x0, color=xcolor, alpha=0.5, ls='--', lw=0.7)
+        # for y0 in (ymin0, ymax0):  # unconstrained bounds
+        #     ax.axhline(y0, color=ycolor, alpha=0.5, ls='--', lw=0.7)
+        ax.axhspan(ymin2, ymax2, color=ycolor, alpha=0.1, lw=0)
+        ax.axhspan(ymin1, ymax1, color=ycolor, alpha=0.2, lw=0)
+        ax.add_artist(mlines.Line2D(*args, color=ycolor, lw=1))
 
     # Add annotations
     # NOTE: Using set_in_layout False significantly improves speed since tight bounding
@@ -1898,7 +1907,7 @@ def generate_plot(
     # NOTE: Here 'figsuffix' is for the figure and 'suffix' is for the path.
     # NOTE: This supports selective overrides e.g. rowlabels=['custom', None, None]
     figtitle = figtitle if figtitle is not None else figlabel
-    figtitle = _capitalize_label(figtitle, prefix=figprefix, suffix=figsuffix)
+    figtitle = _format_label(figtitle, prefix=figprefix, suffix=figsuffix)
     geometry = (grows, gcols, grows * gcols)
     labels_input = (rowlabels, collabels, titles)
     labels_output = []
@@ -2193,7 +2202,7 @@ def generate_plot(
                 kw_guide.setdefault('pad', cbarpad)
                 kw_guide.setdefault('space', cbarspace)
                 for ihandle, ilabel in zip(handles, labels):
-                    ilabel = _fit_label(ilabel, refwidth=size)
+                    ilabel = _split_label(ilabel, refwidth=size)
                     src.colorbar(ihandle, loc=loc, label=ilabel, **kw_guide)
 
     # Adjust shared units

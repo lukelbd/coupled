@@ -426,6 +426,48 @@ def _reduce_institutes(data):
     return data
 
 
+def _reduce_time(data, time=None, season=None, month=None):
+    """
+    Reduce the time coordinate of the data.
+
+    Parameters
+    ----------
+    data : xarray.DataArray or xarray.Dataset
+        The input data.
+    time, season, month : optional
+        The time coordinate or ``'avg'`` instruction.
+
+    Returns
+    -------
+    data : xarray.Dataset or xarray.DataArray
+        The reduced data.
+    """
+    if 'time' not in data.dims:
+        return data
+    if season is not None:
+        seasons = data.time.dt.season.str.lower()
+        data = data.isel(time=(seasons == season.lower()))
+    elif isinstance(month, str):
+        months = data.time.dt.strftime('%b').str.lower()
+        data = data.isel(time=(months == month.lower()))
+    elif month is not None:
+        months = data.time.dt.month
+        data = data.isel(time=(months == month))
+    elif not isinstance(time, str) and time is not None and time is not False:
+        time = time  # NOTE: above respects user-input 'None'
+        data = data.sel(time=time, method='nearest')
+    elif isinstance(time, str) and time != 'avg':
+        time = cftime.datetime.strptime(time, '%Y-%m-%d')  # cftime 1.6.2
+        data = data.sel(time=time, method='nearest')
+    elif isinstance(time, str) and time == 'avg':
+        days = data.time.dt.days_in_month.astype(data.dtype)
+        with xr.set_options(keep_attrs=True):  # average over entire record
+            data = (data * days).sum('time', skipna=False) / days.sum()
+    elif time is not None:
+        raise ValueError(f'Unknown time reduction method {time!r}.')
+    return data
+
+
 def _restore_index(data, facets_name=None, version_name=None):
     """
     Restore multi-index coordinates after level reductions.
@@ -442,6 +484,8 @@ def _restore_index(data, facets_name=None, version_name=None):
     data : xarray.Dataset or xarray.DataArray
         The restored data.
     """
+    # NOTE: Using reset_index('project', drop=True) at end of apply_reduce() can
+    # convert facets multi-index into *facets* index instead of *model* level.
     facets_name = facets_name or FACETS_NAME
     version_name = version_name or VERSION_NAME
     for dim, name, levels in zip(
@@ -449,14 +493,15 @@ def _restore_index(data, facets_name=None, version_name=None):
         (facets_name, version_name),
         (FACETS_LEVELS, VERSION_LEVELS)
     ):
-        if dim in data.coords:  # multi-index still present
+        index = data.indexes.get(dim, None)
+        if index is None or isinstance(index, pd.MultiIndex):
             continue
-        levels = data.sizes.keys() & set(levels)  # remaining level
-        if not levels:  # no remaining levels (e.g. scalar)
-            continue
-        coord = data.coords[level := levels.pop()]
-        index = pd.MultiIndex.from_arrays((coord.values,), names=(level,))
-        data = data.rename({level: dim})
+        levels = data.sizes.keys() & set(levels)
+        level = levels.pop() if levels else 'model'  # remaining level
+        coord = level if levels else dim  # remaining coordinate
+        array = data.coords[coord].values
+        index = pd.MultiIndex.from_arrays((array,), names=(level,))
+        data = data.rename({coord: dim})   # possibly no-op
         data = data.assign_coords({dim: index})
     return data
 
@@ -872,7 +917,7 @@ def apply_reduce(data, attrs=None, **kwargs):
             else:  # for 'time' use 'None' to bypass operation
                 kw.setdefault(dim, value)
         if 'version' in data.coords:
-            experiment, region, period = kw['experiment'], kw['region'], kw['period']
+            experiment, region, period, time = kw['experiment'], kw['region'], kw['period'], kw['time']  # noqa: E501
             if period[0] == 'a' and period != 'ann':  # abrupt-only period
                 kw['period'] = 'ann' if experiment == 'picontrol' else period[1:]
             if region[0] == 'a':  # abrupt-only region
@@ -886,44 +931,26 @@ def apply_reduce(data, attrs=None, **kwargs):
         # NOTE: This silently skips dummy selections (e.g. area=None) that may be needed
         # to prevent _parse_specs from merging e.g. average and non-average selections.
         for dim, value in sorted(kw.items(), key=sorter):
-            # Skip reduction
             opts = [*data.sizes, 'area', 'volume', 'spatial']
             opts.extend(level for idx in data.indexes.values() for level in idx.names)
-            dims = data.sizes.keys() & {'lon', 'lat', 'plev'}
             if dim not in opts or value is None:
                 continue
-            if dim in spatial_ignore and kw.get('spatial', None):
+            if dim in spatial_ignore and kw.get('spatial', None) is not None:
                 continue
-            if dim == 'area' and not dims - {'plev'} or dim == 'volume' and not dims:
+            if dim == 'area' and not data.sizes.keys() & {'lon', 'lat'}:
                 continue
-            # Special reductions
-            if dim == 'time' and 'time' in data.sizes:  # manual weighted average
-                if time == 'avg':  # NOTE: respect user-input 'None' here
-                    days = data.time.dt.days_in_month.astype(data.dtype)
-                    with xr.set_options(keep_attrs=True):  # average over entire record
-                        data = (data * days).sum('time', skipna=False) / days.sum()
-                elif time is not None:
-                    raise ValueError(f'Unknown time reduction method {time!r}.')
+            if dim == 'volume' and not data.sizes.keys() & {'lon', 'lat', 'plev'}:
                 continue
-            if dim == 'area':
-                region = AREA_REGIONS.get(value, None)
-                if region is not None:
-                    data, value = data.climo.truncate(region), 'avg'
-                elif value != 'avg':
-                    raise ValueError(f'Unknown averaging region {value!r}.')
-            # Carry out reduction
+            if dim == 'area' and value != 'avg':  # average over truncated region
+                data, value = data.climo.truncate(AREA_REGIONS[value]), 'avg'
+            if dim in ('time', 'month', 'season'):  # TODO: use 'cell_duration'?
+                data = _reduce_time(data, **{dim: value})
+                continue
             if dim in data.coords and not isinstance(value, (str, tuple)):
-                unit = data.coords[dim].climo.units
-                if isinstance(value, ureg.Quantity):
-                    value = value.to(unit)
-                else:
-                    value = ureg.Quantity(value, unit)
-            data = data.climo.reduce({dim: value}, method='interp')
-            data = data.squeeze()
+                value = ureg.Quantity(value, data.coords[dim].climo.units)
+            data = data.climo.reduce({dim: value}, method='interp').squeeze()
             if dim not in data.coords:
-                data.coords[dim] = value  # converts to data array
-                data.coords[dim] = data.coords[dim].climo.dequantify()
-        # Return after optionally ensuring settings
+                data.coords[dim] = xr.DataArray(value).climo.dequantify()
         data.name = name  # TODO: check if necessary?
         data.attrs.update(attrs)  # TODO: check if necessary?
         result.append(data)

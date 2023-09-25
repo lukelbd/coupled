@@ -26,7 +26,7 @@ from cmip_data.feedbacks import FEEDBACK_DEPENDENCIES
 __all__ = ['get_data', 'process_data']
 
 
-# Observational constraints
+# Observational constraint mean and spreads
 # TODO: Auto-generate this dictionary or save and commit then parse a text file.
 # NOTE: These show best estimate, standard errors, and degrees of freedom for feedback
 # regression slopes using either GISTEMP4 or HadCRUT5. See observed.ipynb notebook.
@@ -109,7 +109,7 @@ with warnings.catch_warnings():  # noqa: E305
     climo.register_derivation(re.compile(r'\A(ta|ts)_diff\Z'))(equator_pole_diffusivity)
 
 
-def _constrain_response(
+def _constrain_data(
     data0, data1, constraint=None, pctile=None, N=None, graphical=False
 ):
     """
@@ -140,9 +140,8 @@ def _constrain_response(
         The emergent constraint accounting for regression uncertainty.
     """
     # NOTE: Below we reverse engineer the t-distribution associated with observational
-    # estimate, then use those distribution properties for our bootstrapping.
-    # NOTE: Below tried adding 'offset uncertainty' but resulted in equivalent spread
-    # compared to standard slop-only regression uncertainty.
+    # estimate, then use those distribution properties for our bootstrapping. Tried
+    # using 'offset uncertainty' but was similar to slope-only regression uncertainty.
     # NOTE: Use N - 2 degrees of freedom for both observed feedback and inter-model
     # coefficients since they are both linear regressions. For now ignore uncertainty
     # of individual feedback regressions that comprise inter-model regression because
@@ -150,11 +149,8 @@ def _constrain_response(
     # should roughly cancel out across e.g. 30 members of ensemble.
     N = N or 10000  # samples to draw
     pctile = 90 if pctile is None else pctile
-    # pctile = 95 if pctile is None else pctile
     pctile = 0.5 * (100 - pctile)  # e.g. [90, 50] --> [[5, 25], [95, 75]]
     pctile = np.array([pctile, 100 - pctile])
-    # steps = 120  # approximate degrees of freedom in Dessler et al.
-    # steps = 6 * (2019 - 2001 + 1)  # number of years in He et al. estimate
     if isinstance(constraint, str):
         constraint = FEEDBACK_ALIASES.get(constraint, constraint)
     elif not np.iterable(constraint) or len(constraint) != 3:
@@ -169,31 +165,10 @@ def _constrain_response(
     idxs = np.argsort(data0, axis=0)
     data0, data1 = data0[idxs], data1[idxs]  # required for graphical error
     mean0, mean1 = data0.mean(), data1.mean()
-    bmean, berror, rsquare, fit, fit_lower, fit_upper = linefit(
+    bmean, berror, _, fit, fit_lower, fit_upper = linefit(
         data0, data1, adjust=False, pctile=pctile
     )
-    if not graphical:  # bootstrapped residual addition
-        # xscore = stats.t.isf(0.025, xdof)  # t score associated with 95% bounds
-        # xerror = (xmax - xmean) / xscore  # used when percentiles were hardcoded
-        rerror = np.sqrt((1 - rsquare) * np.var(data1, ddof=1))  # model residual sigma
-        rdof = data0.size - 2  # inter-model regression dof
-        xs = stats.t.rvs(xdof, loc=xmean, scale=xscale, size=N)  # observations
-        err = stats.t.rvs(rdof, loc=0, scale=rerror, size=N)  # regression
-        ys = err + mean1 + bmean * (xs - mean0)
-        # amean = mean1 - mean0 * bmean  # see wiki page
-        # aerror = berror * np.sqrt(np.sum(data0 ** 2) / data0.size)  # see wiki page
-        # bs_ = stats.t.rvs(data0.size - 2, loc=bmean, scale=berror, size=N)
-        # as_ = stats.t.rvs(data0.size - 2, loc=amean, scale=aerror, size=N)
-        # ys = err + as_ + bs_ * xs  # include both uncertainties
-        # ys = mean1 + bs_ * (xs - mean0)  # include slope uncertainty only
-        ymean = np.mean(ys)
-        ymin, ymax = np.percentile(ys, pctile)
-        constrained = (ymin, ymean, ymax)
-        ys = mean1 + bmean * (xs - mean0)  # no regression uncertainty
-        ymean = np.mean(ys)
-        ymin, ymax = np.percentile(ys, pctile)
-        alternative = (ymin, ymean, ymax)
-    else:  # intersection of shaded regions
+    if graphical:  # intersection of shaded regions
         fit_lower = fit_lower.squeeze()
         fit_upper = fit_upper.squeeze()
         xs = np.sort(data0, axis=0)  # linefit returns result for sorted data
@@ -203,7 +178,97 @@ def _constrain_response(
         constrained = (ymin, ymean, ymax)
         ymin, ymean, ymax = mean1 + bmean * (np.array(observations) - mean0)
         alternative = (ymin, ymean, ymax)  # no regression uncertainty
+    else:  # bootstrapped residual addition
+        # amean = mean1 - mean0 * bmean  # see wiki page
+        # aerror = berror * np.sqrt(np.sum(data0 ** 2) / data0.size)  # see wiki page
+        # bs_ = stats.t.rvs(data0.size - 2, loc=bmean, scale=berror, size=N)
+        # as_ = stats.t.rvs(data0.size - 2, loc=amean, scale=aerror, size=N)
+        # ys = err + as_ + bs_ * xs  # include both uncertainties
+        # ys = mean1 + bs_ * (xs - mean0)  # include slope uncertainty only
+        rscale = np.std(data1 - fit, ddof=1)  # model residual sigma
+        rdof = data0.size - 2  # inter-model regression dof
+        xs = stats.t.rvs(xdof, loc=xmean, scale=xscale, size=N)  # observations
+        rs = stats.t.rvs(rdof, loc=0, scale=rscale, size=N)  # regression
+        ys = rs + mean1 + bmean * (xs - mean0)
+        constrained = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
+        ys = mean1 + bmean * (xs - mean0)  # no regression uncertainty
+        alternative = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
     return observations, alternative, constrained
+
+
+def _find_data(
+    dataset, name, attr=None, attrs=None, hemi=None,
+    scaled=False, quantify=False, standardize=True, **kwargs
+):
+    """
+    Find or derive the variable or variable attribute.
+
+    Parameters
+    ----------
+    dataset : xarray.Dataset
+        The input dataset.
+    name : str
+        The requested variable.
+    attr : str, optional
+        The requested variable attribute.
+    attrs : dict, optional
+        The variable attribute overrides.
+    hemi : str, optional
+        The hemisphere to select.
+    scaled : bool, optional
+        Whether ecs/erf data has been scaled.
+    quantify : bool, optional
+        Whether to quantify the data.
+    standardize : str, optional
+        Whether to standardize the data.
+    **kwargs
+        Additional reduction instructions.
+
+    Returns
+    -------
+    data : xarray.DataArray
+        The result. If `attr` is not ``None`` this is an empty array.
+    """
+    # WARNING: Critical to only apply .reduce() operations to variables required for
+    # derivation or else takes too long. After climopy refactoring this will be taken
+    # into account automatically and derivations will require explicitly specifying
+    # the dependencies upon registration (no more retrieveing inside the function).
+    # NOTE: Here apply_reduce will automatically perform default selections for certain
+    # dimensions (only carry out when requesting data). Also gets net flux (longwave
+    # plus shortwave), atmospheric flux (top-of-atmosphere plus surface), cloud effect
+    # (all-sky minus clear-sky), radiative response (full minus effective forcing),
+    # net imbalance (downwelling minus upwelling), and various transport terms.
+    name = ALIAS_FEEDBACKS.get(name, name)
+    attrs = attrs or {}
+    scaled = scaled or 'ecs' not in name and 'erf' not in name
+    if scaled and name in dataset:
+        data = dataset[name]
+    elif not scaled or name not in dataset.climo:  # coupled-model derivation
+        data = _derive_data(dataset, name, attr=attr, scaled=scaled, **kwargs)
+    elif name in VARIABLE_DEPENDENCIES:  # any registered climopy derivation
+        var = vreg[name]  # specific supported derivation
+        keys = ('short_name', 'long_name', 'standard_units')
+        deps = set(VARIABLE_DEPENDENCIES[name])  # climopy derivation dependencies
+        attrs.update({attr: getattr(var, attr) for attr in keys})
+        if attr:  # TODO: throughout utilities permit cfvariable attributes
+            data = xr.DataArray([], name=name)
+        else:  # derive below with get()
+            data = dataset.drop_vars(dataset.data_vars.keys() - set(deps))
+    else:  # note in future will
+        raise RuntimeError(f'Climopy derivation {name} has unknown dependencies.')
+    if not attr:  # carry out reductions
+        data = apply_reduce(data, **kwargs)
+        if 'plev' in data.coords:  # TODO: make derivations compatible with plev
+            data = data.rename(plev='lev')
+        if hemi and 'lat' in data.sizes:
+            data = data.climo.sel_hemisphere(hemi)
+        if isinstance(data, xr.Dataset):  # finally get the derived variable
+            data = data.climo.get(name, quantify=quantify, standardize=standardize)
+        if 'lev' in data.coords:
+            data = data.rename(lev='plev')
+    data.name = name
+    data.attrs.update(attrs)  # arbitrary overrides
+    return data
 
 
 def _derive_data(dataset, name, scaled=False, **kwargs):  # noqa: E501
@@ -400,81 +465,6 @@ def _operate_data(
         else:
             value = search.sub(replace, value)
         data.attrs[name] = value
-    return data
-
-
-def _find_data(
-    dataset, name, attr=None, attrs=None, hemi=None,
-    scaled=False, quantify=False, standardize=True, **kwargs
-):
-    """
-    Find or derive the variable or variable attribute.
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The input dataset.
-    name : str
-        The requested variable.
-    attr : str, optional
-        The requested variable attribute.
-    attrs : dict, optional
-        The variable attribute overrides.
-    hemi : str, optional
-        The hemisphere to select.
-    scaled : bool, optional
-        Whether ecs/erf data has been scaled.
-    quantify : bool, optional
-        Whether to quantify the data.
-    standardize : str, optional
-        Whether to standardize the data.
-    **kwargs
-        Additional reduction instructions.
-
-    Returns
-    -------
-    data : xarray.DataArray
-        The result. If `attr` is not ``None`` this is an empty array.
-    """
-    # WARNING: Critical to only apply .reduce() operations to variables required for
-    # derivation or else takes too long. After climopy refactoring this will be taken
-    # into account automatically and derivations will require explicitly specifying
-    # the dependencies upon registration (no more retrieveing inside the function).
-    # NOTE: Here apply_reduce will automatically perform default selections for certain
-    # dimensions (only carry out when requesting data). Also gets net flux (longwave
-    # plus shortwave), atmospheric flux (top-of-atmosphere plus surface), cloud effect
-    # (all-sky minus clear-sky), radiative response (full minus effective forcing),
-    # net imbalance (downwelling minus upwelling), and various transport terms.
-    name = ALIAS_FEEDBACKS.get(name, name)
-    attrs = attrs or {}
-    scaled = scaled or 'ecs' not in name and 'erf' not in name
-    if scaled and name in dataset:
-        data = dataset[name]
-    elif not scaled or name not in dataset.climo:  # coupled-model derivation
-        data = _derive_data(dataset, name, attr=attr, scaled=scaled, **kwargs)
-    elif name in VARIABLE_DEPENDENCIES:  # any registered climopy derivation
-        var = vreg[name]  # specific supported derivation
-        keys = ('short_name', 'long_name', 'standard_units')
-        deps = set(VARIABLE_DEPENDENCIES[name])  # climopy derivation dependencies
-        attrs.update({attr: getattr(var, attr) for attr in keys})
-        if attr:  # TODO: throughout utilities permit cfvariable attributes
-            data = xr.DataArray([], name=name)
-        else:  # derive below with get()
-            data = dataset.drop_vars(dataset.data_vars.keys() - set(deps))
-    else:  # note in future will
-        raise RuntimeError(f'Climopy derivation {name} has unknown dependencies.')
-    if not attr:  # carry out reductions
-        data = apply_reduce(data, **kwargs)
-        if 'plev' in data.coords:  # TODO: make derivations compatible with plev
-            data = data.rename(plev='lev')
-        if hemi and 'lat' in data.sizes:
-            data = data.climo.sel_hemisphere(hemi)
-        if isinstance(data, xr.Dataset):  # finally get the derived variable
-            data = data.climo.get(name, quantify=quantify, standardize=standardize)
-        if 'lev' in data.coords:
-            data = data.rename(lev='plev')
-    data.name = name
-    data.attrs.update(attrs)  # arbitrary overrides
     return data
 
 

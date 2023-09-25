@@ -18,4 +18,3 @@ from .results import *  # noqa: F401, F403
 from .internals import *  # noqa: F401, F403
 from .plotting import *  # noqa: F401, F403
 from .templates import *  # noqa: F401, F403
-from .translate import *  # noqa: F401, F403

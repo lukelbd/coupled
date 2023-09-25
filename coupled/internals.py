@@ -14,21 +14,23 @@ from icecream import ic  # noqa: F401
 
 from .results import ALIAS_FEEDBACKS, FEEDBACK_ALIASES
 
-__all__ = ['get_spec', 'parse_specs']
+__all__ = ['get_path', 'get_label', 'get_labels', 'parse_spec', 'parse_specs']
 
-# Threshold for label wrapping
-# NOTE: Play with this to prevent annoying line breaks
-WRAP_SCALE = 1.8
-# WRAP_SCALE = 1.4
+# Threshold for font wrapping
+FONT_SCALE = 1.8
+# FONT_SCALE = 1.4
 
-# Keywords for inter-model reduction methods
-# NOTE: Here 'hemisphere' is not passed to reduce() but handled directly
-KEYS_VARIABLE = (
-    'hemi', 'hemisphere', 'quantify', 'standardize',
-)
-KEYS_METHOD = (  # skip 'spatial' because used in apply_reduce
-    'method', 'std', 'pctile', 'invert', 'normalize',
-)
+# Reduce instructions to ignore when creating paths
+# NOTE: New format will prefer either 'monthly' or 'annual'. To prevent overwriting
+# old results keep 'slope' as the default (i.e. omitted) value when generating paths.
+PATH_IGNORES = {
+    'project': 'cmip',  # ignore if passed
+    'ensemble': 'flagship',
+    'period': 'ann',
+    'source': 'eraint',
+    'style': 'slope',
+    'region': 'globe',
+}
 
 # Regexes for float and operator detection
 # WARNING: Use '.' for product instead of '*' for adjusted Planck parameters.
@@ -39,45 +41,42 @@ REGEX_SPLIT = re.compile(  # ignore e.g. leading positive and negative signs
     r'(?<=[^+./-])([+./-])(?=[^+./-])'
 )
 
-# Path naming and reduction defaults
-# NOTE: New format will prefer either 'monthly' or 'annual'. To prevent overwriting
-# old results keep 'slope' as the default (i.e. omitted) value when generating paths.
-DEFAULTS_PATH = {
-    'project': 'cmip',  # ignore if passed
-    'ensemble': 'flagship',
-    'period': 'ann',
-    'source': 'eraint',
-    'style': 'slope',
-    'region': 'globe',
-}
+# Keywords for inter-model reduction methods
+# NOTE: Here 'hemisphere' is not passed to reduce() but handled directly
+KEYS_VARIABLE = (
+    'hemi', 'hemisphere', 'quantify', 'standardize',
+)
+KEYS_METHOD = (  # skip 'spatial' because used in apply_reduce
+    'method', 'std', 'pctile', 'invert', 'normalize',
+)
 
-# Prefixes used to detect and segregate keyword arguments
+# Keyword prefixes for generating individual dictionaries from specs
 # NOTE: See plotting.py documentation for various 'other' arguments.
 # NOTE: Cannot pass e.g. left=N to gridspec for some reason?
-DETECT_FIG = (
+KEYS_FIGURE = (
     'fig', 'sup', 'dpi', 'ref', 'share', 'span', 'align',
     'tight', 'innerpad', 'outerpad', 'panelpad',
     'left', 'right', 'bottom', 'top',
 )
-DETECT_GRIDSPEC = (
-    'space', 'ratio', 'group', 'equal', 'pad',
-    'wspace', 'wratio', 'wgroup', 'wequal', 'wpad',
-    'hspace', 'hratio', 'hgroup', 'hequal', 'hpad',
-)
-DETECT_AXES = (
+KEYS_AXES = (
     'x', 'y', 'lon', 'lat', 'grid', 'rotate',
     'rc', 'proj', 'land', 'ocean', 'coast', 'margin',
     'abc', 'title', 'ltitle', 'ctitle', 'rtitle',
 )
-DETECT_OTHER = (
+KEYS_GRIDSPEC = (
+    'space', 'ratio', 'group', 'equal', 'pad',
+    'wspace', 'wratio', 'wgroup', 'wequal', 'wpad',
+    'hspace', 'hratio', 'hgroup', 'hequal', 'hpad',
+)
+KEYS_OTHER = (
     'cycle', 'horizontal', 'offset', 'intersect', 'correlation',  # _combine
     'zeros', 'oneone', 'linefit', 'annotate', 'constraint', 'graphical',  # _scatter
     'multicolor', 'pcolor',  # _auto_props
 )
-DETECT_ATTRIBUTES = ('short_name', 'long_name', 'standard_name', 'units')
-DETECT_COLORBAR = ('locator', 'formatter', 'tick', 'minor', 'extend', 'length', 'shrink')  # noqa: E501
-DETECT_LEGEND = ('order', 'frame', 'handle', 'border', 'column')
-DETECT_GUIDE = ('loc', 'location', 'label', 'align')
+KEYS_ATTRIBUTES = ('short_name', 'long_name', 'standard_name', 'units')
+KEYS_COLORBAR = ('locator', 'formatter', 'tick', 'minor', 'extend', 'length', 'shrink')
+KEYS_LEGEND = ('order', 'frame', 'handle', 'border', 'column')
+KEYS_GUIDE = ('loc', 'location', 'label', 'align')
 
 # Argument sorting constants
 # NOTE: Use logical top-down order for file naming and reduction instruction order
@@ -136,7 +135,7 @@ ORDER_READABLE = (
     'spatial',  # always at the end
 )
 
-# General translations
+# Path label translations
 TRANSLATE_PATHS = {
     ('institute', 'avg'): 'inst',
     ('institute', 'flagship'): 'flag',
@@ -170,6 +169,8 @@ TRANSLATE_PATHS = {
     ('lon', 'int'): None,
     ('lon', 'avg'): 'avg',  # always report
 }
+
+# Figure label translations
 TRANSLATE_LABELS = {
     ('project', 'cmip'): 'CMIP',
     ('project', 'cmip5'): 'CMIP5',
@@ -183,16 +184,11 @@ TRANSLATE_LABELS = {
     ('project', 'cmip5665'): 'matching CMIP',
     ('project', 'cmip6655'): 'non-matching CMIP',
     ('project', 'cmip5566'): 'non-matching CMIP',
-    ('institute', 'avg'): None,
-    ('institute', 'flagship'): None,
-    ('institute', None): None,
-    # ('institute', 'avg'): 'institute',
-    # ('institute', 'flagship'): 'flagship-only',
-    # ('institute', None): 'model',
+    ('institute', 'avg'): None,  # or 'institute-average'
+    ('institute', 'flagship'): None,  # or 'flagship-only'
+    ('institute', None): None,  # or 'individual-model'
     ('experiment', 'picontrol'): 'control',
     ('experiment', 'abrupt4xco2'): r'4$\times$CO$_2$',
-    # ('source', 'eraint'): 'custom',
-    # ('source', 'zelinka'): 'Zelinka',
     ('source', 'eraint'): 'Davis et al.',
     ('source', 'zelinka'): 'Zelinka et al.',
     ('style', 'slope'): 'annual',
@@ -200,10 +196,16 @@ TRANSLATE_LABELS = {
     ('style', 'monthly'): 'monthly',
     ('style', 'ratio'): 'ratio-style',
     ('startstop', (0, 150)): 'full',
-    ('startstop', (0, 50)): 'early',
-    ('startstop', (100, 150)): 'late',
+    ('startstop', (1, 150)): 'full + 1',
+    ('startstop', (2, 150)): 'full + 2',
     ('startstop', (0, 20)): 'early',
+    ('startstop', (1, 20)): 'early + 1',
+    ('startstop', (2, 20)): 'early + 2',
+    ('startstop', (0, 50)): 'early 50',
+    ('startstop', (1, 50)): 'early 50 + 1',
+    ('startstop', (2, 50)): 'early 50 + 2',
     ('startstop', (20, 150)): 'late',
+    ('startstop', (100, 150)): 'late 50',
     ('region', 'globe'): 'global-$T$',
     ('region', 'point'): 'local-$T$',
     ('region', 'latitude'): 'zonal-$T$',
@@ -215,12 +217,9 @@ TRANSLATE_LABELS = {
     ('spatial', 'rsq'): 'spatial variance explained',
     ('plev', 'int'): None,
     ('plev', 'avg'): 'column',
-    ('area', None): 'local',  # NOTE: only used with identical=False
-    ('area', 'avg'): 'global',  # NOTE: only used with identical=False
-    ('area', 'trop'): 'tropical',
-    # ('area', None): 'unaveraged',  # NOTE: only used with identical=False
-    # ('area', 'avg'): 'global-average',  # NOTE: only used with identical=False
-    # ('area', 'trop'): 'tropical-average',
+    ('area', None): 'local',  # only used with identical=False
+    ('area', 'avg'): 'global',  # only used with identical=False
+    ('area', 'trop'): 'tropical',  # only used with identical=False
     ('area', 'tpac'): 'tropical Pacific',
     ('area', 'wpac'): 'West Pacific',
     ('area', 'epac'): 'East Pacific',
@@ -242,48 +241,79 @@ TRANSLATE_LABELS = {
     ('lon', 'avg'): None,
 }
 
-# Time translations
-# NOTE: Optionally translate periods
+# Separate long and short label translations
 TRANSLATE_LONGS = {
-    ('period', 'ann'): 'annual',
-    ('period', 'djf'): 'boreal winter',
-    ('period', 'mam'): 'boreal spring',
-    ('period', 'jja'): 'boreal summer',
-    ('period', 'son'): 'boreal autumn',
-    ('period', 'jan'): 'January',
-    ('period', 'feb'): 'February',
-    ('period', 'mar'): 'March',
-    ('period', 'apr'): 'April',
-    ('period', 'may'): 'May',
-    ('period', 'jun'): 'June',
-    ('period', 'jul'): 'July',
-    ('period', 'aug'): 'August',
-    ('period', 'sep'): 'September',
-    ('period', 'oct'): 'October',
-    ('period', 'nov'): 'November',
-    ('period', 'dec'): 'December',
-    **TRANSLATE_LABELS
+    'ann': 'annual',
+    'djf': 'boreal winter',
+    'mam': 'boreal spring',
+    'jja': 'boreal summer',
+    'son': 'boreal autumn',
+    'jan': 'January',
+    'feb': 'February',
+    'mar': 'March',
+    'apr': 'April',
+    'may': 'May',
+    'jun': 'June',
+    'jul': 'July',
+    'aug': 'August',
+    'sep': 'September',
+    'oct': 'October',
+    'nov': 'November',
+    'dec': 'December',
 }
 TRANSLATE_SHORTS = {
-    ('period', 'ann'): 'annual',
-    ('period', 'djf'): 'DJF',
-    ('period', 'mam'): 'MAM',
-    ('period', 'jja'): 'JJA',
-    ('period', 'son'): 'SON',
-    ('period', 'jan'): 'Jan',
-    ('period', 'feb'): 'Feb',
-    ('period', 'mar'): 'Mar',
-    ('period', 'apr'): 'Apr',
-    ('period', 'may'): 'May',
-    ('period', 'jun'): 'Jun',
-    ('period', 'jul'): 'Jul',
-    ('period', 'aug'): 'Aug',
-    ('period', 'sep'): 'Sep',
-    ('period', 'oct'): 'Oct',
-    ('period', 'nov'): 'Nov',
-    ('period', 'dec'): 'Dec',
-    **TRANSLATE_LABELS
+    'ann': 'annual',
+    'djf': 'DJF',
+    'mam': 'MAM',
+    'jja': 'JJA',
+    'son': 'SON',
+    'jan': 'Jan',
+    'feb': 'Feb',
+    'mar': 'Mar',
+    'apr': 'Apr',
+    'may': 'May',
+    'jun': 'Jun',
+    'jul': 'Jul',
+    'aug': 'Aug',
+    'sep': 'Sep',
+    'oct': 'Oct',
+    'nov': 'Nov',
+    'dec': 'Dec',
 }
+TRANSLATE_LONGS = {
+    (key, value): label
+    for key in ('period', 'season')
+    for value, label in TRANSLATE_LONGS.items()
+}
+TRANSLATE_SHORTS = {
+    (key, value): label
+    for key in ('period', 'season')
+    for value, label in TRANSLATE_SHORTS.items()
+}
+TRANSLATE_LONGS.update(TRANSLATE_LABELS)
+TRANSLATE_SHORTS.update(TRANSLATE_LABELS)
+
+
+def _expand_lists(*args, equal=True):
+    """
+    Return lists with possibly matched lengths.
+
+    Parameters
+    ----------
+    *args
+        The lengths of objects.
+    equal : bool, optional
+        Whether to enforce equal lengths.
+    """
+    args = list(args)  # modifable
+    if len(args) == 2 and len(args[0]) == 1 and len(args[1]) != 1:
+        args[0] = args[0] * len(args[1])
+    if len(args) == 2 and len(args[1]) == 1 and len(args[0]) != 1:
+        args[1] = args[1] * len(args[0])
+    if equal and len(set(lengths := list(map(len, args)))) > 1:
+        vals = '\n'.join(map(repr, args))
+        raise ValueError(f'Incompatible mixed lengths {lengths} for values:\n{vals}.')
+    return args
 
 
 def _group_parts(kwargs, keep_operators=False):
@@ -354,53 +384,9 @@ def _ungroup_parts(value):
     return [part[0] if len(part) == 1 else part for part in zip(*parts)]
 
 
-def _to_lists(*args, equal=True):
-    """
-    Ensure input argument lengths match.
-
-    Parameters
-    ----------
-    *args
-        The lengths of objects.
-    equal : bool, optional
-        Whether to enforce equal lengths.
-    """
-    args = list(args)  # modifable
-    if len(args) == 2 and len(args[0]) == 1 and len(args[1]) != 1:
-        args[0] = args[0] * len(args[1])
-    if len(args) == 2 and len(args[1]) == 1 and len(args[0]) != 1:
-        args[1] = args[1] * len(args[0])
-    if equal and len(set(lengths := list(map(len, args)))) > 1:
-        vals = '\n'.join(map(repr, args))
-        raise ValueError(f'Incompatible mixed lengths {lengths} for values:\n{vals}.')
-    return args
-
-
-def _capitalize_label(label, prefix=None, suffix=None):
-    """
-    Cast the input label to title case.
-
-    Parameters
-    ----------
-    label : str
-        The display label.
-    prefix, suffix : optional
-        The label prefix and suffix.
-    """
-    if prefix and not label[:2].isupper():
-        label = label[:1].lower() + label[1:]
-    if prefix:
-        prefix = prefix[:1].upper() + prefix[1:]
-    else:
-        label = label[:1].upper() + label[1:]
-    parts = (prefix, label, suffix)
-    label = ' '.join(filter(None, parts))
-    return label
-
-
 def _combine_labels(*labels, identical=False):
     """
-    Helper function to combine labels.
+    Helper function to combine separate labels.
 
     Parameters
     ----------
@@ -437,7 +423,81 @@ def _combine_labels(*labels, identical=False):
     return labels
 
 
-def _create_path(dataset, *kws_process):
+def _format_label(label, prefix=None, suffix=None):
+    """
+    Helper function for format and capitalize the label.
+
+    Parameters
+    ----------
+    label : str
+        The display label.
+    prefix, suffix : optional
+        The label prefix and suffix.
+    """
+    if prefix and not label[:2].isupper():
+        label = label[:1].lower() + label[1:]
+    if prefix:
+        prefix = prefix[:1].upper() + prefix[1:]
+    else:
+        label = label[:1].upper() + label[1:]
+    parts = (prefix, label, suffix)
+    label = ' '.join(filter(None, parts))
+    return label
+
+
+def _split_label(label, fontsize=None, refwidth=None, nmax=None):
+    """
+    Helper function to split the label into separate lines.
+
+    Parameters
+    ----------
+    label : str
+        The input label.
+    refwidth : unit-spec, optional
+        The reference maximum width.
+    nmax : int, optional
+        Optional maximum number of breaks to use.
+    """
+    # NOTE: This adds extra padding to allow labels to extend into border.
+    # NOTE: Adjust contribution from math, e.g. 2$\times$CO$_2$, since this
+    # consists of mahy characters that do not contribute to actual space.
+    label = label or ''
+    label = label.replace('\n', ' ')  # remove previous wrapping just in case
+    label = label + ' '  # end with dummy space for threshold loop below
+    idxs_space = np.array([i for i, c in enumerate(label) if c == ' '])
+    idxs_check = idxs_space.astype(float)
+    for m in re.finditer(r'\$[^$]+\$', label):
+        i, j = m.span()
+        tex = label[i + 1:j - 1]  # text inside '$$'
+        tex = re.sub(r'\\[A-Za-z]+\{([^}]*)\}', r'\1', tex)  # replace e.g. \mathrm{}
+        tex = re.sub(r'[_^]\{?[0-9A-Za-z+-]*\}?', '#', tex)  # replace exponents
+        tex = re.sub(r'\s*\\[.,:;]\s*', '', tex)  # replace space between terms
+        tex = re.sub(r'\\[A-Za-z]+', 'x', tex)  # replace tex symbol
+        idxs_check[(idxs_check >= i) & (idxs_check < j)] = np.nan  # no breaks here
+        idxs_check[idxs_check >= j] -= j - i - 1 - len(tex)  # size used for wrap
+    basesize = pplt.rc['font.size']  # reference size
+    fontscale = pplt.utils._fontsize_to_pt(fontsize or basesize) / basesize
+    refwidth = pplt.units(refwidth or pplt.rc['subplots.refwidth'], 'in', 'em')
+    refscale = FONT_SCALE / fontscale  # font scaling for line wrapping detection
+    thresholds = refscale * refwidth * np.arange(1, 20)
+    seen, chars, count = set(), list(label), 0  # convert string to list
+    for thresh in thresholds:
+        idxs, = np.where(idxs_check <= thresh)
+        if not np.any(idxs_check > thresh):  # no spaces or end-of-string over this
+            continue
+        if not idxs.size:  # including empty idxs_check
+            continue
+        if nmax and count >= nmax:
+            continue
+        if idxs[-1] not in seen:  # avoid infinite loop and jump to next threshold
+            seen.add(idx := idxs[-1])
+            thresholds -= thresh - idxs_check[idx]  # closer to threshold by this
+            chars[idxs_space[idx]] = '\n'
+            count += 1  # update newline count
+    return ''.join(chars[:-1])
+
+
+def get_path(dataset, *kws_process):
     """
     Convert reduction operators into path suitable for saving.
 
@@ -463,11 +523,11 @@ def _create_path(dataset, *kws_process):
         seen, parts = set(), []
         values = [kw[key] for kw in kws_process if key in kw]
         values = [value for value in values if value not in seen and not seen.add(value)]  # noqa: E501
-        if len(values) == 1 and values[0] == DEFAULTS_PATH.get(key, None):
+        if len(values) == 1 and values[0] == PATH_IGNORES.get(key, None):
             continue
         for value in values:  # across all subplots and tuples
-            label = _get_label(dataset, key, value, mode='path')
-            if not label:
+            label = get_label(dataset, key, value, mode='path')
+            if not label:  # e.g. for 'None' reduction
                 continue
             if label not in parts:  # e.g. 'avg' to be ignored
                 parts.append(label)
@@ -477,64 +537,7 @@ def _create_path(dataset, *kws_process):
     return result
 
 
-def _fit_label(label, fontsize=None, refwidth=None, nmax=None):
-    """
-    Fit label into given width by replacing spaces with newlines.
-
-    Parameters
-    ----------
-    label : str
-        The input label.
-    refwidth : unit-spec, optional
-        The reference maximum width.
-    nmax : int, optional
-        Optional maximum number of breaks to use.
-
-    Returns
-    -------
-    label : str
-        The label with inserted newlines.
-    """
-    # NOTE: This adds extra padding to allow labels to extend into border.
-    # NOTE: Adjust contribution from math, e.g. 2$\times$CO$_2$, since this
-    # consists of mahy characters that do not contribute to actual space.
-    label = label or ''
-    label = label.replace('\n', ' ')  # remove previous wrapping just in case
-    label = label + ' '  # end with dummy space for threshold loop below
-    idxs_space = np.array([i for i, c in enumerate(label) if c == ' '])
-    idxs_check = idxs_space.astype(float)
-    for m in re.finditer(r'\$[^$]+\$', label):
-        i, j = m.span()
-        tex = label[i + 1:j - 1]  # text inside '$$'
-        tex = re.sub(r'\\[A-Za-z]+\{([^}]*)\}', r'\1', tex)  # replace e.g. \mathrm{}
-        tex = re.sub(r'[_^]\{?[0-9A-Za-z+-]*\}?', '#', tex)  # replace exponents
-        tex = re.sub(r'\s*\\[.,:;]\s*', '', tex)  # replace space between terms
-        tex = re.sub(r'\\[A-Za-z]+', 'x', tex)  # replace tex symbol
-        idxs_check[(idxs_check >= i) & (idxs_check < j)] = np.nan  # no breaks here
-        idxs_check[idxs_check >= j] -= j - i - 1 - len(tex)  # size used for wrap
-    basesize = pplt.rc['font.size']
-    fontscale = pplt.utils._fontsize_to_pt(fontsize or basesize) / basesize
-    refwidth = pplt.units(refwidth or pplt.rc['subplots.refwidth'], 'in', 'em')
-    refscale = WRAP_SCALE / fontscale  # font scaling
-    thresholds = refscale * refwidth * np.arange(1, 20)
-    seen, chars, count = set(), list(label), 0  # convert string to list
-    for thresh in thresholds:
-        idxs, = np.where(idxs_check <= thresh)
-        if not np.any(idxs_check > thresh):  # no spaces or end-of-string over this
-            continue
-        if not idxs.size:  # including empty idxs_check
-            continue
-        if nmax and count >= nmax:
-            continue
-        if idxs[-1] not in seen:  # avoid infinite loop and jump to next threshold
-            seen.add(idx := idxs[-1])
-            thresholds -= thresh - idxs_check[idx]  # closer to threshold by this
-            chars[idxs_space[idx]] = '\n'
-            count += 1  # update newline count
-    return ''.join(chars[:-1])
-
-
-def _get_label(dataset, key, value, mode=None, name=None):
+def get_label(dataset, key, value, mode=None, name=None):
     """
     Return an arbitrary label type based on the dataset.
 
@@ -546,7 +549,7 @@ def _get_label(dataset, key, value, mode=None, name=None):
         The reduce coordinate.
     value : str or float
         The reduce selection.
-    mode : {'path', 'short', 'long'}, optional
+    mode : {'long', 'short', 'path'}, optional
         The label mode used to translate selections.
     name : str, optional
         The name used to determine experiment translations.
@@ -561,7 +564,7 @@ def _get_label(dataset, key, value, mode=None, name=None):
     # key because this is added to the data array short and long names during
     # application, which are subsequently used for axis labels, legend entries, and
     # colorbar labels. Note the method is also manually appended to the figure path.
-    mode = mode or 'path'
+    mode = mode or 'long'
     if mode not in ('path', 'short', 'long'):
         raise ValueError(f'Invalid label mode {mode!r}.')
     operator_to_label = {'+': 'plus', '-': 'minus', '*': 'times', '/': 'over'}
@@ -635,7 +638,7 @@ def _get_label(dataset, key, value, mode=None, name=None):
     return label
 
 
-def _infer_labels(
+def get_labels(
     dataset, *kws_process, identical=False,
     title_case=False, long_names=False, skip_names=False, **kwargs,
 ):
@@ -657,7 +660,7 @@ def _infer_labels(
     skip_names : bool, optional
         Whether to skip names and `spatial` in the label.
     **kwargs
-        Passed to `_fit_label`.
+        Passed to `_split_label`.
 
     Returns
     -------
@@ -715,7 +718,7 @@ def _infer_labels(
                         continue
                     if key in KEYS_METHOD or skip_names and key in ('name', 'spatial'):
                         continue
-                    kw_label[key] = _get_label(dataset, key, value, mode=mode, name=name)  # noqa: E501
+                    kw_label[key] = get_label(dataset, key, value, mode=mode, name=name)  # noqa: E501
                 nkws_label.append(kw_label)
             kw_label = {}  # merge labels for stuff inside subplot
             for key in sorted((key for kw in nkws_label for key in kw), key=sorter):
@@ -789,15 +792,15 @@ def _infer_labels(
             label = remove(label, 'boreal ')
         if control in label and 'surface warming' in label:  # convert 'ts'
             label = label.replace('warming', 'temperature')
-        label = _fit_label(label.strip(), **kwargs)
+        label = _split_label(label.strip(), **kwargs)
         if title_case:
-            label = _capitalize_label(label)
+            label = _format_label(label)
         labels.append(label)
 
     return labels[0] if identical else labels
 
 
-def get_spec(dataset, spec, **kwargs):
+def parse_spec(dataset, spec, **kwargs):
     """
     Parse the variable name specification.
 
@@ -857,21 +860,21 @@ def get_spec(dataset, spec, **kwargs):
     for key, value in kw.items():  # NOTE: sorting performed in _parse_labels
         if key in detect_process:
             kw_process[key] = value  # e.g. for averaging
-        elif any(key.startswith(prefix) for prefix in DETECT_FIG):
+        elif any(key.startswith(prefix) for prefix in KEYS_FIGURE):
             kw_figure[key] = value
-        elif any(key.startswith(prefix) for prefix in DETECT_GRIDSPEC):
+        elif any(key.startswith(prefix) for prefix in KEYS_GRIDSPEC):
             kw_gridspec[key] = value
-        elif any(key.startswith(prefix) for prefix in DETECT_AXES):
+        elif any(key.startswith(prefix) for prefix in KEYS_AXES):
             kw_axes[key] = value
-        elif any(key.startswith(prefix) for prefix in DETECT_OTHER):
+        elif any(key.startswith(prefix) for prefix in KEYS_OTHER):
             kw_other[key] = value
-        elif any(key.startswith(prefix) for prefix in DETECT_ATTRIBUTES):
+        elif any(key.startswith(prefix) for prefix in KEYS_ATTRIBUTES):
             kw_attrs[key] = value
-        elif any(key.startswith(prefix) for prefix in ('colorbar', *DETECT_COLORBAR)):
+        elif any(key.startswith(prefix) for prefix in ('colorbar', *KEYS_COLORBAR)):
             kw_colorbar[key] = value
-        elif any(key.startswith(prefix) for prefix in ('legend', *DETECT_LEGEND)):
+        elif any(key.startswith(prefix) for prefix in ('legend', *KEYS_LEGEND)):
             kw_legend[key] = value
-        elif any(key.startswith(prefix) for prefix in DETECT_GUIDE):
+        elif any(key.startswith(prefix) for prefix in KEYS_GUIDE):
             kw_colorbar[key] = kw_legend[key] = value  # shared keywords
         else:  # arbitrary plotting keywords
             kw_command[key] = value
@@ -961,7 +964,7 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
                     kspecs = tuple(kspecs)
                 # Iterate over correlation pairs
                 for spec in kspecs:
-                    kw_process, kw_collection = get_spec(dataset, spec, **kwargs)
+                    kw_process, kw_collection = parse_spec(dataset, spec, **kwargs)
                     if value := kw_collection.figure.get('refwidth', None):
                         refwidth = value  # for scaling grid labels
                     if not any(kw_process.get(key) for key in ('lon', 'lat', 'area')):
@@ -984,7 +987,7 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
         abcwidth = pplt.units(1 * pplt.rc.fontsize, 'pt', 'in')
         refwidth = pplt.units(refwidth or pplt.rc['subplots.refwidth'], 'in')
         refwidth -= abcwidth if len(rowspecs) < 2 or len(colspecs) < 2 else 0
-        grdlabels = _infer_labels(
+        grdlabels = get_labels(
             dataset,
             *ikws_process,
             identical=False,
@@ -1012,7 +1015,7 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
     kws_process, kws_collection = [], []
     for ikws_row, ikws_col in itertools.product(*kws_rowcol):
         # Initial stuff
-        ikws_row, ikws_col = _to_lists(ikws_row, ikws_col)
+        ikws_row, ikws_col = _expand_lists(ikws_row, ikws_col)
         ikws_process, ikws_collection = [], []
         for jkws_row, jkws_col in zip(ikws_row, ikws_col):  # subplot entries
             # Combine row and column keywords
@@ -1079,8 +1082,8 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
             ikws_process[0][:1],
             ikws_process[0][1:] or ikws_process[0][:1]
         ]
-        prefixes_axes = _infer_labels(dataset, *ikws_pair, skip_names=True, **kw)
-        prefixes_legend = _infer_labels(dataset, *ikws_process, **kw)
+        prefixes_axes = get_labels(dataset, *ikws_pair, skip_names=True, **kw)
+        prefixes_legend = get_labels(dataset, *ikws_process, **kw)
         for axis, prefix in zip('xy', prefixes_axes):
             if prefix:  # apply for last item in subplot
                 ikws_collection[-1].attrs.setdefault(f'{axis}label_prefix', prefix)
@@ -1094,7 +1097,7 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
     # TODO: Combine column count determination here with generate_plot()?
     ncols = len(colspecs) if len(colspecs) > 1 else len(rowspecs) if len(rowspecs) > 1 else 3  # noqa: E501
     figwidth = ncols * refwidth + 0.3 * refwidth * (ncols - 1)
-    figlabel = _infer_labels(
+    figlabel = get_labels(
         dataset,
         *kws_process,
         refwidth=figwidth,
@@ -1104,7 +1107,7 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
         fontsize=pplt.rc.fontlarge
     )
     pathspecs = [dspec for ikws_process in kws_process for dspec in ikws_process]
-    pathlabel = _create_path(dataset, *pathspecs)
+    pathlabel = get_path(dataset, *pathspecs)
     fontwidth = pplt.utils._fontsize_to_pt(pplt.rc.fontlarge)  # a-b-c label adjustment
     axeswidth = refwidth - 3 * pplt.units(fontwidth, 'pt', 'in')
     kw_fit = dict(fontsize=fontwidth, refwidth=axeswidth)
@@ -1113,7 +1116,7 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
     elif len(rowspecs) > 1 and len(colspecs) > 1:
         gridlabels = tuple(gridlabels)  # NOTE: tuple critical for generate_plot
     elif len(rowspecs) > 1:
-        gridlabels = [_fit_label(label, **kw_fit) for label in gridlabels[0]]
+        gridlabels = [_split_label(label, **kw_fit) for label in gridlabels[0]]
     else:
-        gridlabels = [_fit_label(label, **kw_fit) for label in gridlabels[1]]
+        gridlabels = [_split_label(label, **kw_fit) for label in gridlabels[1]]
     return kws_process, kws_collection, figlabel, pathlabel, gridlabels

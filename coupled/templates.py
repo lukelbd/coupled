@@ -35,10 +35,7 @@ KEYS_CONTOUR = (  # plurals not required
     'levels', 'linewidth', 'linestyle', 'edgecolor',
 )
 KEYS_SHADING = (
-    'cmap', 'cmap_kw', 'norm', 'norm_kw', 'vmin', 'vmax', 'step', 'locator', 'symmetric', 'diverging', 'sequantial',  # noqa: E501
-)
-KEYS_EITHER = (  # used in constraint_rows()
-    *KEYS_CONTOUR, *KEYS_SHADING
+    'cmap', 'cmap_kw', 'norm', 'norm_kw', 'vmin', 'vmax', 'robust', 'step', 'locator', 'symmetric', 'diverging', 'sequantial',  # noqa: E501
 )
 
 # Keywords for generating dictionary specs from kwargs
@@ -214,80 +211,27 @@ def _constraint_props(method=None):
     Parameters
     ----------
     method : bool
-        The method to use for shading.
+        The method to use for regression shading.
 
     Returns
     -------
-    label : str
-        The constraint label.
-    methods : tuple
-        The filled contour and hatching methods.
-    hatches, levels : list
-        The hatching instructions and associated level boundaries.
+    stipple, hatches, levels : list
+        The stipple method and associated hatching style and level boundaries.
     """
-    method = method or 'slope'
-    check, *options = method.split('_')
-    if check in ('proj', 'norm'):  # TODO: merge with constraint 'pairs'
-        label = 'Projection'
-        methods = (method, 'corr')
-        # label = 'Correlation'
-        # methods = ('corr', 'corr')
+    methods = method or 'slope'
+    methods = (methods,) if isinstance(methods, str) else tuple(methods or (None,))
+    corr = all(method and method.split('_')[0] in ('proj', 'rsq') for method in methods)
+    if corr:  # correlation instead of slope
+        stipple = 'corr'
         hatches = ['.....', '...', None, '...', '.....']
         levels = [-10, -0.8, -0.5, 0.5, 0.8, 10]
         # levels = [-10, -0.66, -0.33, 0.33, 0.66, 10]
-    elif check in ('corr', 'rsq', 'slope', 'var', 'std'):
-        label = 'Regression'
-        methods = (method, 'rsq')
-        # label = 'Correlation'
-        # methods = ('corr', 'rsq')
+    else:
+        stipple = 'rsq'
         hatches = [None, '...', '.....']
         levels = [0, 33.333, 66.666, 1000]
-    else:
-        raise RuntimeError
-    return label, methods, hatches, levels
-
-
-def _default_size(refsize=None, project=None, institute=None, **kwargs):
-    """
-    Generate appropriate scale for bar-type feedback subplots so that
-    annotations can be shown without overlapping.
-
-    Parameters
-    ----------
-    refsize : float
-        The reference size.
-    project : optional
-        The project string.
-    institute : optional
-        The institute string.
-
-    Returns
-    -------
-    refsize, altsize : float
-        The two sizes for axes.
-    """
-    # TODO: Add similar defaults for violin and multiple regression plots. Currently
-    # logic is hardcoded into notebooks. Size depends on number of variables.
-    refsize = refsize or 1.7  # narrow for bar plots
-    if project in (None, 'cmip'):  # 90 models 45 institutes
-        scale = 1.5 if institute else 3
-    elif project in ('cmip6',):  # 60 models 30 institutes
-        scale = 1 if institute else 2
-    elif project in ('cmip65',):  # 40 models ~15 institutes
-        scale = 0.6 if institute else 1.4
-    elif project in ('cmip5', 'cmip56'):  # 30 models ~15 institutes
-        scale = 0.6 if institute else 1.0
-    elif project in ('cmip66',):  # 20 models ~15 institutes
-        scale = 0.6 if institute else 0.8
-    elif project in ('cmip6-cmip5', 'cmip65-cmip56'):  # ~15 matching institutes
-        scale = 0.6
-    else:
-        raise RuntimeError(f'Unknown project {project}.')
-    # altsize = 1.3 * scale * refsize
-    altsize = 1.4 * scale * refsize
-    if kwargs.get('horizontal', False):
-        refsize, altsize = altsize, refsize
-    return refsize, altsize
+        # levels = [0, 50, 80, 1000]
+    return stipple, hatches, levels
 
 
 def _generate_dicts(*kws, expand=True, check=True):
@@ -303,25 +247,25 @@ def _generate_dicts(*kws, expand=True, check=True):
     check : bool, optional
         Whether to check lists have equivalent lengths.
     """
-    # NOTE: This allows e.g. list applied to one side of correlation pair for
-    # multiple items in a single subplot. See notebooks for details.
-    kwargs = {
-        f'{key}{i + 1}': value
-        for i, kw in enumerate(kws) for key, value in kw.items()
-    }
+    # NOTE: This allows e.g. list applied to one side of correlation pair
+    # for multiple items in a single subplot. See notebooks for details.
     lengths = {
-        key: len(value)  # allow e.g. pair of different names
-        for key, value in kwargs.items()
+        f'{key}{i + 1}': len(value)
+        for i, kw in enumerate(kws)
+        for key, value in kw.items()  # e.g. pair of names
         if 'color' not in key and 'cycle' not in key  # e.g. 'color1'
     }
     length = set(lengths.values()) - {1}
     if check and len(length) > 1:  # or e.g. allow e.g. ('name', 'cycle') truncation
-        values = {key: kwargs[key] for key in lengths}
-        raise ValueError(f'Unexpected mixed lengths {lengths} from {values}.')
+        lengths = ', '.join(f'{key}={length}' for key, length in lengths.items())
+        raise ValueError(f'Unexpected mixed lengths: {lengths}.')
     length = length.pop() if length else 1
     results = []
     for kw in kws:
-        result = {key: value * length if len(value) == 1 else value for key, value in kw.items()}  # noqa: E501
+        result = {
+            key: value * length if len(value) == 1 else value
+            for key, value in kw.items()
+        }
         if expand:
             result = [dict(zip(result, vals)) for vals in zip(*result.values())]
             result = result or [{}]
@@ -397,21 +341,21 @@ def divide_specs(key, specs, **kwargs):
         yield subs, kwargs
 
 
-def generate_specs(pairs=None, product=None, outer='breakdown', maxcols=None, **kwargs):
+def generate_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **kwargs):
     """
     Generate feedback and variable specifications based on input keywords.
 
     Parameters
     ----------
+    outer : str or list of str, optional
+        The kwargs for the outer plotting specs. Can include multiple keys per
+        multiplicand e.g. ``outer=(('breakdown', 'color'), ('project', 'experiment'))``.
     pairs : str or list of str, optional
         The coordinate name(s) to be used for feedback constraints. These can
         also be generated using combination of ``'name'`` and ``'breakdown'``.
     product : tuple of str or list of str, optional
         The list-like kwargs to combine with `itertools.product`. Can include multiple
         keys per multiplicand e.g. ``product=(('experiment', 'color'), 'project')``.
-    outer : str or list of str, optional
-        The kwargs for the outer plotting specs. Can include multiple keys per
-        multiplicand e.g. ``outer=(('breakdown', 'color'), ('project', 'experiment'))``.
     **kwargs : item or list of item, optional
         The reduce specifications. These can be scalar strings or tuples for generating
         comparisons across columns or within subplots. Can also append ``1`` or ``2``
@@ -433,8 +377,10 @@ def generate_specs(pairs=None, product=None, outer='breakdown', maxcols=None, **
     # shorthand 'breakdown' keys. Default is to generate feedback components with
     # e.g. generate_specs(breakdown='all') but generate transport components if
     # 'transport' is passed with e.g. generate_specs(breakdown='all', transport='t')
-    outer = (outer,) if isinstance(outer, str) else outer or ()
+    outer = [[outer]] if isinstance(outer, str) else outer or []
     outer = [[keys] if isinstance(keys, str) else list(keys) for keys in outer]
+    pairs = pairs or ()
+    pairs = (pairs,) if isinstance(pairs, str) else tuple(pairs)
     ncols = kwargs.get('ncols', None)
     maxcols = 1 if ncols else maxcols  # disable special arrangements
     kw_break = {key: kwargs.pop(key) for key in tuple(kwargs) if key in KEYS_BREAK}
@@ -446,80 +392,81 @@ def generate_specs(pairs=None, product=None, outer='breakdown', maxcols=None, **
     elif kw_break:  # non-empty breakdown
         breakdown, kw_default = feedback_specs(maxcols=maxcols, **kw_break)
         kw_default = {**kw_default, 'proj_kw': {'lon_0': 210}}
-    elif any(f'name{s}' in kwargs for s in ('', 1, 2)):  # explicit name
+    else:  # note scalar_grid() pops the name first so permit zero arguents
         breakdown = None
         kw_default = {'ncols': ncols or maxcols}
-    else:
-        raise ValueError('Neither variable name nor breakdown was specified.')
-    idxs = [i for i, keys in enumerate(outer) if 'breakdown' in keys or 'component' in keys]  # noqa: E501
-    kws_pair = [{}, {}]
+    idxs = [i for i, keys in enumerate(outer) if 'breakdown' in keys]
+    jdxs = [i for i, keys in enumerate(outer) if 'name' in keys]  # if breakdown not passed  # noqa: E501
+    kws_inner = [{}, {}]
     kws_outer = [{} for i in range(len(outer))]
     for key, value in kw_default.items():
         kwargs.setdefault(key, value)
     if not breakdown:
         pass
-    elif not idxs:
-        kws_pair[0]['name'] = kws_pair[1]['name'] = breakdown
-    else:
-        kws_outer[idxs[0]]['name'] = breakdown
+    elif not idxs and not jdxs:
+        kws_inner[0]['name'] = kws_inner[1]['name'] = breakdown
+    else:  # permit e.g. feedback breakdown rows and variable name columns
+        kws_outer[idxs[0] if idxs else jdxs[0]]['name'] = breakdown
 
-    # Assign separate plot spec dictionaries
-    # WARNING: Numpy arrays should be used for e.g. scalar level lists or color values
+    # Assign outer and inner dictionaries
+    # NOTE: Numpy arrays should be used for e.g. scalar level lists or color values
     # and tuples or lists should be used for vectors of settings across subplots.
     # NOTE: Here 'outer' is used to specify different reduce instructions across rows
     # or columns. For example: correlate with feedback parts in rows, generate_specs(
     # name='psl', breakdown='net'); or correlate with parts (plus others) in subplots,
     # generate_specs(name='psl', breakdown='net', outer=None, experiment=('picontrol', 'abrupt4xco2')).  # noqa: E501
-    pairs = pairs or ()
-    pairs = (pairs,) if isinstance(pairs, str) else tuple(pairs)
-    kw_plot = {
-        key: list(item) if isinstance(item := kwargs.pop(key), (list, tuple)) else (item,)  # noqa: E501
-        for key in tuple(kwargs) if key in KEYS_PLOT
-    }
     for keys, kw in zip(outer, kws_outer):
         for key in keys:
             if key in pairs:
                 raise ValueError(f'Keyword {key} cannot be in both outer and pairs.')
             if key == 'color':  # generally joined with e.g. 'breakdown'
-                kw['color'] = kwargs.pop(key, CYCLE_DEFAULT)  # ignore defaults
-            elif key in kw_plot:
-                kw[key] = kw_plot.pop(key)
+                value = kwargs.get(key, CYCLE_DEFAULT)  # ignore defaults
+            else:
+                value = kwargs.get(key, None)
+            if isinstance(value, (tuple, list)):
+                kwargs.pop(key, None)
+                kw[key] = value
     for key in pairs:  # specifications for pairs
-        if values := kw_plot.get(key):
-            if not np.iterable(values) or len(values) > 2:
-                raise ValueError(f'Coordinate pair {key}={values!r} is not a 2-tuple.')
-            del kw_plot[key]
-            values = values * 2 if len(values) == 1 else values
-            for kw, value in zip(kws_pair, values):
-                kw[key] = list(value) if isinstance(value, (tuple, list)) else [value]
-    sentinel = object()  # see below
-    spatial = ('lon', 'lat', 'plev', 'area')
-    kws_pair[0].update(kw_plot)  # remaining scalars or vectors
-    kws_pair[1].update(kw_plot)
-    for key in KEYS_PLOT:  # add scalar versions
-        value = kwargs.pop(f'{key}1', sentinel)  # ignore none iteration placeholders
-        is_vector = isinstance(value, (tuple, list))
-        if value is not sentinel and (key in spatial or value is not None):
-            if len(outer) > 0 and key in outer[0] and is_vector:
-                kws_outer[0].update({key: value})  # e.g. outer=('name', 'name')
-            else:
-                kws_pair[0].update({key: value if is_vector else (value,)})
-        value = kwargs.pop(f'{key}2', sentinel)
-        is_vector = isinstance(value, (tuple, list))
-        if value is not sentinel and (key in spatial or value is not None):
-            if len(outer) > 1 and key in outer[1] and is_vector:
-                kws_outer[1].update({key: value})
-            else:
-                kws_pair[1].update({key: value if is_vector else (value,)})
+        values = kwargs.pop(key, None)
+        if values is None:
+            continue
+        if not np.iterable(values) or len(values) > 2:
+            raise ValueError(f'Coordinate pair {key}={values!r} is not a 2-tuple.')
+        values = values * 2 if len(values) == 1 else values
+        for kw, value in zip(kws_inner, values):
+            kw[key] = list(value) if isinstance(value, (tuple, list)) else [value]
+    kw_inner = {
+        key: list(kwargs.pop(key)) for key in tuple(kwargs)
+        if key in KEYS_PLOT and isinstance(kwargs[key], (list, tuple))
+    }
+    kws_inner[0].update(kw_inner)  # remaining scalars or vectors
+    kws_inner[1].update(kw_inner)
 
     # Convert reduce vector iterables to dictionaries
     # NOTE: This also builds optional Cartesian products between lists of keywords
     # specified by 'product' keyword. Others are enforced to have same length.
-    # NOTE: Above, scalar 'kwargs' are kept in place for simplicity, but still need
-    # to repeat scalar (name, breakdown) or manual scalar correlation pair items.
+    # NOTE: This can fail if user passes feedbacks along rows and requests
+    # e.g. 'name1' so should only assign to outer if vector is passed.
+    sentinel = object()  # see below
+    spatial = ('lon', 'lat', 'plev', 'area')  # include user input none
     product = product or ()
     product = [[keys] if isinstance(keys, str) else list(keys) for keys in product]
-    for dict_ in (*kws_outer, *kws_pair):
+    for key in KEYS_PLOT:  # add scalar versions
+        value = kwargs.pop(f'{key}1', sentinel)  # ignore none iteration placeholders
+        if value is not sentinel and (key in spatial or value is not None):
+            value = list(value) if isinstance(value, (tuple, list)) else [value]
+            if len(outer) > 0 and key in outer[0] and len(value) > 1:
+                kws_outer[0].update({key: value})
+            else:
+                kws_inner[0].update({key: value})
+        value = kwargs.pop(f'{key}2', sentinel)  # ignore none iteration placeholders
+        if value is not sentinel and (key in spatial or value is not None):
+            value = list(value) if isinstance(value, (tuple, list)) else [value]
+            if len(outer) > 1 and key in outer[1] and len(value) > 1:
+                kws_outer[1].update({key: value})
+            else:
+                kws_inner[1].update({key: value})
+    for dict_ in (*kws_outer, *kws_inner):
         kws = []
         for keys in product:  # then skip if absent
             if any(key in dict_ for key in keys):
@@ -530,8 +477,8 @@ def generate_specs(pairs=None, product=None, outer='breakdown', maxcols=None, **
         values = [[v for val in vals for v in val] for vals in values]
         dict_.update({key: vals for key, vals in zip(keys, zip(*values))})
     kws_outer = tuple(map(_generate_dicts, kws_outer))
-    kws_pair = _generate_dicts(*kws_pair)
-    return *kws_outer, *kws_pair, kwargs
+    kws_inner = _generate_dicts(*kws_inner)  # expand and enforce identical lengths
+    return *kws_outer, *kws_inner, kwargs
 
 
 def feedback_specs(
@@ -580,10 +527,10 @@ def feedback_specs(
     init_names = lambda ncols: ((names := np.array([[None] * ncols] * 25)), names.flat)
     if not component and not feedbacks and not forcing and not sensitivity:
         raise ValueError('Invalid keyword argument combination.')
-    if breakdown is None:
-        components = component or 'net'
+    if breakdown is None or component is not None:
+        components = component or 'net'  # 'component' input overrides 'breakdown'
     elif SPECS_FEEDBACK:
-        components = SPECS_FEEDBACK[breakdown]
+        components = SPECS_FEEDBACK[breakdown]  # pre-configured breakdown
     else:
         raise ValueError(f'Invalid breakdown {breakdown!r}. Options are: {options}')
     components = (components,) if isinstance(components, str) else tuple(components)
@@ -878,33 +825,20 @@ def scalar_grid(data, forward=True, **kwargs):
     # breakdown='cld' or component=('swcld', 'lwcld') because the latter vector
     # is placed in outer specs while the former is placed in subspecs. However here
     # often need to vectorize breakdown inside subspecs (e.g. bar plots with many
-    # feedback components) so approach is e.g. name='ts' and forward=True or False.
-    names = ('name', 'breakdown', 'component')
-    compare = sum(bool(kwargs.get(key)) for key in names) > 1  # noqa: E501
-    spread = kwargs.get('method', None) in ('std', 'var', 'cov', 'slope')
-    globe = kwargs.get('area', None) is not None
+    # feedback components) which can cause issues matching lengths of regression pair
+    # objects so approach is to instead use e.g. name='ts' and forward=True or False.
+    name = kwargs.pop('name', None)  # WARNING: critial to show here first
+    results = []
     if 'rowspecs' in kwargs and 'colspecs' in kwargs:
         rowspecs = kwargs.pop('rowspecs', None) or [{}]
         colspecs = kwargs.pop('colspecs', None) or [{}]
-        figspecs = [rowspecs, colspecs]
-        subspecs1 = subspecs2 = {}
+        figspecs, subspecs1, subspecs2 = [rowspecs, colspecs], {}, {}
     else:
         *figspecs, subspecs1, subspecs2, kwargs = generate_specs(**kwargs)
         rowspecs = figspecs[0] if len(figspecs) > 0 else [{}]
         colspecs = figspecs[1] if len(figspecs) > 1 else [{}]
-    name = kwargs.pop('name', None)
-    results = []
     for rowspecs, kwargs in divide_specs('row', rowspecs, **kwargs):
         defaults = {}
-        if globe and not compare and not spread and subspecs1 == subspecs2:
-            kws = (*subspecs1, *subspecs2, kwargs)
-            projects = set(kw['project'] for kw in kws if 'project' in kw)
-            institutes = set(kw['institute'] for kw in kws if 'institute' in kw)
-            project = projects.pop() if len(projects) == 1 else None
-            institute = institutes.pop() if len(institutes) == 1 else None
-            kw_size = {**kwargs, 'project': project, 'institute': institute}
-            refsize, altsize = _default_size(**kw_size)
-            defaults.update(refheight=refsize, refwidth=altsize, annotate=True)
         rspecs = []
         kwargs = {**defaults, **kwargs}
         for rspec in rowspecs:
@@ -917,11 +851,12 @@ def scalar_grid(data, forward=True, **kwargs):
                     ispec, jspec = (spec1, spec2) if forward else (spec2, spec1)
                     if name is not None:  # e.g. 'ts' or 'tpat'
                         ispec['name'] = name
-                        jspec.setdefault('name', name)  # e.g. no 'breakdown'
+                        jspec.setdefault('name', None)  # e.g. no 'breakdown'
                     spec = ({**rspec, **spec1}, {**rspec, **spec2})
                 ispecs.append(spec)
             rspecs.append(ispecs or [rspec])
         for cspecs, kwargs in divide_specs('col', colspecs, **kwargs):
+            # ic(rspecs, cspecs)
             result = plotting.generate_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results
@@ -936,18 +871,21 @@ def pattern_rows(data, method=None, shading=True, contours=True, **kwargs):
     ----------
     data : xarray.Dataset
         The source dataset.
-    method : bool, optional
-        The single-variable method to use.
-    shading : bool, optional
-        Whether to include shading.
-    contours : bool, optional
-        Whether to include reference contours.
+    method : str or 2-tuple, optional
+        The single-variable method(s) to use.
+    shading : dict, optional
+        Additional shading-only keyword arguments.
+    contours : bool or dict, optional
+        Whether to include contours or contours-only keyword arguments.
     rowsplit, colsplit : optional
         Passed to `divide_specs`.
     **kwargs
         Passed to `generate_specs`.
     """
-    # NOTE: For simplicity pass scalar 'outer' and other vectors are used in columns.
+    # NOTE: Pass e.g. method=('avg', 'var') for custom shading and contour assignment
+    # NOTE: For simplicity pass scalar 'outer' and other vectors are used in columns
+    if 'breakdown' not in kwargs and 'component' not in kwargs and 'outer' not in kwargs:  # noqa: E501
+        raise ValueError('Feedback breakdown not specified.')
     if not isinstance(method := method or 'avg', str):
         method1, method2 = method
     elif method in ('avg', 'med'):
@@ -956,30 +894,29 @@ def pattern_rows(data, method=None, shading=True, contours=True, **kwargs):
         method1, method2 = method, 'avg'
     else:
         raise ValueError(f'Invalid pattern_rows() method {method!r}.')
-    if 'breakdown' not in kwargs and 'component' not in kwargs and 'outer' not in kwargs:  # noqa: E501
-        raise RuntimeError
-    rowspecs, colspecs, *_, kwargs = generate_specs(maxcols=1, **kwargs)
-    kw_shading = {'method': method1} if shading is True else dict(shading or {})
+    kwargs.update(maxcols=1)  # use custom method assignment
+    rowspecs, colspecs, *_, kwargs = generate_specs(**kwargs)
+    kw_shading = dict(shading) if isinstance(shading, dict) else {}
     kw_shading.update({key: kwargs.pop(key) for key in KEYS_SHADING if key in kwargs})
-    kw_contour = {'method': method2} if contours is True else dict(contours or {})
+    kw_contour = dict(contours) if isinstance(contours, dict) else {}
     kw_contour.update({key: kwargs.pop(key) for key in KEYS_CONTOUR if key in kwargs})
     results = []
     for rowspecs, kwargs in divide_specs('row', rowspecs, **kwargs):
         rspecs = []
-        for rspec in rowspecs:
+        for rspec in rowspecs:  # kwargs take precedence
             kw = {key: val for key, val in rspec.items() if key not in KEYS_CONTOUR}
-            spec = [{**kw, **kw_shading}]
+            spec = [{**kw, 'method': method1, **kw_shading}]
             if contours:
                 kw = {key: val for key, val in rspec.items() if key not in KEYS_SHADING}
-                spec.append({**kw, **kw_contour})
+                spec.append({**kw, 'method': method2, **kw_contour})
             rspecs.append(spec)
         cspecs = []  # NOTE: irrelevant keywords for non-cmap figures are ignored
         for cspec in colspecs:
             kw = {key: val for key, val in cspec.items() if key not in KEYS_CONTOUR}
-            spec = [{**kw, **kw_shading}]  # noqa: E501
+            spec = [kw]
             if contours:
                 kw = {key: val for key, val in cspec.items() if key not in KEYS_SHADING}
-                spec.append({**kw, **kw_contour})
+                spec.append(kw)
             cspecs.append(spec)
         for cspecs, kwargs in divide_specs('col', cspecs, **kwargs):
             # ic(rspecs, cspecs)
@@ -997,94 +934,87 @@ def constraint_rows(data, method=None, contours=True, hatching=True, **kwargs):
     ----------
     data : xarray.DataArray
         The data.
-    method : str, optional
-        The two-variable method to use.
+    method : str or sequence, optional
+        The double-variable method(s) to use.
     contours : bool, optional
-        Whether to include reference averages.
+        Whether to include contours or contour-only keyword arguments.
     hatching : bool optional
-        Whether to include correlation hatching.
+        Whether to include hatching or hatching-only keyword arguments.
     rowsplit, colsplit : optional
         Passed to `divide_specs`.
+    base : str, optional
+        Similar to `experiment1` but applies over 'outer' arrays.
     **kwargs
         Passed to `generate_specs`.
-
-    Other Parameters
-    ----------------
-    base : str, optional
-        Kludge. As with `experiment1` but applies over 'outer' arrays.
-    pattern : str, optional
-        Kludge. The method to use for temperature pattern variables.
     """
-    # TODO: Remove 'base' keyword kludge and support two pairs of outer arrays
+    # NOTE: This permits passing vector 'method' with 'outer' unlike other templates
+    # NOTE: This forbids e.g. tuple of levels to specify separate shading and contours
+    # TODO: Remove 'base' keyword kludge now that vector 'experiment1' supported
     if 'breakdown' not in kwargs and 'component' not in kwargs and 'outer' not in kwargs:  # noqa: E501
-        raise RuntimeError
-    rowspecs, *colspecs, subspecs1, subspecs2, kwargs = generate_specs(maxcols=1, **kwargs)  # noqa: E501
+        raise ValueError('Feedback breakdown not specified.')
+    method = method or 'slope'
+    kwargs.update(maxcols=1, method=method)
+    stipple, hatches, levels = _constraint_props(method=method)
+    rowspecs, *colspecs, subspecs1, subspecs2, kwargs = generate_specs(**kwargs)
     if len(subspecs1) != 1 or len(subspecs2) != 1:
         raise ValueError(f'Too many constraints {subspecs1} and {subspecs2}. Check outer argument.')  # noqa: E501
     (subspec1,), (subspec2,) = subspecs1, subspecs2
-    pattern = kwargs.pop('pattern', None)  # TODO: remove kludge
-    kw_shading = {key: kwargs.pop(key) for key in KEYS_SHADING if key in kwargs}
-    kw_contour = {key: kwargs.pop(key) for key in KEYS_CONTOUR if key in kwargs}
-    _, methods, hatches, levels = _constraint_props(method=method)
-    if usefirst := subspec2.get('area'):
+    if subspec2.get('area'):
         subspec = subspec1
-    elif usefirst := subspec1.get('name') in KEYS_PLEV and not subspec1.get('plev'):
+    elif subspec1.get('name') in KEYS_PLEV and not subspec1.get('plev'):
         subspec = subspec1  # TODO: more complex rules?
     else:
         subspec = subspec2
-    # ic(kwargs, subspec, subspec1, subspec2)
     if colspecs:  # i.e. single row-column plot
         colspecs, = colspecs
     else:
         colspecs = [{}]
+    default = kwargs.pop('base', None)
+    keys_both = (*KEYS_SHADING, *KEYS_CONTOUR)
+    kw_shading = {key: kwargs.pop(key) for key in KEYS_SHADING if key in kwargs}
+    kw_contour = dict(contours) if isinstance(contours, dict) else {}
+    kw_contour = {key: kwargs.pop(key) for key in KEYS_CONTOUR if key in kwargs}
+    kw_hatching = dict(hatching) if isinstance(hatching, dict) else {}
     results = []
-    warming = ('tpat', 'tstd', 'tdev', 'tabs', 'ecs')
     for rowspecs, kwargs in divide_specs('row', rowspecs, **kwargs):
         rspecs = []
         for rspec in rowspecs:  # WARNING: critical to put overrides in row specs
-            kw1, kw2 = {**rspec, **subspec1}, {**rspec, **subspec2}
-            base, _ = kw1.pop('base', None), kw2.pop('base', 0)  # TODO: remove kludge
-            if base is not None:  # apply possibly vector base experiment
-                kw1['experiment'] = base
-            ikw1 = {key: val for key, val in kw1.items() if key not in KEYS_CONTOUR}
-            ikw2 = {key: val for key, val in kw2.items() if key not in KEYS_CONTOUR}
-            if base is not None:  # always use slope
-                ikw1['method'] = ikw2['method'] = 'slope'
-            if pattern and any(kw.get('name') in warming for kw in (kw1, kw2)):
-                ikw1['method'] = ikw2['method'] = pattern
-            spec = [(ikw1, ikw2)]  # takes precedence over columns
+            ispec = {key: val for key, val in rspec.items() if key not in KEYS_CONTOUR}
+            ispec.update(kw_shading)
+            base = default or ispec.pop('base', None)
+            kw1, kw2 = {**ispec, **subspec1}, {**ispec, **subspec2}
+            kw1.update({'experiment': base} if base else {})
+            spec = [(kw1, kw2)]  # rows take precedence over columns
             if contours:
-                ikw = kw1 if usefirst else kw2
-                ikw = {key: val for key, val in ikw.items() if key not in KEYS_SHADING}
-                if name := ikw.get('name', None):  # TODO: remove kludge
-                    ikw['name'] = 'tstd' if name == 'tdev' else name
-                spec.append(ikw)  # possibly feedbacks
+                ispec = {key: val for key, val in rspec.items() if key not in KEYS_SHADING}  # noqa: E501
+                ispec.update(kw_contour)
+                name = ispec.get('name') or subspec.get('name')
+                kw = {**ispec, **subspec, 'method': 'avg'}
+                kw.update({'name': 'tstd' if name == 'tdev' else name} if name else {})
+                spec.append(kw)
             if hatching:
-                ikw1 = {key: val for key, val in kw1.items() if key not in KEYS_EITHER}
-                ikw2 = {key: val for key, val in kw2.items() if key not in KEYS_EITHER}
-                spec.append((ikw1, ikw2))
+                ispec = {key: val for key, val in rspec.items() if key not in keys_both}
+                ispec.update({**kw_hatching, 'levels': levels, 'hatches': hatches})
+                kw1 = {**ispec, **subspec1, 'method': stipple}
+                kw2 = {**ispec, **subspec2, 'method': stipple}
+                spec.append((kw1, kw2))
             rspecs.append(spec)
         cspecs = []
         for cspec in colspecs:
-            kw = {'method': methods[0], 'symmetric': True, 'cmap': 'Balance', **kw_shading}  # noqa: E501
-            ikw1, ikw2 = {**cspec, **subspec1}, {**cspec, **subspec2}
-            ikw1 = {key: val for key, val in ikw1.items() if key not in KEYS_CONTOUR}
-            ikw2 = {key: val for key, val in ikw2.items() if key not in KEYS_CONTOUR}
-            spec = [({**kw, **ikw1}, {**kw, **ikw2})]
-            if contours:
-                kw = {'method': 'avg', 'symmetric': False, **kw_contour}
-                ikw = {**cspec, **subspec}
-                ikw = {key: val for key, val in ikw.items() if key not in KEYS_SHADING}
-                spec.append({**kw, **ikw})
-            if hatching:
-                kw = {'method': methods[1], 'levels': levels, 'hatches': hatches}
-                ikw1, ikw2 = {**cspec, **subspec1}, {**cspec, **subspec2}
-                ikw1 = {key: val for key, val in ikw1.items() if key not in KEYS_EITHER}
-                ikw2 = {key: val for key, val in ikw2.items() if key not in KEYS_EITHER}
-                spec.append(({**kw, **ikw1}, {**kw, **ikw2}))
+            ispec = {key: val for key, val in cspec.items() if key not in KEYS_CONTOUR}
+            base = default or ispec.pop('base', None)
+            kw1, kw2 = {**ispec, **subspec1}, {**ispec, **subspec2}
+            kw1.update({'experiment': base} if base else {})
+            spec = [(kw1, kw2)]
+            if contours:  # contour
+                ispec = {key: val for key, val in cspec.items() if key not in KEYS_SHADING}  # noqa: E501
+                spec.append({**ispec, **subspec})
+            if hatching:  # stipple
+                ispec = {key: val for key, val in cspec.items() if key not in keys_both}
+                spec.append(({**ispec, **subspec1}, {**ispec, **subspec2}))
             cspecs.append(spec)
-        # ic(cspecs, rspecs, kwargs)
         for cspecs, kwargs in divide_specs('col', cspecs, **kwargs):
+            # ic(rspecs, cspecs)
             result = plotting.generate_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results
@@ -1106,21 +1036,23 @@ def relationship_rows(data, method=None, **kwargs):
     **kwargs
         Passed to `generate_specs`.
     """
+    # NOTE: This is used for general circulation constraints on feedbacks
     # TODO: Update this. It is out of date with constraint_rows.
     if 'breakdown' not in kwargs and 'component' not in kwargs and 'outer' not in kwargs:  # noqa: E501
-        raise RuntimeError
-    rowspecs, colspecs1, colspecs2, kwargs = generate_specs(maxcols=1, **kwargs)
+        raise ValueError('Feedback breakdown not specified.')
+    kwargs.update(maxcols=1, method=method)
+    rowspecs, colspecs1, colspecs2, kwargs = generate_specs(**kwargs)
     if len(colspecs1) != 1 or len(colspecs2) != 1:
         raise ValueError(f'Too many constraints {colspecs1} and {colspecs2}. Check outer argument.')  # noqa: E501
-    label, methods, hatches, levels = _constraint_props(method=method)
-    kwargs['collabels'] = [None, None, label]
+    stipple, hatches, levels = _constraint_props(method=method)
+    kwargs.update(collabels=[None, None, 'Inter-model\nrelationship'])
     rplots = (
         {'method': 'avg', 'symmetric': True, 'cmap': 'ColdHot'},
         {'method': 'std', 'symmetric': False, 'cmap': 'ColdHot'},
     )
     cplots = (
-        {'method': methods[0], 'symmetric': True, 'cmap': 'Balance'},
-        {'method': methods[1], 'levels': levels, 'hatches': hatches, 'colors': 'none'},
+        {'method': method, 'symmetric': True, 'cmap': 'Balance'},
+        {'method': stipple, 'levels': levels, 'hatches': hatches, 'colors': 'none'},
     )
     results = []
     for rowspecs, kwargs in divide_specs('row', rowspecs, **kwargs):

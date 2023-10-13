@@ -9,17 +9,16 @@ import warnings
 
 import climopy as climo  # noqa: F401
 import numpy as np
-import pandas as pd
 import xarray as xr
-from climopy.var import linefit
+from climopy.var import _get_bounds, linefit
 from climopy import ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
-from .internals import KEYS_METHOD
-from .internals import _group_parts, _ungroup_parts, _to_lists
+from .internals import KEYS_REDUCE
+from .internals import _expand_lists, _group_parts, _ungroup_parts
 from .results import ALIAS_FEEDBACKS, FEEDBACK_ALIASES, REGEX_FLUX
-from .reduce import _method_double, apply_method, apply_reduce
+from .reduce import _reduce_double, reduce_facets, reduce_general
 from cmip_data.feedbacks import FEEDBACK_DEPENDENCIES
 
 
@@ -233,7 +232,7 @@ def _find_data(
     # derivation or else takes too long. After climopy refactoring this will be taken
     # into account automatically and derivations will require explicitly specifying
     # the dependencies upon registration (no more retrieveing inside the function).
-    # NOTE: Here apply_reduce will automatically perform default selections for certain
+    # NOTE: Here reduce_general will automatically perform selections for certain
     # dimensions (only carry out when requesting data). Also gets net flux (longwave
     # plus shortwave), atmospheric flux (top-of-atmosphere plus surface), cloud effect
     # (all-sky minus clear-sky), radiative response (full minus effective forcing),
@@ -257,7 +256,7 @@ def _find_data(
     else:  # note in future will
         raise RuntimeError(f'Climopy derivation {name} has unknown dependencies.')
     if not attr:  # carry out reductions
-        data = apply_reduce(data, **kwargs)
+        data = reduce_general(data, **kwargs)
         if 'plev' in data.coords:  # TODO: make derivations compatible with plev
             data = data.rename(plev='lev')
         if hemi and 'lat' in data.sizes:
@@ -425,7 +424,7 @@ def _operate_data(
     relative : bool, optional
         Whether to subtract or divide the global average.
     **kwargs
-        Passed to `apply_reduce`.
+        Passed to `reduce_general`.
 
     Returns
     -------
@@ -481,7 +480,7 @@ def get_data(dataset, name, attr=None, **kwargs):
     attr : str, optional
         The requested variable attribute.
     **kwargs
-        Passed to `apply_reduce`.
+        Passed to `reduce_general`.
 
     Returns
     -------
@@ -489,7 +488,7 @@ def get_data(dataset, name, attr=None, **kwargs):
         The result. If `attr` is not ``None`` this is the corresponding attribute.
     """
     # TODO: This is similar to climopy recursive derivation invocation. Except delays
-    # summations until selections are performed in apply_reduce()... better than
+    # summations until selections are performed in reduce_general()... better than
     # re-calculating full result every time (intensive) or caching full result after
     # calculation (excessive storage). Should add to climopy by 1) translating
     # instructions, 2) selecting relevant variables, 3) performing scalar selections
@@ -500,18 +499,15 @@ def get_data(dataset, name, attr=None, **kwargs):
     spatial = kwargs.get('spatial', None)
     start = kwargs.get('start', 0)
     stop = kwargs.get('stop', 150)
-    if spatial:  # only now apply spatial correlation
+    if spatial:  # only apply custom spatial correlation
+        kw0, kw1 = {}, {}
         if 'version' in data.coords:
             kw0, kw1 = {'start': 0, 'stop': 150}, {'start': start, 'stop': stop}
-        else:
-            kw0, kw1 = {}, {}
         data0 = data.sel(experiment='picontrol', **kw0)
         data1 = data.sel(experiment='abrupt4xco2', **kw1)
-        data, attrs = _method_double(
-            data0, data1, dim='area', method=spatial
-        )
-        name = attrs.pop('name')  # only used in apply_method()
+        data, attrs = _reduce_double(data0, data1, dim='area', method=spatial)
         data.attrs.update({**data.attrs, **attrs})
+        del data.attrs['name']  # only used in reduce_facets()
     if attr == 'units':
         result = data.climo.units
     elif attr:
@@ -552,19 +548,13 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
     # permit arbitrary combinations of names and indexers (see _parse_specs).
     # TODO: Possibly keep original 'signs' instead of _group_parts signs? See
     # below where arguments are combined and have to pick a sign.
-    kws_group, kws_count, kws_input, kws_method = [], [], [], []
+    kws_group, kws_count, kws_input, kws_reduce = [], [], [], []
     if len(kws_process) not in (1, 2):
         raise ValueError(f'Expected two process dictionaries. Got {len(kws_process)}.')
     for i, kw_process in enumerate(kws_process):  # iterate method reduce arguments
         kw_process, kw_coords, kw_count = kw_process.copy(), {}, {}
-        kw_method = {
-            key: kw_process.pop(key) for key in KEYS_METHOD
-            if key in kw_process
-        }
-        kw_input = {  # TODO: should never have data array here?
-            key: value for key, value in kw_process.items()
-            if key != 'name' and value is not None
-        }
+        kw_reduce = {key: kw_process.pop(key) for key in KEYS_REDUCE if key in kw_process}  # noqa: E501
+        kw_input = {key: val for key, val in kw_process.items() if key != 'name' and val is not None}  # noqa: E501
         kw_process = _group_parts(kw_process, keep_operators=True)
         for key, value in kw_process.items():
             sels = ['+']
@@ -587,7 +577,7 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
         kws_group.append(kw_coords)
         kws_count.append(kw_count)
         kws_input.append(kw_input)
-        kws_method.append(kw_method)
+        kws_reduce.append(kw_reduce)
 
     # Group split reduce instructions into separate dictionaries
     # TODO: Add more grouping options (similar to _build_specs). For now just
@@ -595,25 +585,25 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
     # WARNING: Here 'product' can be used for e.g. cmip6-cmip5 abrupt4xco2-picontrol
     # but there are some terms that we always want to group together e.g. 'experiment'
     # and 'startstop'. So include some overrides below.
-    kws_reduce = []
+    kws_data = []
     for key in sorted(set(key for kw in kws_count for key in kw)):
         count = [kw.get(key, 0) for kw in kws_count]
         if count[0] == count[-1]:  # otherwise match correlation pair operators
             continue
         if count[1] % count[0] == 0:
-            i, j = 0, 1
+            idx1, idx2 = 0, 1
         elif count[0] % count[1] == 0:
-            i, j = 1, 0
+            idx1, idx2 = 1, 0
         else:
             raise ValueError(f'Incompatible counts {count[0]} and {count[1]}.')
-        values = kws_group[i].get(key, (('+', None),))
-        values = values * (count[j] // count[i])  # i.e. *average* with itself
-        kws_group[i][key] = values
-    for kw_coords, kw_method in zip(kws_group, kws_method):
+        values = kws_group[idx1].get(key, (('+', None),))
+        values = values * (count[idx2] // count[idx1])  # i.e. *average* with itself
+        kws_group[idx1][key] = values
+    for kw_coords, kw_reduce in zip(kws_group, kws_reduce):
         startstop = 'startstop' in kw_coords and 'experiment' in kw_coords
         groups = [('startstop', 'experiment')] if startstop else []
         for group in groups:
-            values = _to_lists(*(kw_coords[key] for key in group))
+            values = _expand_lists(*(kw_coords[key] for key in group))
             kw_coords.update(dict(zip(group, values)))
         groups.extend(
             (key,) for key in kw_coords if not any(key in group for group in groups)
@@ -621,7 +611,7 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
         kw_product = {
             group: tuple(zip(*(kw_coords[key] for key in group))) for group in groups
         }
-        ikws_reduce = []
+        ikws_data = []
         for values in itertools.product(*kw_product.values()):  # non-grouped coords
             items = {
                 key: val for group, vals in zip(groups, values)
@@ -629,10 +619,10 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
             }
             signs, values = zip(*items.values())
             sign = -1 if signs.count('-') % 2 else +1
-            kw_reduce = dict(zip(items.keys(), values))
-            kw_reduce.update(kw_method)
-            ikws_reduce.append((sign, kw_reduce))
-        kws_reduce.append(ikws_reduce)
+            kw_data = dict(zip(items.keys(), values))
+            kw_data.update(kw_reduce)
+            ikws_data.append((sign, kw_data))
+        kws_data.append(ikws_data)
 
     # Reduce along facets dimension and carry out operation
     # TODO: Support operations before reductions instead of after. Should have
@@ -644,89 +634,87 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
     kwargs = {}
     datas_persum = []  # each item part of a summation
     methods_persum = set()
-    kws_reduce = _to_lists(*kws_reduce, equal=False)
-    if any(len(kws) != len(kws_reduce[0]) for kws in kws_reduce):
-        raise ValueError('Operator count mismatch in numerator and denominator.')
-    for ikws_reduce in zip(*kws_reduce):  # iterate operators
-        isigns, ikws_reduce = zip(*ikws_reduce)
-        datas, exps, kw_method = [], [], {}
-        for kw_reduce in ikws_reduce:  # iterate method reduce arguments
-            kw_reduce = kw_reduce.copy()
-            name = kw_reduce.pop('name')  # NOTE: always present
-            area = kw_reduce.get('area')
-            experiment = kw_reduce.get('experiment')
+    kws_data = _expand_lists(*kws_data)
+    for ikws_data in zip(*kws_data):  # iterate operators
+        signs, ikws_data = zip(*ikws_data)
+        datas, exps, kw_reduce = [], [], {}
+        for kw_data in ikws_data:  # iterate reduce arguments
+            kw_data = kw_data.copy()
+            name = kw_data.pop('name')  # NOTE: always present
+            area = kw_data.get('area')
+            experiment = kw_data.get('experiment')
             if name == 'tabs' and experiment == 'picontrol':
                 name = 'tstd'  # use rfnt_ecs for e.g. abrupt minus pre-industrial
-            if name in warming and area == 'avg' and len(ikws_reduce) == 2:
+            if name in warming and area == 'avg' and len(ikws_data) == 2:
                 if name in warming[:2] or experiment == 'picontrol':
                     name = 'tstd'  # default to global average temp standard deviation
-            for key in tuple(kw_reduce):
-                if key in KEYS_METHOD:
-                    kw_method.setdefault(key, kw_reduce.pop(key))
-            data = get_data(dataset, name, **kw_reduce)
+            for key in tuple(kw_data):
+                if key in KEYS_REDUCE:
+                    kw_reduce.setdefault(key, kw_data.pop(key))
+            data = get_data(dataset, name, **kw_data)
             datas.append(data)
             exps.append(experiment)
-        datas, method, default = apply_method(*datas, **kw_method)
+        datas, method, default = reduce_facets(*datas, **kw_reduce)
         for key, value in default.items():
             kwargs.setdefault(key, value)
         if len(datas) == 1:  # e.g. regression applied
             idxs = tuple(i for i, exp in enumerate(exps) if i != 'picontrol')
-            isigns = (isigns[idxs[-1] if idxs else -1],)  # WARNING: see _group_parts
-        datas_persum.append((isigns, datas))  # plotting command arguments
+            signs = (signs[idxs[-1] if idxs else -1],)  # WARNING: see _group_parts
+        datas_persum.append((signs, datas))  # plotting command arguments
         methods_persum.add(method)
         if len(methods_persum) > 1:
             raise RuntimeError(f'Mixed reduction methods {methods_persum}.')
 
     # Combine arrays specified with reduction '+' and '-' keywords
-    # NOTE: The additions below are scaled as *averages* so e.g. project='cmip5+cmip6'
-    # gives the average across cmip5 and cmip6 inter-model averages.
-    # NOTE: Here the percentile ranges are only supported for 1-dimensional line plots
-    # for which we only use one plot argument. So kwargs below are not be overwritten.
     # WARNING: Can end up with all-zero arrays if e.g. doing single scatter or multiple
     # bar regression operations and only the dependent or independent variable relies
     # on an operations between slices (e.g. area 'nino-nina' combined with experiment
     # 'abrupt4xco2-picontrol' creates 4 datas that sum to zero). Use the kludge below.
+    # NOTE: The additions below are scaled as *averages* so e.g. project='cmip5+cmip6'
+    # gives the average across cmip5 and cmip6 inter-model averages. Also previously
+    # we supported percentile ranges and standard deviations of differences between
+    # individual institutes from different projects by passing 2D data to line() with
+    # e.g. 'shadepctiles' but now for consistency with line() plots of regression
+    # coefficients we use sum of variances (see _reduce_single and _reduce_double
+    # for details). Institute differences are now only supported for scalar plots.
     print('.', end=' ')
     args = []
     method = methods_persum.pop()
     signs_persum, datas_persum = zip(*datas_persum)
     for signs, datas in zip(zip(*signs_persum), zip(*datas_persum)):  # plot arguments
-        idatas = []
-        for i, data in enumerate(datas):
-            index = data.indexes.get('facets', None)
-            project = data.coords.get('project', None)
-            if (
-                index is not None and project is not None
-                and project.size > 1 and np.all(project == project[0])
-            ):
-                arrays = list(zip(*index.values))  # support institute operations
-                arrays[index.names.index('project')] = ['CMIP'] * index.size
-                index = pd.MultiIndex.from_arrays(arrays, names=index.names)
-                data = data.assign_coords(facets=index)
-            idatas.append(data)
-        isigns, idatas = signs, xr.align(*idatas)
-        sum_scale = sum(sign == 1 for sign in isigns)
-        if idatas[0].sizes.get('facets', None) == 0:
-            raise RuntimeError(
-                'Empty facets dimension. This is most likely due to an '
-                'operation across projects without an institute average.'
-            )
+        datas = xr.align(*datas)
+        parts = tuple(data.isel(sigma=0) if 'sigma' in data.dims else data for data in datas)  # noqa: E501
+        sum_scale = sum(sign == 1 for sign in signs)
+        if parts[0].sizes.get('facets', None) == 0:
+            raise RuntimeError('Empty facets dimension.')
         with xr.set_options(keep_attrs=True):  # keep e.g. units and short_prefix
-            data = sum(s * sdata for s, sdata in zip(isigns, idatas)) / sum_scale
-        if size := data.sizes.get('pctile', None):  # now apply percentile ranges
-            for i, key in zip(range(1, size, 2), ('shade', 'fade')):
-                kwargs[f'{key}data'] = data.isel(pctile=slice(i, i + 2)).values
-            data = data.isel(pctile=0)  # original data
-        if len(kws_process) == 1 and (name := kws_process[0].get('name')):
-            data.name = name  # e.g. 'ts' minus 'tabs'
-        if method == 'dist' and len(idatas) > 1 and np.allclose(data, 0):
-            data = idatas[0]
-        if suffix and any(sign == -1 for sign in isigns):  # TODO: make optional?
-            data.attrs['short_suffix'] = data.attrs['long_suffix'] = 'anomaly'
-        args.append(data)
+            arg = sum(sign * part for sign, part in zip(signs, parts)) / sum_scale
+        if method == 'dist' and len(parts) > 1 and np.allclose(arg, 0):
+            arg = parts[0]  # kludge for e.g. control late minus control early
+        if len(parts) == 1 and (name := kws_process[0].get('name')):
+            arg.name = name  # kluge for e.g. 'ts' minus 'tstd'
+        if suffix and any(sign == -1 for sign in signs):
+            suffix = 'anomaly' if suffix is True else suffix
+            arg.attrs['short_suffix'] = arg.attrs['long_suffix'] = suffix
+        if 'sigma' in datas[0].dims:  # see _apply_single and _apply_double
+            dof = kwargs.pop('dof', None)
+            sigma = sum(data.isel(sigma=1) for data in datas) ** 0.5
+            for which in ('shade', 'fade'):
+                pctile = kwargs.pop(f'{which}pctiles', None)
+                std = kwargs.pop(f'{which}stds', None)
+                if pctile is not None:
+                    bounds = _get_bounds(sigma, 100 - pctile, dof=dof)
+                elif std is not None:
+                    bounds = (-std * sigma, std * sigma)
+                else:
+                    continue
+                bounds = (arg + bounds[0], arg + bounds[1])
+                bounds = xr.concat(bounds, dim='bounds')
+                kwargs[f'{which}data'] = bounds.transpose('bounds', ...).values
+        args.append(arg)
 
     # Align and restore coordinates
-    # WARNING: In some xarray versions seems _method_double with conflicting scalar
+    # WARNING: In some xarray versions seems _reduce_double with conflicting scalar
     # coordinates will keep the first one instead of discarding. So overwrite below.
     # NOTE: Xarray automatically drops non-matching scalar coordinates (similar
     # to vector coordinate matching utilities) so try to restore them below.
@@ -742,6 +730,12 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
             for key, value in kw_input.items():
                 if key not in names and key not in arg.sizes:
                     arg.coords[key] = value
+                delta = (
+                    key == 'experiment' and isinstance(value, str)
+                    and 'picontrol' in value and 'abrupt4xco2' in value
+                )
+                if delta and 'style' in arg.coords and 'style' not in kw_input:
+                    del arg.coords['style']  # i.e. default was requested
     else:  # create 2-tuple coordinates
         keys = sorted(set(key for kw in kws_input for key in kw))
         kw_input = {}

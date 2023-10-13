@@ -26,10 +26,12 @@ FONT_SCALE = 1.8
 PATH_IGNORES = {
     'project': 'cmip',  # ignore if passed
     'ensemble': 'flagship',
-    'period': 'ann',
     'source': 'eraint',
     'style': 'slope',
     'region': 'globe',
+    'period': 'ann',
+    # 'start': 0,  # always include
+    # 'stop': 150,  # always include
 }
 
 # Regexes for float and operator detection
@@ -46,8 +48,8 @@ REGEX_SPLIT = re.compile(  # ignore e.g. leading positive and negative signs
 KEYS_VARIABLE = (
     'hemi', 'hemisphere', 'quantify', 'standardize',
 )
-KEYS_METHOD = (  # skip 'spatial' because used in apply_reduce
-    'method', 'std', 'pctile', 'invert', 'normalize',
+KEYS_REDUCE = (  # skip 'spatial' because used in reduce_general
+    'method', 'std', 'pctile', 'preserve', 'invert', 'normalize',
 )
 
 # Keyword prefixes for generating individual dictionaries from specs
@@ -71,7 +73,7 @@ KEYS_GRIDSPEC = (
 KEYS_OTHER = (
     'cycle', 'horizontal', 'offset', 'intersect', 'correlation',  # _combine
     'zeros', 'oneone', 'linefit', 'annotate', 'constraint', 'graphical',  # _scatter
-    'multicolor', 'pcolor',  # _auto_props
+    'transpose', 'multicolor', 'pcolor', 'area',  # _auto_props
 )
 KEYS_ATTRIBUTES = ('short_name', 'long_name', 'standard_name', 'units')
 KEYS_COLORBAR = ('locator', 'formatter', 'tick', 'minor', 'extend', 'length', 'shrink')
@@ -196,16 +198,16 @@ TRANSLATE_LABELS = {
     ('style', 'monthly'): 'monthly',
     ('style', 'ratio'): 'ratio-style',
     ('startstop', (0, 150)): 'full',
-    ('startstop', (1, 150)): 'full + 1',
-    ('startstop', (2, 150)): 'full + 2',
+    ('startstop', (1, 150)): 'full',
+    ('startstop', (2, 150)): 'full',
     ('startstop', (0, 20)): 'early',
-    ('startstop', (1, 20)): 'early + 1',
-    ('startstop', (2, 20)): 'early + 2',
-    ('startstop', (0, 50)): 'early 50',
-    ('startstop', (1, 50)): 'early 50 + 1',
-    ('startstop', (2, 50)): 'early 50 + 2',
+    ('startstop', (1, 20)): 'early',
+    ('startstop', (2, 20)): 'early',
+    ('startstop', (0, 50)): 'year 0--50',
+    ('startstop', (1, 50)): 'year 1--50',
+    ('startstop', (2, 50)): 'year 2--50',
     ('startstop', (20, 150)): 'late',
-    ('startstop', (100, 150)): 'late 50',
+    ('startstop', (100, 150)): 'year 100--150',
     ('region', 'globe'): 'global-$T$',
     ('region', 'point'): 'local-$T$',
     ('region', 'latitude'): 'zonal-$T$',
@@ -294,25 +296,25 @@ TRANSLATE_LONGS.update(TRANSLATE_LABELS)
 TRANSLATE_SHORTS.update(TRANSLATE_LABELS)
 
 
-def _expand_lists(*args, equal=True):
+def _expand_lists(*args):
     """
-    Return lists with possibly matched lengths.
+    Return lists with matched lengths.
 
     Parameters
     ----------
-    *args
-        The lengths of objects.
-    equal : bool, optional
-        Whether to enforce equal lengths.
+    *args : list
+        The lists to match.
     """
+    lengths = list(map(len, args))
+    length = set(lengths) - {1}
     args = list(args)  # modifable
-    if len(args) == 2 and len(args[0]) == 1 and len(args[1]) != 1:
-        args[0] = args[0] * len(args[1])
-    if len(args) == 2 and len(args[1]) == 1 and len(args[0]) != 1:
-        args[1] = args[1] * len(args[0])
-    if equal and len(set(lengths := list(map(len, args)))) > 1:
-        vals = '\n'.join(map(repr, args))
-        raise ValueError(f'Incompatible mixed lengths {lengths} for values:\n{vals}.')
+    if len(length) > 1:
+        values = '\n'.join(f'{len(arg)}: {arg!r}' for arg in args)
+        raise ValueError(f'Incompatible mixed lengths {lengths} for values\n{values}.')
+    length = length.pop() if length else None
+    for i, items in enumerate(args):
+        if length and len(items) == 1:
+            args[i] = length * items
     return args
 
 
@@ -328,11 +330,11 @@ def _group_parts(kwargs, keep_operators=False):
         Whether to keep pre-industrial start and stop operators.
     """
     # WARNING: Need process_data() to accomodate situations where e.g. generating
-    # several 'scatter plots' that get concatenated into a bar plot of regression
-    # coefficients of 'late minus early vs. unperturbed', in which case apply_reduce()
+    # several 'scatter plots' that get concatenated into a bar plot of 'late minus
+    # early vs. unperturbed' regression coefficients, in which case reduce_general()
     # will translate denominator to 'full unperturbed minus full unperturbed' i.e.
     # zero, and case where we are doing e.g. spatial version of this regression,
-    # where apply_reduce() gets regression coefficients before the subtraction
+    # where reduce_general() gets regression coefficients before the subtraction
     # operation so there is no need to worry about denominator. Solution is to
     # keep same number of operators (so numerator and denominator have same number
     # and thus can be combined) but replace with just '+' i.e. a dummy average.
@@ -344,11 +346,11 @@ def _group_parts(kwargs, keep_operators=False):
     if 'start' in kwargs and 'stop' in kwargs:
         start, stop = kwargs.pop('start'), kwargs.pop('stop')
         if kwargs.get('experiment') == 'picontrol':
-            n1 = sum(map(start.count, '+-')) if isinstance(start, str) else 0
-            n2 = sum(map(stop.count, '+-')) if isinstance(stop, str) else 0
+            num1 = sum(map(start.count, '+-')) if isinstance(start, str) else 0
+            num2 = sum(map(stop.count, '+-')) if isinstance(stop, str) else 0
             if keep_operators:
-                start = '+'.join(itertools.repeat('0', n1 + 1))
-                stop = '+'.join(itertools.repeat('150', n2 + 1))
+                start = '+'.join(itertools.repeat('0', num1 + 1))
+                stop = '+'.join(itertools.repeat('150', num2 + 1))
             else:
                 start = None
                 stop = None
@@ -382,6 +384,28 @@ def _ungroup_parts(value):
             iparts.append(part)
         parts.append(iparts)
     return [part[0] if len(part) == 1 else part for part in zip(*parts)]
+
+
+def _capitalize_label(label, prefix=None, suffix=None):
+    """
+    Helper function for format and capitalize the label.
+
+    Parameters
+    ----------
+    label : str
+        The display label.
+    prefix, suffix : optional
+        The label prefix and suffix.
+    """
+    if prefix and not label[:2].isupper():
+        label = label[:1].lower() + label[1:]
+    if prefix:
+        prefix = prefix[:1].upper() + prefix[1:]
+    else:
+        label = label[:1].upper() + label[1:]
+    parts = (prefix, label, suffix)
+    label = ' '.join(filter(None, parts))
+    return label
 
 
 def _combine_labels(*labels, identical=False):
@@ -421,28 +445,6 @@ def _combine_labels(*labels, identical=False):
         else:
             labels = [regex.sub('', label).strip() for label in labels]
     return labels
-
-
-def _format_label(label, prefix=None, suffix=None):
-    """
-    Helper function for format and capitalize the label.
-
-    Parameters
-    ----------
-    label : str
-        The display label.
-    prefix, suffix : optional
-        The label prefix and suffix.
-    """
-    if prefix and not label[:2].isupper():
-        label = label[:1].lower() + label[1:]
-    if prefix:
-        prefix = prefix[:1].upper() + prefix[1:]
-    else:
-        label = label[:1].upper() + label[1:]
-    parts = (prefix, label, suffix)
-    label = ' '.join(filter(None, parts))
-    return label
 
 
 def _split_label(label, fontsize=None, refwidth=None, nmax=None):
@@ -513,11 +515,13 @@ def get_path(dataset, *kws_process):
     path : str
         The parts joined with underscores and dashes.
     """
-    # NOTE: This omits keywords that correspond to default values but always
-    # includes experiment because default is ambiguous between variables.
+    # NOTE: This omits keywords that correspond to default values (for those that
+    # have fixed defaults, i.e. not 'style' or 'experiment'). In latter case may get
+    # distinction between e.g. passing experiment=None and experiment='abrupt4xco2'
+    # even if that is in fact the default when saving path names. Should revisit.
+    labels = []
     kws_process = [(kw,) if isinstance(kw, dict) else tuple(kw) for kw in kws_process]
     kws_process = [kw.copy() for kws in kws_process for kw in kws]
-    labels = []
     kws_process = list(map(_group_parts, kws_process))
     for key in ORDER_LOGICAL:
         seen, parts = set(), []
@@ -561,9 +565,8 @@ def get_label(dataset, key, value, mode=None, name=None):
     """
     # NOTE: This function is used for axis label prefixes, legend entry prefixes, row
     # and column labels, and figure and path titles. It is never used for the 'method'
-    # key because this is added to the data array short and long names during
-    # application, which are subsequently used for axis labels, legend entries, and
-    # colorbar labels. Note the method is also manually appended to the figure path.
+    # key because this is added to the data short and long names during application,
+    # which are subsequently used for axis labels, legend entries, and colorbar labels
     mode = mode or 'long'
     if mode not in ('path', 'short', 'long'):
         raise ValueError(f'Invalid label mode {mode!r}.')
@@ -593,11 +596,11 @@ def get_label(dataset, key, value, mode=None, name=None):
                 label = None
             elif part and part[0] in operator_to_label:  # e.g. (-, -) startstop tuples
                 label = part[0] if mode == 'path' else operator_to_label[part[0]]
-            elif mode == 'path':
+            elif mode == 'path':  # e.g. 'startstop'
                 label = TRANSLATE_PATHS.get((key, part), part)
             elif mode == 'short':
                 label = TRANSLATE_SHORTS.get((key, part), part)
-            else:
+            else:  # e.g. 'startstop'
                 label = TRANSLATE_LONGS.get((key, part), part)
             if version and mode != 'path' and part == 'picontrol':
                 label = 'unperturbed'
@@ -639,8 +642,8 @@ def get_label(dataset, key, value, mode=None, name=None):
 
 
 def get_labels(
-    dataset, *kws_process, identical=False,
-    title_case=False, long_names=False, skip_names=False, **kwargs,
+    dataset, *kws_process, identical=False, capitalize=False,
+    long_names=False, skip_names=False, **kwargs,
 ):
     """
     Convert reduction operators into human-readable labels.
@@ -653,7 +656,7 @@ def get_labels(
         The reduction keyword arguments.
     identical : bool, optional
         Whether to keep identical reduce operations across list.
-    title_case : bool, optional
+    capitalize : bool, optional
         Whether to return labels in title case.
     long_names : bool, optional
         Whether to use long reduce instructions.
@@ -712,13 +715,11 @@ def get_labels(
                 name = kw_infer.get('name', None)
                 kw_label, kw_infer = {}, _group_parts(kw_infer)
                 for key, value in kw_infer.items():  # get individual label
-                    if key == 'statistic':  # TODO: remove!
-                        continue
                     if key in KEYS_VARIABLE:  # ignore climo.get() keywords
                         continue
-                    if key in KEYS_METHOD or skip_names and key in ('name', 'spatial'):
+                    if key in KEYS_REDUCE or skip_names and key in ('name', 'spatial'):
                         continue
-                    kw_label[key] = get_label(dataset, key, value, mode=mode, name=name)  # noqa: E501
+                    kw_label[key] = get_label(dataset, key, value, mode=mode, name=name)
                 nkws_label.append(kw_label)
             kw_label = {}  # merge labels for stuff inside subplot
             for key in sorted((key for kw in nkws_label for key in kw), key=sorter):
@@ -764,37 +765,31 @@ def get_labels(
                     front.append(items[0])
         # Combine and adjust labels
         remove = lambda lab, key: lab[::-1].replace(key[::-1], '', 1)[::-1]
+        control, abrupt = 'pre-industrial', r'abrupt 4$\times$CO$_2$'
         left, right = ' '.join(filter(None, left)), ' '.join(filter(None, right))
         center = ' vs. '.join(filter(None, (left, right)))
         label = ' '.join(filter(None, (*front, center, *back)))
-        average = 'CMIP5 plus CMIP6'
-        abrupt = r'abrupt 4$\times$CO$_2$'
-        control = 'pre-industrial'
-        change = f'{abrupt} minus {control}'
-        warming = 'temperature response'
-        scaling = rf'{abrupt} 2$\times$CO$_2$'
-        if change in label:
-            if label[-8:] == 'feedback':
-                pass  # do not replace with 'response'
-            elif label in (change, f'early {change}', f'late {change}'):
-                pass  # special exceptions in case 'feedback' is missing
-            else:
-                label = remove(f'{label.replace(change, abrupt)} response', f'{abrupt} ')  # noqa: E501
-        if average in label:
-            label = label.replace(average, 'CMIP')
-        if warming in label:
-            label = label.replace(warming, 'warming')
-        if identical and label[-8:] == 'feedback':  # change end to 'feedbacks'
-            label = f'{label}s'
-        if scaling in label:  # drop '2xCO2' scaling
-            label = label.replace(scaling, abrupt, 1)
-        if label.count('boreal') == 2:  # drop e.g. 'boreal winter minus boreal summer'
-            label = remove(label, 'boreal ')
+        if (sub := f'{abrupt} minus {control}') not in label:
+            pass  # difference between experiments
+        elif label[-8:] == 'feedback' or label in (sub, f'early {sub}', f'late {sub}'):
+            pass  # special exceptions in case 'feedback' is missing
+        else:
+            label = remove(f'{label.replace(sub, abrupt)} response', f'{abrupt} ')
+        if (sub := 'CMIP5 plus CMIP6') in label:
+            label = label.replace(sub, 'CMIP')
+        if (sub := 'temperature response') in label:
+            label = label.replace(sub, 'warming')
+        if (sub := rf'{abrupt} 2$\times$CO$_2$') in label:  # drop '2xCO2' scaling
+            label = label.replace(sub, abrupt, 1)
+        if label.count(sub := 'boreal') == 2:  # e.g. 'boreal winter - boreal summer'
+            label = remove(label, f'{sub} ')
         if control in label and 'surface warming' in label:  # convert 'ts'
             label = label.replace('warming', 'temperature')
+        if identical and label[-8:] == 'feedback':  # change end to 'feedbacks'
+            label = f'{label}s'
         label = _split_label(label.strip(), **kwargs)
-        if title_case:
-            label = _format_label(label)
+        if capitalize:
+            label = _capitalize_label(label)
         labels.append(label)
 
     return labels[0] if identical else labels
@@ -847,7 +842,7 @@ def parse_spec(dataset, spec, **kwargs):
         name, kw = None, spec
     else:  # length-2 iterable
         name, kw = spec
-    kw = {**kwargs, **kw}  # copy
+    kw = {**kwargs, **kw}  # prefer spec arguments
     alt = kw.pop('name', None)
     name = name or alt  # see below
     kw_figure, kw_gridspec, kw_axes = {}, {}, {}
@@ -856,7 +851,7 @@ def parse_spec(dataset, spec, **kwargs):
     detect_process = list(dataset.sizes)
     detect_process.extend(name for idx in dataset.indexes.values() for name in idx.names)  # noqa: E501
     detect_process.extend(('area', 'volume', 'spatial', 'institute'))
-    detect_process.extend((*KEYS_VARIABLE, *KEYS_METHOD))  # noqa: E501
+    detect_process.extend((*KEYS_VARIABLE, *KEYS_REDUCE))  # noqa: E501
     for key, value in kw.items():  # NOTE: sorting performed in _parse_labels
         if key in detect_process:
             kw_process[key] = value  # e.g. for averaging
@@ -933,13 +928,12 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
     # NOTE: This permits sharing keywords across each group with trailing dictoinaries
     # in either the primary gridspec list or any of the subplot sub-lists. Currently
     # the 'figures.py' utilities do this automatically but could be useful in future.
-    # ic('Row specs:', *rowspecs)  # uncomment for debugging
-    # ic('Column specs:', *colspecs)
+    # ic(*rowspecs, *colspecs)  # uncomment for debugging
     refwidth = refscale = None
     kws_process, kws_collection, gridlabels = [], [], []
     detect_process = [name for idx in dataset.indexes.values() for name in idx.names]
     detect_process.extend(('area', 'volume', 'spatial', 'institute'))
-    detect_process.extend((*KEYS_VARIABLE, *KEYS_METHOD))
+    detect_process.extend((*KEYS_VARIABLE, *KEYS_REDUCE))
     for i, ispecs in enumerate((rowspecs, colspecs)):
         # Collect specs per subplot
         ikws_process, ikws_collection = [], []
@@ -949,21 +943,21 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
             jkws_process, jkws_collection = [], []
             if not isinstance(jspecs, list):
                 jspecs = [jspecs]
-            for kspecs in jspecs:  # specs per subplot
+            for sspecs in jspecs:  # specs per subplot
                 # Translate into name and dictionary
-                kkws_pair, kkws_process, kkws_collection = [{}, {}], [], []
-                if kspecs is None:
-                    kspecs = (None,)  # possibly construct from keyword args
-                elif isinstance(kspecs, (str, dict)):
-                    kspecs = (kspecs,)
-                elif len(kspecs) != 2:
-                    raise ValueError(f'Invalid variable specs {kspecs}.')
-                elif type(kspecs[0]) != type(kspecs[1]):  # noqa: E721  # (str, dict)
-                    kspecs = (kspecs,)
+                skws_pair, skws_process, skws_collection = [{}, {}], [], []
+                if sspecs is None:
+                    sspecs = (None,)  # possibly construct from keyword args
+                elif isinstance(sspecs, (str, dict)):
+                    sspecs = (sspecs,)
+                elif len(sspecs) != 2:
+                    raise ValueError(f'Invalid variable specs {sspecs}.')
+                elif type(sspecs[0]) != type(sspecs[1]):  # noqa: E721  # (str, dict)
+                    sspecs = (sspecs,)
                 else:
-                    kspecs = tuple(kspecs)
+                    sspecs = tuple(sspecs)
                 # Iterate over correlation pairs
-                for spec in kspecs:
+                for spec in sspecs:
                     kw_process, kw_collection = parse_spec(dataset, spec, **kwargs)
                     if value := kw_collection.figure.get('refwidth', None):
                         refwidth = value  # for scaling grid labels
@@ -971,16 +965,16 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
                         refscale = 0.6 if i == 0 else 1.0  # i.e. longitude-latitude
                     for key, value in tuple(kw_process.items()):
                         if isinstance(value, tuple) and len(value) == 2:
-                            kkws_pair[0][key], kkws_pair[1][key] = kw_process.pop(key)
-                    kkws_process.append(kw_process)
-                    kkws_collection.append(kw_collection)
-                if any(kkws_pair):
-                    if len(kkws_process) == 1:
-                        kkws_process = [kkws_process[0].copy(), kkws_process[0].copy()]
-                    for kw_process, kw_pair in zip(kkws_process, kkws_pair):
+                            skws_pair[0][key], skws_pair[1][key] = kw_process.pop(key)
+                    skws_process.append(kw_process)
+                    skws_collection.append(kw_collection)
+                if any(skws_pair):
+                    if len(skws_process) == 1:
+                        skws_process = [skws_process[0].copy(), skws_process[0].copy()]
+                    for kw_process, kw_pair in zip(skws_process, skws_pair):
                         kw_process.update(kw_pair)
-                jkws_process.append(tuple(kkws_process))  # denotes correlation-pair
-                jkws_collection.append(tuple(kkws_collection))
+                jkws_process.append(tuple(skws_process))  # denotes correlation-pair
+                jkws_collection.append(tuple(skws_collection))
             ikws_process.append(jkws_process)
             ikws_collection.append(jkws_collection)
         # Infer grid labels
@@ -991,8 +985,8 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
             dataset,
             *ikws_process,
             identical=False,
+            capitalize=True,
             long_names=True,
-            title_case=True,
             fontsize=pplt.rc.fontlarge,
             refwidth=(refscale or 1) * refwidth,  # account for a-b-c space
         )
@@ -1031,11 +1025,11 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
                             kw.setdefault(key, value)  # prefer row entries
                 kws.append(kw)
             kw_collection = collection(*kws)
-
             # Intersect processing keywords
-            # NOTE: This also supports 2-tuple specifications for variables
-            rkws_process = [kw.copy() for kw in rkws_process]  # NOTE: copy needed
-            ckws_process = [kw.copy() for kw in ckws_process]
+            rkws_process = [kw.copy() for kw in rkws_process]  # iterate pairs
+            ckws_process = [kw.copy() for kw in ckws_process]  # iterate pairs
+            if len(rkws_process) not in (1, 2) or len(ckws_process) not in (1, 2):
+                raise ValueError(f'Invalid combination {rkws_process} and {ckws_process}.')  # noqa: E501
             if len(rkws_process) == 1 and len(ckws_process) == 1:
                 kw_process = (*rkws_process, *ckws_process)
             elif len(rkws_process) == 2 and len(ckws_process) == 2:
@@ -1043,23 +1037,22 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
                 for rkw, ckw in zip(rkws_process, ckws_process):
                     for key, value in ckw.items():
                         rkw.setdefault(key, value)
-            elif len(rkws_process) in (1, 2) and len(ckws_process) in (1, 2):
-                if len(rkws_process) == 1:
-                    ref, kw_process = rkws_process[0], ckws_process
-                else:
-                    ref, kw_process = ckws_process[0], rkws_process
-                for key, value in ref.items():
+            else:  # one is scalar the other vector
+                kw_process = (ckws_process, rkws_process)[len(rkws_process) == 2]
+                kw_reference = (ckws_process, rkws_process)[len(rkws_process) != 2]
+                for key, value in kw_reference[0].items():  # noqa: E501
                     for kw in kw_process:
                         kw.setdefault(key, value)
-            else:
-                raise ValueError(f'Impossible combination {rkws_process} and {ckws_process}.')  # noqa: E501
-
-            # Merge pairs and possibly apply autocmap
+            # Combine pairs and possibly apply autocmap
             if len(kw_process) == 2:
                 for kw1, kw2 in (kw_process, kw_process[::-1]):
                     for key, value in kw2.items():
                         kw1.setdefault(key, value)
-                if kw_process[0] == kw_process[1]:
+                kws_check = [
+                    {key: value for key, value in kw.items() if key not in KEYS_REDUCE}
+                    for kw in kw_process  # ignore e.g. default **kwargs method
+                ]
+                if kws_check[0] == kws_check[1]:
                     kw_process = kw_process[:1]
             if autocmap:  # use different colormaps for project and other anomalies
                 index = max(
@@ -1077,15 +1070,13 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
         # Infer legend and axes prefixes
         # TODO: Optionaly use either 'long_names' or 'skip_names'? Commonly want
         # single label for contours but multiple labels for line plots.
-        kw = dict(refwidth=np.inf, identical=False, long_names=True, title_case=False)
-        ikws_pair = [  # process arguments for e.g. scatter plot
-            ikws_process[0][:1],
-            ikws_process[0][1:] or ikws_process[0][:1]
-        ]
+        kw = dict(refwidth=np.inf, identical=False, capitalize=False, long_names=True)
+        ikws_pair = [ikws_process[0][:1], ikws_process[0][-1:]]
+        dist_pair = len(ikws_process[0]) == 2 and ikws_process[0][-1].get('area')
         prefixes_axes = get_labels(dataset, *ikws_pair, skip_names=True, **kw)
         prefixes_legend = get_labels(dataset, *ikws_process, **kw)
         for axis, prefix in zip('xy', prefixes_axes):
-            if prefix:  # apply for last item in subplot
+            if prefix and dist_pair:
                 ikws_collection[-1].attrs.setdefault(f'{axis}label_prefix', prefix)
         for pspec, prefix in zip(ikws_collection, prefixes_legend):
             if prefix:  # add prefix to this
@@ -1102,8 +1093,8 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
         *kws_process,
         refwidth=figwidth,
         identical=True,
+        capitalize=True,
         long_names=True,
-        title_case=True,
         fontsize=pplt.rc.fontlarge
     )
     pathspecs = [dspec for ikws_process in kws_process for dspec in ikws_process]

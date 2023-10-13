@@ -16,15 +16,15 @@ from .internals import ORDER_LOGICAL
 from .results import FACETS_NAME, FACETS_LEVELS, VERSION_NAME, VERSION_LEVELS
 from cmip_data.internals import MODELS_INSTITUTES, INSTITUTES_LABELS
 
-__all__ = ['apply_method', 'apply_reduce']
+__all__ = ['reduce_facets', 'reduce_general']
 
 # model_to_inst = MODELS_INSTITUTES.copy()
 # model_to_inst['CMIP6', 'CERES'] = 'CERES'  # observations placeholder
 # inst_to_label = INSTITUTES_LABELS.copy()  # see also _parse_constraints
 
 # Reduction defaults
-# NOTE: Default 'style' depends on styles present. If single style is present for
-# source 'eraint' then select it. Otherwise prefer 'annual' over 'monthly'.
+# NOTE: Default 'style' depends on styles present and may be overwritten, and default
+# 'time' can be overwritten by None (see below). See also PATHS_IGNORE in internals.py.
 DEFAULTS_GENERAL = {
     'experiment': 'picontrol',
     'ensemble': 'flagship',
@@ -34,6 +34,7 @@ DEFAULTS_GENERAL = {
 DEFAULTS_VERSION = {
     'experiment': 'abrupt4xco2',
     'source': 'eraint',
+    'style': 'slope',  # possibly overwritten
     'start': 0,
     'stop': 150,
     'region': 'globe',
@@ -259,8 +260,8 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
         slope_lower, slope_upper = slope - sigma, slope + sigma
     else:
         pctile = 95 if pctile is None or pctile is True else pctile
-        pctile = 0.5 * (100 - np.atleast_1d(pctile))
-        pctile = np.array([pctile, 100 - pctile])  # e.g. [90, 50] --> [[5, 25], [95, 75]]  # noqa: E501
+        pctile = 0.5 * (100 - np.atleast_1d(pctile))  # e.g. [90, 50] -> [5, 25]
+        pctile = np.array([pctile, 100 - pctile])  # e.g. [5, 25] -> [[5, 25], [95, 75]]
         sigma_lower, sigma_upper = _get_bounds(sigma, pctile, dof=data0.size - 2)
         slope_lower = slope + xr.DataArray(sigma_lower, dims=('pctile', *sigma.dims))
         slope_upper = slope + xr.DataArray(sigma_upper, dims=('pctile', *sigma.dims))
@@ -339,14 +340,10 @@ def _parse_institute(institute=None):
     ----------
     institute : str, default: None
         The selection. If ``'avg'`` then simply return the averaging function and
-        `apply_reduce` will delay application to end of other selections. Otherwise
-        this is used
-        delay operation
-        perform an institute-wise `groupby` average
-        and replace the model ids in the multi-index with curated institute ids, the
-        name of an institute to select only its associated models, or the special
-        key ``'flagship'`` to select "flagship" models from unique institutes (i.e.
-        the final models in the `cmip_data.internals` dictionary).
+        `reduce_facets` will delay application to end of other selections. Otherwise
+        this should be a specific institute name or ``'flagship'`` to select the
+        curated "flagship" models from each institute, defined as the last models
+        in the institute definition lists from the `cmip_data.internals` database.
 
     Returns
     -------
@@ -383,6 +380,44 @@ def _parse_institute(institute=None):
     return func
 
 
+def _restore_index(data, facets_name=None, version_name=None):
+    """
+    Restore multi-index coordinates after level reductions.
+
+    Parameters
+    ----------
+    data : xarray.Dataset or xarray.DataArray
+        The input data.
+    facets_name, version_name : str, optional
+        The index names to overwrite.
+
+    Returns
+    -------
+    data : xarray.Dataset or xarray.DataArray
+        The restored data.
+    """
+    # NOTE: Using reset_index('project', drop=True) at end of reduce_general() can
+    # convert facets multi-index into *facets* index instead of *model* level.
+    facets_name = facets_name or FACETS_NAME
+    version_name = version_name or VERSION_NAME
+    for dim, name, levels in zip(
+        ('facets', 'version'),
+        (facets_name, version_name),
+        (FACETS_LEVELS, VERSION_LEVELS)
+    ):
+        index = data.indexes.get(dim, None)
+        if index is None or isinstance(index, pd.MultiIndex):
+            continue
+        levels = data.sizes.keys() & set(levels)
+        level = levels.pop() if levels else 'model'  # remaining level
+        coord = level if levels else dim  # remaining coordinate
+        array = data.coords[coord].values
+        index = pd.MultiIndex.from_arrays((array,), names=(level,))
+        data = data.rename({coord: dim})   # possibly no-op
+        data = data.assign_coords({dim: index})
+    return data
+
+
 def _reduce_institutes(data):
     """
     Reduce facets index using institute averages.
@@ -397,8 +432,8 @@ def _reduce_institutes(data):
     data : xarray.Dataset or xarray.DataArray
         The reduced data.
     """
-    # NOTE: This will be built into _method_single and _method_double in future, with
-    # optional option to weight by institute instead of averaging. See apply_reduce().
+    # NOTE: This will be built into _reduce_single and _reduce_double in future, with
+    # optional option to weight by institute instead of averaging. See reduce_general().
     long_name = 'source institute'  # WARNING: critical to assign this
     if 'facets' not in data.coords:
         return data
@@ -468,45 +503,7 @@ def _reduce_time(data, time=None, season=None, month=None):
     return data
 
 
-def _restore_index(data, facets_name=None, version_name=None):
-    """
-    Restore multi-index coordinates after level reductions.
-
-    Parameters
-    ----------
-    data : xarray.Dataset or xarray.DataArray
-        The input data.
-    facets_name, version_name : str, optional
-        The index names to overwrite.
-
-    Returns
-    -------
-    data : xarray.Dataset or xarray.DataArray
-        The restored data.
-    """
-    # NOTE: Using reset_index('project', drop=True) at end of apply_reduce() can
-    # convert facets multi-index into *facets* index instead of *model* level.
-    facets_name = facets_name or FACETS_NAME
-    version_name = version_name or VERSION_NAME
-    for dim, name, levels in zip(
-        ('facets', 'version'),
-        (facets_name, version_name),
-        (FACETS_LEVELS, VERSION_LEVELS)
-    ):
-        index = data.indexes.get(dim, None)
-        if index is None or isinstance(index, pd.MultiIndex):
-            continue
-        levels = data.sizes.keys() & set(levels)
-        level = levels.pop() if levels else 'model'  # remaining level
-        coord = level if levels else dim  # remaining coordinate
-        array = data.coords[coord].values
-        index = pd.MultiIndex.from_arrays((array,), names=(level,))
-        data = data.rename({coord: dim})   # possibly no-op
-        data = data.assign_coords({dim: index})
-    return data
-
-
-def _method_single(data, dim=None, method=None, pctile=None, std=None):
+def _reduce_single(data, method, dim=None, pctile=None, std=None, preserve=True):
     """
     Apply reduction method for single data array.
 
@@ -514,111 +511,116 @@ def _method_single(data, dim=None, method=None, pctile=None, std=None):
     ----------
     data : xarray.DataArray
         The input data.
-    dim : str, default: 'facets'
-        The dimension.
-    method : str, optional
-        The reduction method (see `apply_method`).
+    method : str
+        The reduction method (see `reduce_facets`).
+    dim : str, optional
+        The reduction dimension. Default is the first dimension.
 
     Other Parameters
     ----------------
     pctile : float or sequence, optional
-        The percentile range or thresholds for related methods. Set to ``True`` to
-        use default values of ``80`` for ``avg|med`` and ``50`` for ``pctile``.
-        Pass two values, e.g. ``[80, 100]``, to use both `shade` and `fade` keywords.
+        The percentile range or bounds for related methods. If ``True`` then defaults
+        of ``80`` and ``50`` are used for ``avg|med`` and ``pctile``. If two values
+        passed e.g. ``(80, 100)`` both `shade` and `fade` keywords are used.
     std : float or sequence, optional
-        The standard deviation multiple for related methods. Set to ``True`` to use
-        default values of ``1`` for ``std`` and ``3`` for ``avg|med`` shading.
-        Pass two values, e.g. ``[1, 3]``, to use both `shade` and `fade` keywords.
+        The standard deviation multiple for related methods. If ``True`` then defaults
+        of ``3`` and ``1`` are used for ``avg|med`` and ``std``. If two values
+        passed e.g. ``(1, 3)`` both `shade` and `fade` keywords are used.
+    preserve : bool, optional
+        Whether to apply ``avg|med`` operations immediately or preserve the distribution
+        until plotting using ``shade|fade`` keyword arguments. If ``False`` this will
+        cause ``process_data()`` to show uncertainty for differences of selections on
+        each model e.g. ``experiment='abrupt4xco2-picontrol'`` intead of ensembles.
 
     Returns
     -------
-    data : xarray.DataArray
-        The resulting data.
+    result : xarray.DataArray
+        The reduced data.
     defaults : dict
         The default attributes and command keyword args.
     """
-    # NOTE: Here `pctile` is shared between inter-model percentile differences and
-    # composites of a second array based on values in the first array.
-    method = method or 'avg'
-    ndim = data.ndim
-    kw = {'dim': dim or 'facets', 'skipna': True}
-    name = data.name
-    short = long = None
+    # NOTE: Here `pctile` keyword argument is shared between inter-model percentile
+    # differences and composites of a second array based on values in the first array.
+    # NOTE: Here we put 'variance' on additional DataArray dimension since variance
+    # of gaussian random variables is linearly additive, so can allow process_data()
+    # to carry out any operations (e.g. project=cmip6-cmip5) and generate 'shadedata'
+    # and 'fadedata' arrays from the input arguments. Note resulting percentiles will
+    # only be an approximation to some actual Monte Carlo sampled difference of
+    # t-distributions. See: https://en.wikipedia.org/wiki/Variance#Propertieswill
+    pctile = None if pctile is False else pctile
+    pctile = True if method == 'pctile' and pctile is None else pctile
+    pctile = (80, 80)[method == 'pctile'] if pctile is True else pctile
+    pctile = np.atleast_1d(pctile) if pctile is not None else pctile
+    std = None if std is False else std
+    std = True if method == 'std' and std is None else std
+    std = (1, 1)[method == 'std'] if std is True else std
+    std = np.atleast_1d(std) if std is not None else std
     defaults = {}
+    short = long = None
+    name = data.name
+    dim = dim or data.dims[0]
+    kw = {'dim': dim, 'skipna': False}
     if method == 'avg' or method == 'med':
         key = 'mean' if method == 'avg' else 'median'
+        cmd = getattr(data, key)
+        result = cmd(**kw, keep_attrs=True)
         descrip = 'mean' if method == 'avg' else 'median'
-        std = std.tolist() if isinstance(std, np.ndarray) else std
-        pctile = pctile.tolist() if isinstance(pctile, np.ndarray) else pctile
-        if not std and not pctile:
-            assert ndim < 4
-            cmd = getattr(data, key)
-            data = cmd(**kw, keep_attrs=True)
-            short = f'{descrip} {data.short_name}'  # only if no range included
-            long = f'{descrip} {data.long_name}'
-        elif std:  # standard deviation range
-            assert ndim == 2
-            # std = [1, 3] if std is True else std
-            std = 3 if std is True else std
-            std = np.atleast_1d(std)
-            shade, fade = std if std.size == 2 else (std.item(), None)
-            defaults.update({key: True, 'shadestds': shade, 'fadestds': fade})
+        short = f'{descrip} {data.short_name}'  # only if no range included
+        long = f'{descrip} {data.long_name}'
+        if result.ndim == 1 and any(nums is not None for nums in (pctile, std)):
+            nums = pctile if pctile is not None else std
+            which = 'pctile' if pctile is not None else 'std'
+            shade, fade = nums if nums.size == 2 else (nums.item(), None)
+            defaults.update({f'shade{which}s': shade, f'fade{which}s': fade})
             defaults.update({'fadealpha': 0.15, 'shadealpha': 0.3})
-        elif pctile:  # percentile range
-            assert ndim == 2
-            # pctile = [50, 95] if pctile is True else pctile
-            pctile = 80 if pctile is True else pctile
-            pctile = np.atleast_1d(pctile)
-            shade, fade = pctile if pctile.size == 2 else (pctile.item(), None)
-            defaults.update({key: True, 'shadepctiles': shade, 'fadepctiles': fade})
-            defaults.update({'fadealpha': 0.15, 'shadealpha': 0.3})
+            if preserve:  # preserve distributions for now
+                result = data
+                defaults.update({f'{descrip}s': True})
+            else:  # reduce and record variance
+                result = xr.concat((result, data.var(ddof=1, **kw)), dim='sigma')
+                defaults['dof'] = data.sizes[dim] - 1
     elif method == 'pctile':
-        assert ndim < 4
-        pctile = 50 if pctile is None or pctile is True else pctile
-        nums = 0.01 * pctile / 2, 1 - 0.01 * pctile / 2
         with xr.set_options(keep_attrs=True):  # note name is already kept
-            data = data.quantile(nums[1], **kw) - data.quantile(nums[0], **kw)
+            nums = (0.5 - 0.005 * pctile.item(), 0.5 + 0.005 * pctile.item())
+            result = data.quantile(nums[1], **kw) - data.quantile(nums[0], **kw)
         short = f'{data.short_name} spread'
         long = f'{data.long_name} percentile range'
     elif method == 'std':
-        assert ndim < 4
-        std = 1 if std is None or std is True else std
         with xr.set_options(keep_attrs=True):  # note name is already kept
-            data = std * data.std(**kw)
+            std = std.item()
+            result = std * data.std(**kw)
         short = f'{data.short_name} spread'
         long = f'{data.long_name} standard deviation'
     elif method == 'var':
-        assert ndim < 4
         with xr.set_options(keep_attrs=True):  # note name is already kept
-            data = data.var(**kw)
+            result = data.var(**kw)
         data.attrs['units'] = f'({data.units})^2'
         short = f'{data.short_name} variance'
         long = f'{data.long_name} variance'
     elif method == 'skew':  # see: https://stackoverflow.com/a/71149901/4970632
-        assert ndim < 4
         with xr.set_options(keep_attrs=True):
-            data = data.reduce(func=stats.skew, **kw)
+            result = data.reduce(func=stats.skew, **kw)
         data.attrs['units'] = ''
         short = f'{data.short_name} skewness'
         long = f'{data.long_name} skewness'
     elif method == 'kurt':  # see: https://stackoverflow.com/a/71149901/4970632
-        assert ndim < 4
         with xr.set_options(keep_attrs=True):
-            data = data.reduce(func=stats.kurtosis, **kw)
+            result = data.reduce(func=stats.kurtosis, **kw)
         data.attrs['units'] = ''
         short = f'{data.short_name} kurtosis'
         long = f'{data.long_name} kurtosis'
     elif method == 'dist':  # bars or boxes
-        assert ndim == 1
-        data = data[~data.isnull()]
+        if data.ndim > 1:
+            raise ValueError(f'Invalid dimensionality {data.ndim!r} for distribution.')
+        result = data[~data.isnull()]
         name = None
     else:
         raise ValueError(f'Invalid single-variable method {method}.')
     defaults.update({'name': name, 'short_name': short, 'long_name': long})
-    return data, defaults
+    return result, defaults
 
 
-def _method_double(data0, data1, dim=None, method=None, pctile=None, invert=None):
+def _reduce_double(data0, data1, method, dim=None, pctile=None, std=None, invert=None):
     """
     Apply reduction method for two data arrays.
 
@@ -626,105 +628,117 @@ def _method_double(data0, data1, dim=None, method=None, pctile=None, invert=None
     ----------
     data0, data1 : xarray.DataArray
         The input data.
-    dim : str, default: 'facets'
-        The reduction dimension.
-    method : str, optional
-        The method (see `apply_method`).
+    method : str
+        The reduction method (see `reduce_facets`).
+    dim : str, optional
+        The reduction dimension. Default is the first shared dimension.
 
     Other Parameters
     ----------------
     pctile : float or sequence, optional
-        The percentile range or thresholds for related methods. Set to ``True`` to
-        use default values of ``95`` for ``cov|proj|slope|`` and ``33`` for ``diff``.
-        Pass two values, e.g. ``[50, 95]``, to use both `shade` and `fade` keywords.
+        The percentile range or bounds for ``cov|proj|slope``. If ``True`` then default
+        of ``95`` is used. If two values passed then both `shade` and `fade` are used.
+    std : float or sequence, optional
+        The standard deviation multiple for ``cov|proj|slope``. If ``True`` then default
+        of ``3`` is used. If two values passed then both `shade` and `fade` are used.
     invert : bool, optional
-        Whether to invert the direction of composites, projections, and regressions so
-        that the first variable is the predictor instead of the second variable. This
-        has no effect on ``cov|corr|rsq``.
+        Whether to invert the independent and dependent ``diff|proj|slope`` variables.
+        This has no effect on the symmetric operations ``cov|corr|rsq``.
 
     Returns
     -------
-    data : xarray.DataArray
-        The resulting data.
+    result : xarray.DataArray
+        The reduced data.
     defaults : dict
         The default attributes and command keyword args.
     """
-    # NOTE: Normalization and anomalies with respect to global average
-    # are supported in `apply_method`.
+    # NOTE: Normalization and anomalies with respect to global average as in climopy
+    # accessor.get() are supported in `reduce_facets`.
+    # NOTE: Here we put 'variance' on additional DataArray dimension since variance
+    # of gaussian random variables is linearly additive, so can allow process_data()
+    # to carry out any operations (e.g. project=cmip6-cmip5) and generate 'shadedata'
+    # and 'fadedata' arrays from the input arguments. Note resulting percentiles will
+    # only be an approximation to some actual Monte Carlo sampled difference of
+    # t-distributions. See: https://en.wikipedia.org/wiki/Variance#Propertieswill
+    pctile = None if pctile is False else pctile
+    pctile = 80 if pctile is True else pctile
+    pctile = np.atleast_1d(pctile) if pctile is not None else pctile
+    std = None if std is False else std
+    std = 1 if std is True else std
+    std = np.atleast_1d(std) if std is not None else std
     data0, data1 = (data1, data0) if invert else (data0, data1)
-    method = method or 'cov'
+    defaults = {}
+    shared = [dim for dim in data0.dims if dim in data1.dims]
     short = long = None
     name = f'{data0.name}|{data1.name}'  # NOTE: needed for _combine_commands labels
-    ndim = max(data0.ndim, data1.ndim)
-    dim = dim or 'facets'
-    defaults = {}
-    if dim == 'area':
-        short_prefix, long_prefix = 'spatial', f'{data1.long_name} spatial'
-    elif data0.long_name == data0.long_name:
-        short_prefix, long_prefix = data1.short_name, data1.long_name
-    else:
-        short_prefix, long_prefix = data1.short_name, f'{data1.long_name}/{data0.long_name}'  # noqa: E501
-    if method in ('corr', 'rsq'):
-        cov, std0, std1 = _components_covariance(data0, data1, dim=dim, resid=False)
-        data = cov / (std0 * std1)
-        if method == 'corr':  # correlation coefficient
-            data = data.climo.to_units('dimensionless').climo.dequantify()
-            data.attrs['units'] = ''
-            short = f'{short_prefix} correlation'
-            long = f'{long_prefix} correlation coefficient'
-        else:  # variance explained
-            data = (data ** 2).climo.to_units('percent').climo.dequantify()
-            data.attrs['units'] = '%'
-            short = f'{short_prefix} variance explained'
-            long = f'{long_prefix} variance explained'
-    elif method in ('cov', 'proj', 'slope'):
-        cov, std, resid = _components_covariance(data0, data1, dim=dim, resid=True)
+    dim = dim or shared[0]
+    if dim == 'area':  # special consideration
+        short_prefix, long_prefix = 'spatial ', f'{data1.short_name} spatial '
+    else:  # TODO: revisit this and permit customization
+        short_prefix, long_prefix = '', f'{data1.short_name} '
+    if method in ('cov', 'proj', 'slope'):
         factor = 0 if method == 'cov' else 1 if method == 'proj' else 2
-        data = (cov / std ** factor).climo.dequantify()
+        cov, std0, resid = _components_covariance(data0, data1, dim=dim, resid=True)
+        result = (cov / std0 ** factor).climo.dequantify()
+        # ic(data0.coords, data1.coords, result, method, factor)
         if method == 'cov':
-            data.attrs['units'] = f'{data1.units} {data0.units}'
-            short = f'{short_prefix} covariance'
-            long = f'{long_prefix} covariance'
+            result.attrs['units'] = f'{data1.units} {data0.units}'
+            short = f'{short_prefix}covariance'
+            long = f'{long_prefix}covariance'
         elif method == 'proj':
-            data.attrs['units'] = data1.units
-            short = f'{short_prefix} projection'
-            long = f'{long_prefix} projection'
+            result.attrs['units'] = data1.units
+            short = f'{short_prefix}projection'
+            long = f'{long_prefix}projection'
         else:
-            data.attrs['units'] = f'{data1.units} / ({data0.units})'
-            short = f'{short_prefix} regression coefficient'
-            long = f'{long_prefix} regression coefficient'
-        if ndim == 2 and pctile is not None:  # NOTE: implies one dimension was reduced
-            dof = data0.sizes[dim] - 2  # must be scalar dimension
-            sigma = np.sqrt(resid / std / dof)  # this is sqrt(n)^-1 / sqrt(n)^-1 / dof
-            sigma = (sigma * std ** (2 - factor)).climo.dequantify()  # scaled stderr
-            pctile = 0.5 * (100 - np.atleast_1d(95 if pctile is True else pctile))
-            pctile = np.array([pctile, 100 - pctile])  # e.g. [90, 50] --> [[5, 25], [95, 75]]  # noqa: E501
-            dlower, dupper = _get_bounds(sigma, pctile, dof=data0.size - 2)
-            bounds = [(data + dl, data + du) for dl, du in zip(dlower, dupper)]
-            bounds = [xr.DataArray(b, dims=data.dims) for bnds in bounds for b in bnds]
-            data = xr.concat((data, *bounds), dim='pctile')  # pull out after operation
+            result.attrs['units'] = f'{data1.units} / ({data0.units})'
+            short = f'{short_prefix}regression coefficient'
+            long = f'{long_prefix}regression coefficient'
+        if result.ndim == 1 and any(nums is not None for nums in (pctile, std)):
+            sigma = (resid / std0) / np.sqrt(data0.sizes[dim] - 2)  # regression error
+            sigma = (sigma * std0 ** (2 - factor)).climo.dequantify()  # scaled error
+            result = xr.concat((result, sigma ** 2), dim='sigma')  # see process_data()
+            nums = pctile if pctile is not None else std
+            which = 'pctile' if pctile is not None else 'std'
+            shade, fade = nums if nums.size == 2 else (nums.item(), None)
+            defaults['dof'] = data1.sizes[dim] - 2
+            defaults.update({f'shade{which}s': shade, f'fade{which}s': fade})
             defaults.update({'fadealpha': 0.15, 'shadealpha': 0.25})
+    elif method in ('corr', 'rsq'):
+        cov, std0, std1 = _components_covariance(data0, data1, dim=dim, resid=False)
+        result = cov / (std0 * std1)
+        if method == 'corr':  # correlation coefficient
+            result = result.climo.to_units('dimensionless').climo.dequantify()
+            result.attrs['units'] = ''
+            short = f'{short_prefix}correlation'
+            long = f'{long_prefix}correlation coefficient'
+        else:  # variance explained
+            result = (result ** 2).climo.to_units('percent').climo.dequantify()
+            result.attrs['units'] = '%'
+            short = f'{short_prefix}variance explained'
+            long = f'{long_prefix}variance explained'
     elif method == 'diff':  # composite difference along first arrays
-        assert dim != 'area'
-        data_lo, data_hi = _components_composite(data0, data1, pctile=pctile, dim=dim)
-        data = data_hi - data_lo
-        data = data.climo.dequantify()
-        data.attrs['units'] = data1.units
+        result0, result1 = _components_composite(data0, data1, pctile=pctile, dim=dim)
+        result = result1 - result0
+        result = result.climo.dequantify()
+        result.attrs['units'] = data1.units
         short = f'{data1.short_name} composite difference'
         long = f'{data0.long_name}-composite {data1.long_name} difference'
     elif method == 'dist':  # scatter or bars
-        assert ndim == 1
-        data0, data1 = data0[~data0.isnull()], data1[~data1.isnull()]
-        data0, data1 = xr.align(data0, data1)  # intersection-style broadcast
-        data = (data0, data1)
+        if max(data0.ndim, data1.ndim) > 1:
+            raise ValueError(f'Invalid dimensionality {data0.ndim} x {data1.ndim} for distribution.')  # noqa: E501
+        result0, result1 = data0[~data0.isnull()], data1[~data1.isnull()]
+        result0, result1 = xr.align(result0, result1)  # intersection-style broadcast
+        result = (result0, result1)
         name = None
     else:
         raise ValueError(f'Invalid double-variable method {method}')
     defaults.update({'name': name, 'short_name': short, 'long_name': long})
-    return data, defaults
+    return result, defaults
 
 
-def apply_method(*datas, method=None, verbose=False, invert=None, pctile=None, std=None):  # noqa: E501
+def reduce_facets(
+    *datas, method=None, verbose=False, pctile=None, std=None, preserve=None, invert=None,  # noqa: E501
+):
     """
     Reduce along the facets coordinate using an arbitrary method.
 
@@ -740,8 +754,10 @@ def apply_method(*datas, method=None, verbose=False, invert=None, pctile=None, s
         with ``_anom`` or ``_norm`` to take global anomaly or use normalization.
     verbose : bool, optional
         Whether to print extra information.
-    **kwargs
-        Passed to `apply_single` or `apply_double`.
+    pctile, std, preserve : optional
+        Passed to `_reduce_single`.
+    pctile, std, invert : optional
+        Passed to `_reduce_double`.
 
     Returns
     -------
@@ -757,15 +773,15 @@ def apply_method(*datas, method=None, verbose=False, invert=None, pctile=None, s
     # move this stuff to climopy (already implemented in accessor getter).
     ndim = max(data.ndim for data in datas)
     datas = tuple(data.copy() for data in datas)  # e.g. for distribution updates
-    default = 'dist' if ndim == 1 else 'avg' if len(datas) == 1 else 'rsq'
-    method = method or default
-    method, *options = method.split('_')
+    default = 'dist' if ndim == 1 else 'avg' if len(datas) == 1 else 'slope'
+    method, *options = (method or default).split('_')
     anomaly = 'anom' in options
     normalize = 'norm' in options
+    kwargs = dict(dim='facets', std=std, pctile=pctile)
     if len(datas) == 1:
-        data, defaults = _method_single(*datas, method=method, std=std, pctile=pctile)
+        data, defaults = _reduce_single(*datas, method, preserve=preserve, **kwargs)
     elif len(datas) == 2:
-        data, defaults = _method_double(*datas, method=method, invert=invert, pctile=pctile)  # noqa: E501
+        data, defaults = _reduce_double(*datas, method, invert=invert, **kwargs)
     else:
         raise ValueError(f'Unexpected argument count {len(datas)}.')
     if anomaly:
@@ -787,12 +803,13 @@ def apply_method(*datas, method=None, verbose=False, invert=None, pctile=None, s
     keys = ('facets', 'time', 'plev', 'lat', 'lon')  # coordinate sorting order
     args = tuple(data) if isinstance(data, tuple) else (data,)
     args = [arg.transpose(..., *(key for key in keys if key in arg.sizes)) for arg in args]  # noqa: E501
+    dependent = args[-1]
     if name := defaults.pop('name', None):
-        args[-1].name = name
+        dependent.name = name
     if long := defaults.pop('long_name', None):
-        args[-1].attrs['long_name'] = long
+        dependent.attrs['long_name'] = long
     if short := defaults.pop('short_name', None):
-        args[-1].attrs['short_name'] = short
+        dependent.attrs['short_name'] = short
     if verbose:
         masks = [(~arg.isnull()).any(arg.sizes.keys() - {'facets'}) for arg in args]
         valid = invalid = ''
@@ -808,7 +825,7 @@ def apply_method(*datas, method=None, verbose=False, invert=None, pctile=None, s
     return args, method, defaults
 
 
-def apply_reduce(data, attrs=None, **kwargs):
+def reduce_general(data, attrs=None, **kwargs):
     """
     Carry out arbitrary reduction of the given dataset variables.
 
@@ -830,12 +847,12 @@ def apply_reduce(data, attrs=None, **kwargs):
     # TODO: In future will add 'institute' MultiIndex level (see also results.py).
     # Should replace parsers with a function that does basic project and institute
     # selections (note e.g. 'cmip65' is already an institute-based selection so should
-    # be in same function anyway), then modify _method_single() and _method_double()
+    # be in same function anyway), then modify _reduce_single() and _reduce_double()
     # to support either insitute-averaging preceding the facet operations or using
     # weights .groupby(grouper) + 1 / xr.ones_like(facets).groupby(grouper).sum(). Both
-    # will need 'groupers' e.g. a facets array minus the model level. Could use simliar
-    # method to get ensemble average across individual model versions (similar to
-    # other papers e.g. Caldwell or Brient maybe that used multiple versions?)
+    # will need 'groupers' e.g. a facets array without the model level. Could use
+    # simliar method to get ensemble average across individual model versions (similar
+    # to other papers e.g. Caldwell or Brient maybe that used multiple versions?)
     institute = kwargs.pop('institute', None)  # apply after end
     project = kwargs.pop('project', None)  # apply after end
     facets = data.indexes.get('facets', pd.Index([]))
@@ -882,7 +899,7 @@ def apply_reduce(data, attrs=None, **kwargs):
     # selections in automatically-generated labels if user explicitly passed them.
     # WARNING: Sometimes multi-index reductions can eliminate previously valid
     # coords, so critical to iterate one-by-one and validate selections each time.
-    spatial_ignore = ('area', 'spatial', 'start', 'stop', 'experiment')
+    kwargs.setdefault('time', 'avg')
     order = list(ORDER_LOGICAL)
     sorter = lambda item: order.index(item[0]) if item[0] in order else len(order)  # noqa: U101, E501
     result = []
@@ -891,25 +908,38 @@ def apply_reduce(data, attrs=None, **kwargs):
     else:
         datas = (data,)
     for data in datas:
-        # Apply default values and possible overrides
-        # NOTE: None is automatically replaced with default values (e.g. period=None)
-        # and default experiment depends on whether this is feedback variable or not.
+        # Generate default values
+        # NOTE: If single style is present for source 'eraint' then select it, or
+        # if both 'monthly' and 'annual' are present then will select former for
+        # unperturbed feedbacks and latter for perturbed feedbacks.
         kw = kwargs.copy()
         name = data.name
         attrs = data.attrs.copy()
         attrs.update(attrs or {})
         defaults = DEFAULTS_GENERAL.copy()
-        sources = ('zelinka', 'forster', 'geoffroy')  # ignored feedback sources
+        source = kwargs.get('source', None) or 'eraint'
+        externals = ('zelinka', 'forster', 'geoffroy')  # ignored feedback sources
+        experiment = kw.get('experiment', None) or 'abrupt4xco2'
         if 'version' in data.coords:
             defaults.update(DEFAULTS_VERSION)
-        if data.sizes.get('version', 0) > 1:  # skip _derive_data
-            values = zip(data.source.values, data.style.values)
-            styles = {style for source, style in values if source not in sources}
-            if len(styles) > 1:  # prefer 'annual' as result of pop() below
-                styles = [style for style in ('monthly', 'annual') if style in styles]
-            if len(styles) > 0:
+        if source not in externals and data.sizes.get('version', 0) > 1:
+            styles = {
+                style for source, style in zip(data.source.values, data.style.values)
+                if style in ('monthly', 'annual') and source not in externals
+            }
+            if not styles:
+                pass  # e.g. only outdated 'slope' style
+            elif len(styles) == 1:
                 defaults['style'] = styles.pop()
-        for dim, value in defaults.items():  # apply default reductions
+            elif experiment == 'picontrol':
+                defaults['style'] = 'monthly'
+            else:
+                defaults['style'] = 'annual'
+
+        # Apply default values
+        # NOTE: None is automatically replaced with default values (e.g. period=None)
+        # except for time=None used as placeholder to prevent time averaging.
+        for dim, value in defaults.items():
             if 'startstop' in kw:  # inside loop for aesthetics only
                 kw['start'], kw['stop'] = kw.pop('startstop')
             if dim in kw and kw[dim] is None and dim != 'time':
@@ -930,12 +960,13 @@ def apply_reduce(data, attrs=None, **kwargs):
         # Iterate over reductions
         # NOTE: This silently skips dummy selections (e.g. area=None) that may be needed
         # to prevent _parse_specs from merging e.g. average and non-average selections.
+        names_spatial = ('area', 'spatial', 'start', 'stop', 'experiment')
+        names_indexers = (*data.sizes, 'area', 'volume', 'spatial', 'month', 'season')
+        names_indexers += tuple(level for idx in data.indexes.values() for level in idx.names)  # noqa: E501
         for dim, value in sorted(kw.items(), key=sorter):
-            opts = [*data.sizes, 'area', 'volume', 'spatial']
-            opts.extend(level for idx in data.indexes.values() for level in idx.names)
-            if dim not in opts or value is None:
+            if dim not in names_indexers or value is None:
                 continue
-            if dim in spatial_ignore and kw.get('spatial', None) is not None:
+            if dim in names_spatial and kw.get('spatial', None) is not None:
                 continue
             if dim == 'area' and not data.sizes.keys() & {'lon', 'lat'}:
                 continue
@@ -945,10 +976,10 @@ def apply_reduce(data, attrs=None, **kwargs):
                 data, value = data.climo.truncate(AREA_REGIONS[value]), 'avg'
             if dim in ('time', 'month', 'season'):  # TODO: use 'cell_duration'?
                 data = _reduce_time(data, **{dim: value})
-                continue
-            if dim in data.coords and not isinstance(value, (str, tuple)):
-                value = ureg.Quantity(value, data.coords[dim].climo.units)
-            data = data.climo.reduce({dim: value}, method='interp').squeeze()
+            else:  # reduce non-time coordinate
+                if dim in data.coords and not isinstance(value, (str, tuple)):
+                    value = ureg.Quantity(value, data.coords[dim].climo.units)
+                data = data.climo.reduce({dim: value}, method='interp').squeeze()
             if dim not in data.coords:
                 data.coords[dim] = xr.DataArray(value).climo.dequantify()
         data.name = name  # TODO: check if necessary?
@@ -956,10 +987,13 @@ def apply_reduce(data, attrs=None, **kwargs):
         result.append(data)
 
     # Re-combine and return
+    # NOTE: Dropping then restoring the project below both simplifies annotations
+    # in generate_plot() and permits alignment of linear operations along institutes
+    # from different projects in reduce_general().
     # NOTE: Faster to delay institute averaging until after selections. Only concern
     # is if 'reduce' methods were non-linear but current processing workflow with
     # _find_data() and _derive_data() already presumes linearity. Non-linear
-    # operations only used *after* this step in _method_single() and _method_double().
+    # operations only used *after* this step in _reduce_single() and _reduce_double().
     # height = height.groupby(institute).mean(skipna=False, keep_attrs=True)
     if is_dataset:
         data = xr.Dataset({data.name: data for data in result})
@@ -971,6 +1005,8 @@ def apply_reduce(data, attrs=None, **kwargs):
     names = data.indexes['facets'].names if 'facets' in data.sizes else ()
     facets_name = data.facets.attrs.get('long_name') if 'facets' in data.sizes else None
     if 'project' in names and len(set(data.project.values)) == 1:
+        project = data.project.values[0]
         data = data.reset_index('project', drop=True)
+        data.coords['project'] = project
     data = _restore_index(data, facets_name=facets_name)
     return data

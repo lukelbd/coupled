@@ -12,7 +12,7 @@ import proplot as pplt
 from climopy import ureg, vreg  # noqa: F401
 from icecream import ic  # noqa: F401
 
-from .results import ALIAS_FEEDBACKS, FEEDBACK_ALIASES
+from .results import ALIAS_FEEDBACKS, FEEDBACK_ALIASES, FACETS_LEVELS, VERSION_LEVELS
 
 __all__ = ['get_path', 'get_label', 'get_labels', 'parse_spec', 'parse_specs']
 
@@ -73,7 +73,7 @@ KEYS_GRIDSPEC = (
 KEYS_OTHER = (
     'cycle', 'horizontal', 'offset', 'intersect', 'correlation',  # _combine
     'zeros', 'oneone', 'linefit', 'annotate', 'constraint', 'graphical',  # _scatter
-    'transpose', 'multicolor', 'pcolor', 'area',  # _auto_props
+    'transpose', 'autocolor', 'pcolor', 'area',  # _auto_props
 )
 KEYS_ATTRIBUTES = ('short_name', 'long_name', 'standard_name', 'units')
 KEYS_COLORBAR = ('locator', 'formatter', 'tick', 'minor', 'extend', 'length', 'shrink')
@@ -831,9 +831,13 @@ def parse_spec(dataset, spec, **kwargs):
           * ``attrs``: Added to `.attrs` for use in resulting plot labels.
           * ``other``: Custom keyword arguments for plotting options.
     """
+    # WARNING: Critical to always parse facet and version levels since figures.py will
+    # auto apply these coordinates even if not present e.g. for bootstrap datasets. Then
+    # have process.py ignore them when version is not present.
     # NOTE: For subsequent processing we put the variables being combined (usually one)
     # inside kw_process 'name' key. This helps when merging variable specifications
     # between row and column specs and between tuple-style specs (see parse_specs).
+    # detect_process.extend(name for idx in dataset.indexes.values() for name in idx.names)  # noqa: E501
     if spec is None:
         name, kw = None, {}
     elif isinstance(spec, str):
@@ -849,9 +853,9 @@ def parse_spec(dataset, spec, **kwargs):
     kw_command, kw_other, kw_attrs = {}, {}, {}
     kw_colorbar, kw_legend, kw_process = {}, {}, {}
     detect_process = list(dataset.sizes)
-    detect_process.extend(name for idx in dataset.indexes.values() for name in idx.names)  # noqa: E501
     detect_process.extend(('area', 'volume', 'spatial', 'institute'))
-    detect_process.extend((*KEYS_VARIABLE, *KEYS_REDUCE))  # noqa: E501
+    detect_process.extend((*FACETS_LEVELS, *VERSION_LEVELS))  # even if not present
+    detect_process.extend((*KEYS_VARIABLE, *KEYS_REDUCE))
     for key, value in kw.items():  # NOTE: sorting performed in _parse_labels
         if key in detect_process:
             kw_process[key] = value  # e.g. for averaging
@@ -865,13 +869,13 @@ def parse_spec(dataset, spec, **kwargs):
             kw_other[key] = value
         elif any(key.startswith(prefix) for prefix in KEYS_ATTRIBUTES):
             kw_attrs[key] = value
+        elif any(key.startswith(prefix) for prefix in KEYS_GUIDE):
+            kw_colorbar[key] = kw_legend[key] = value
         elif any(key.startswith(prefix) for prefix in ('colorbar', *KEYS_COLORBAR)):
             kw_colorbar[key] = value
         elif any(key.startswith(prefix) for prefix in ('legend', *KEYS_LEGEND)):
             kw_legend[key] = value
-        elif any(key.startswith(prefix) for prefix in KEYS_GUIDE):
-            kw_colorbar[key] = kw_legend[key] = value  # shared keywords
-        else:  # arbitrary plotting keywords
+        else:  # pass to plotting command by default
             kw_command[key] = value
     if name is not None:  # string or correlation tuple
         kw_process['name'] = name

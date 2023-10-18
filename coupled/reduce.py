@@ -7,7 +7,7 @@ import climopy as climo  # noqa: F401
 import numpy as np
 import pandas as pd
 import xarray as xr
-from climopy.var import _get_bounds, linefit
+from climopy.var import _dist_bounds, linefit
 from climopy import ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
@@ -128,9 +128,6 @@ def _components_corr(data0, data1, dim=None, pctile=None):
     # See: https://en.wikipedia.org/wiki/Pearson_correlation_coefficient#Standard_error
     dim = dim or data0.dims[0]
     data0, data1 = xr.align(data0, data1)
-    pctile = np.atleast_1d(95 if pctile is None else pctile)
-    pctile = 0.5 * (100 - pctile)  # e.g. [90, 50] --> [[5, 25], [95, 75]]
-    pctile = np.array([pctile, 100 - pctile])
     anom0 = data0 - data0.mean(dim)
     anom1 = data1 - data1.mean(dim)
     std0 = np.sqrt((anom0 ** 2).sum(dim))
@@ -140,7 +137,9 @@ def _components_corr(data0, data1, dim=None, pctile=None):
     rsquare = corr ** 2  # variance explained == correlation squared
     sigma = np.sqrt((1 - corr ** 2) / (ndim - 2))  # standard error
     t = corr * np.sqrt((ndim - 2) / (1 - corr ** 2))  # t-statistic
-    dt_lower, dt_upper = _get_bounds(sigma, pctile, dof=data0.size - 2)
+    pctile = np.atleast_1d(95 if pctile is None or pctile is True else pctile)
+    pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])  # see _dist_bounds
+    dt_lower, dt_upper = _dist_bounds(sigma, pctile, dof=data0.size - 2)
     dt_lower = xr.DataArray(dt_lower, dims=('pctile', *sigma.dims))
     dt_upper = xr.DataArray(dt_upper, dims=('pctile', *sigma.dims))
     t_lower, t_upper = t + dt_lower, t + dt_upper
@@ -236,14 +235,16 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     fit, fit_lower, fit_upper : xarray.DataArray
         The fit to the original points with `pctile` lower and upper bounds.
     """
+    # TODO: Change slope function to interpret e.g. pctile=90 as 90% range instead
+    # of threshold. Then check timescales project and elsewhere to ensure compatibility
     # NOTE: Here np.polyfit requires monotonically increasing coordinates. Not sure
     # why... could consider switching to manual slope and stderr calculation.
     # NOTE: Unlike climopy linefit(), which returns scalar slope standard error and
     # best fit uncertainty range with *optional* percentile dimension, this returns
     # slope estimate uncertainty range with *mandatory* percentile dimension and
     # a single best fit uncertainy range. In this project require former for thin and
-    # thick whiskers on _combine_command() bar plots while a single best fit range
-    # is sufficient for most scatter and regression plots. Should merge with linefit().
+    # thick whiskers on _merge_dists() bar plots while a single best fit range is
+    # sufficient for most scatter and regression plots. Should merge with linefit().
     dim = dim or data0.dims[0]
     data0, data1 = xr.align(data0, data1)
     axis = data0.dims.index(dim)
@@ -258,11 +259,10 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     fit_upper.coords.update(coords)
     if pctile is False:  # use standard errors
         slope_lower, slope_upper = slope - sigma, slope + sigma
-    else:
-        pctile = 95 if pctile is None or pctile is True else pctile
-        pctile = 0.5 * (100 - np.atleast_1d(pctile))  # e.g. [90, 50] -> [5, 25]
-        pctile = np.array([pctile, 100 - pctile])  # e.g. [5, 25] -> [[5, 25], [95, 75]]
-        sigma_lower, sigma_upper = _get_bounds(sigma, pctile, dof=data0.size - 2)
+    else:  # see _dist_bounds
+        pctile = np.atleast_1d(95 if pctile is None or pctile is True else pctile)
+        pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])  # pctile dimension
+        sigma_lower, sigma_upper = _dist_bounds(sigma, pctile, dof=data0.size - 2)
         slope_lower = slope + xr.DataArray(sigma_lower, dims=('pctile', *sigma.dims))
         slope_upper = slope + xr.DataArray(sigma_upper, dims=('pctile', *sigma.dims))
     return slope, slope_lower, slope_upper, rsquare, fit, fit_lower, fit_upper
@@ -275,7 +275,7 @@ def _parse_project(facets, project=None):
     Parameters
     ----------
     facets : numpy.ndarray
-        The facets. Used to search for models from the same institute in other projects.
+        The facets. Used to scarch for models from the same institute in other projects.
     project : str, default: 'cmip'
         The selection. Values should start with ``'cmip'``. No integer ending indicates
         all cmip5 and cmip6 models, ``5`` (``6``) indicates just cmip5 (cmip6) models,
@@ -764,9 +764,9 @@ def reduce_facets(
     args : tuple
         The output plotting arrays.
     method : str
-        The resulting method used.
-    kwargs : dict
-        The plotting and `_infer_command` keyword arguments.
+        The method used to reduce the data.
+    defaults : dict
+        The default plotting arguments.
     """
     # Apply single or double reduction methods
     # NOTE: This supports on-the-fly anomalies and normalization. Should eventually
@@ -922,7 +922,9 @@ def reduce_general(data, attrs=None, **kwargs):
         experiment = kw.get('experiment', None) or 'abrupt4xco2'
         if 'version' in data.coords:
             defaults.update(DEFAULTS_VERSION)
-        if source not in externals and data.sizes.get('version', 0) > 1:
+        if 'version' not in data.coords:
+            kw = {key: value for key, value in kw.items() if key not in VERSION_LEVELS and key != 'startstop'}  # noqa: E501
+        if source not in externals and data.sizes.get('version', 1) > 1:
             styles = {
                 style for source, style in zip(data.source.values, data.style.values)
                 if style in ('monthly', 'annual') and source not in externals

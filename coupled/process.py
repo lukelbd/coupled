@@ -10,7 +10,7 @@ import warnings
 import climopy as climo  # noqa: F401
 import numpy as np
 import xarray as xr
-from climopy.var import _get_bounds, linefit
+from climopy.var import _dist_bounds, linefit
 from climopy import ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
@@ -25,38 +25,41 @@ from cmip_data.feedbacks import FEEDBACK_DEPENDENCIES
 __all__ = ['get_data', 'process_data']
 
 
+# Model-estimated bootstrapped feedback uncertainty
+# NOTE: See templates.py _calc_bootstrap for calculation details
+# TODO: Record degrees of freedom and autocorrelation across successive bootstrap
+# feedback estimates (e.g. year 0-20 estimate will be related to year 5-25). For now
+# just assume implied distribution is Gaussian in _constrain_data() below.
+BOOTSTRAP_SPREAD = {
+    'net': {20: None, 40: None, 60: None},
+    'sw': {20: None, 40: None, 60: None},
+    'lw': {20: None, 40: None, 60: None},
+    'cre': {20: None, 40: None, 60: None},
+    'swcre': {20: None, 40: None, 60: None},
+    'lwcre': {20: None, 40: None, 60: None},
+}
+
 # Observational constraint mean and spreads
 # TODO: Auto-generate this dictionary or save and commit then parse a text file.
 # NOTE: These show best estimate, standard errors, and degrees of freedom for feedback
-# regression slopes using either GISTEMP4 or HadCRUT5. See observed.ipynb notebook.
+# regression slopes using either GISTEMP4 or HadCRUT5 and using surface temp autocorr
+# adjustment (consistent with Dessler et al.). See observed.ipynb notebook.
 FEEDBACK_CONSTRAINTS = {
     # 'cld': (0.69, (1.04 - 0.31) / 2,  # He et al. with 95% uncertainty
-    # 'cld': (0.68, 0.18, 226),  # custom trended estimate
-    'cld': (0.35, 0.26, 226),  # custom detrended estimate
-    'net': (-0.84, 0.29, 274),
-    'sw': (0.86, 0.24, 274),
-    'lw': (-1.70, 0.19, 274),
-    'cre': (0.27, 0.23, 274),
-    'swcre': (0.19, 0.24, 274),
-    'lwcre': (0.08, 0.13, 274),
-    # 'net': (-0.84, 0.31, 249),  # correlation-adjusted error
-    # 'sw': (0.86, 0.25, 242),
-    # 'lw': (-1.70, 0.19, 274),
-    # 'cre': (0.27, 0.23, 274),
-    # 'swcre': (0.19, 0.24, 274),
-    # 'lwcre': (0.08, 0.15, 232),
-    'hadnet': (-0.84, 0.31, 274),
-    'hadsw': (0.88, 0.25, 274),
-    'hadlw': (-1.72, 0.21, 274),
-    'hadcre': (0.30, 0.24, 274),
-    'hadswcre': (0.15, 0.26, 274),
-    'hadlwcre': (0.15, 0.14, 274),
-    # 'hadnet': (-0.84, 0.31, 274),  # correlation-adjusted error
-    # 'hadsw': (0.88, 0.25, 274),
-    # 'hadlw': (-1.72, 0.21, 274),
-    # 'hadcre': (0.30, 0.24, 274),
-    # 'hadswcre': (0.15, 0.26, 274),
-    # 'hadlwcre': (0.15, 0.14, 274),
+    # 'cld': (0.68, 0.18, 97),  # He et al. trended estimate (total record is 226)
+    'cld': (0.35, 0.25, 108),  # He et al. detrended estimate (total record is 226)
+    'net': (-0.85, 0.29, 166),  # custom estimates (total record is 274)
+    'sw': (0.86, 0.24, 175),
+    'lw': (-1.71, 0.19, 129),
+    'cre': (0.27, 0.23, 131),
+    'swcre': (0.19, 0.24, 140),
+    'lwcre': (0.08, 0.13, 184),
+    'hadnet': (-0.84, 0.31, 166),
+    'hadsw': (0.89, 0.26, 175),
+    'hadlw': (-1.73, 0.21, 129),
+    'hadcre': (0.30, 0.24, 131),
+    'hadswcre': (0.15, 0.26, 140),
+    'hadlwcre': (0.15, 0.14, 184),
 }
 
 # Variable dependencies
@@ -80,8 +83,8 @@ VARIABLE_DEPENDENCIES = {
     'ta_diff': ('ta', 'lset', 'dset'),
 }
 
-# Define additional variables
-# TODO: Use this approach for flux addition terms and other stuff
+# Variable derivations
+# NOTE: See timescales definitions.py (eventually will be copied to climopy)
 def equator_pole_delta(self, name):  # noqa: E302
     temp, _ = name.split('_')
     temp = self[temp]  # also quantifies
@@ -97,8 +100,10 @@ def equator_pole_diffusivity(self, name):  # noqa: E302
     transport = self['lset'] + self['dset']  # moist not directly available
     transport = transport.sel(lat=slice(0, 90)).climo.average('area')
     return transport / delta
+
+# Declare variables
+# TODO: Use this approach for flux addition terms and other stuff
 with warnings.catch_warnings():  # noqa: E305
-    # Add definitions
     warnings.simplefilter('ignore')
     vreg.define('ta_grad', 'equator-pole air temperature difference', 'K')
     vreg.define('ts_grad', 'equator-pole surface temperature difference', 'K')
@@ -109,7 +114,7 @@ with warnings.catch_warnings():  # noqa: E305
 
 
 def _constrain_data(
-    data0, data1, constraint=None, pctile=None, N=None, graphical=False
+    data0, data1, constraint=None, pctile=None, N=None, bootstrap=None, graphical=False
 ):
     """
     Return percentile bounds for observational constraint.
@@ -120,14 +125,16 @@ def _constrain_data(
         The predictor data. Must be 1D.
     data1 : xarray.DataArray
         The predictand data. Must be 1D.
-    constraint : 2-tuple, default: (0.32, 1.06)
+    constraint : str or 2-tuple,
         The 95% bounds on the observational constraint.
     pctile : float, default: 95
         The emergent constraint percentile bounds to be returned.
     N : int, default: 100000
         The number of bootstrapped samples to carry out.
+    bootstrap : bool or int, optional
+        Whether to include model bootstrap-estimated observed uncertainty.
     graphical : bool, optional
-        Whether to use graphical intersections instead of bootstrapping.
+        Whether to use graphical intersections instead of residual bootstrapping.
 
     Returns
     -------
@@ -147,47 +154,51 @@ def _constrain_data(
     # their sample sizes are larger (150 years) and uncertainties are unc-rrelated so
     # should roughly cancel out across e.g. 30 members of ensemble.
     N = N or 10000  # samples to draw
-    pctile = 90 if pctile is None else pctile
-    pctile = 0.5 * (100 - pctile)  # e.g. [90, 50] --> [[5, 25], [95, 75]]
-    pctile = np.array([pctile, 100 - pctile])
+    pctile = 90 if pctile is None or pctile is True else pctile
+    pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
+    kwargs = dict(pctile=pctile, adjust=False)  # no correlation across ensembles
     if isinstance(constraint, str):
-        constraint = FEEDBACK_ALIASES.get(constraint, constraint)
-    elif not np.iterable(constraint) or len(constraint) != 3:
-        raise ValueError(f'Invalid constraint {constraint}. Must be length 2.')
+        constraint = FEEDBACK_CONSTRAINTS[FEEDBACK_ALIASES.get(constraint, constraint)]
+    if not np.iterable(constraint) or len(constraint) != 3:
+        raise ValueError(f'Invalid constraint {constraint}. Must be (mean, sigma, dof).')  # noqa: E501
     if data0.ndim != 1 or data1.ndim != 1:
         raise ValueError(f'Invalid data dims {data0.ndim} and {data1.ndim}. Must be 1D.')  # noqa: E501
-    xmean, xscale, xdof = FEEDBACK_CONSTRAINTS[constraint]
-    xmin, xmax = stats.t.ppf(0.01 * pctile, loc=xmean, scale=xscale, df=xdof)
-    observations = (xmin, xmean, xmax)
+    xmean, xscale, xdof = constraint  # note dof will have small effect
+    xmin, xmax = stats.t(df=xdof, loc=xmean, scale=xscale).ppf(0.01 * pctile)
+    nbounds = 1 if bootstrap is False else 2  # number of bounds returned
+    observations = np.array([xmin, xmean, xmax])
+    if bootstrap is not False:  # e.g. True or None
+        bootstrap = 20 if bootstrap is True else bootstrap
+        escale = BOOTSTRAP_SPREAD[constraint][bootstrap or 20]
+        xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
+        es = stats.norm(loc=0, scale=escale).rvs(N)  # implied variability error
+        observations = np.insert(np.percentile(xs + es, pctile), 1, observations)
     data0 = np.array(data0).squeeze()
     data1 = np.array(data1).squeeze()
     idxs = np.argsort(data0, axis=0)
     data0, data1 = data0[idxs], data1[idxs]  # required for graphical error
     mean0, mean1 = data0.mean(), data1.mean()
-    bmean, berror, _, fit, fit_lower, fit_upper = linefit(
-        data0, data1, adjust=False, pctile=pctile
-    )
+    bmean, berror, _, fit, fit_lower, fit_upper = linefit(data0, data1, **kwargs)
     if graphical:  # intersection of shaded regions
         fit_lower = fit_lower.squeeze()
         fit_upper = fit_upper.squeeze()
         xs = np.sort(data0, axis=0)  # linefit returns result for sorted data
-        ymin = np.interp(xmin, xs, fit_lower)
-        ymax = np.interp(xmax, xs, fit_upper)
         ymean = mean1 + bmean.item() * (xmean - mean0)
-        constrained = (ymin, ymean, ymax)
-        ymin, ymean, ymax = mean1 + bmean * (np.array(observations) - mean0)
-        alternative = (ymin, ymean, ymax)  # no regression uncertainty
+        ymins = np.interp(observations[:nbounds], xs, fit_lower)
+        ymaxs = np.interp(observations[-nbounds:], xs, fit_upper)
+        constrained = (*ymins, ymean, *ymaxs)
+        alternative = mean1 + bmean * (observations - mean0)
     else:  # bootstrapped residual addition
         # amean = mean1 - mean0 * bmean  # see wiki page
         # aerror = berror * np.sqrt(np.sum(data0 ** 2) / data0.size)  # see wiki page
-        # bs_ = stats.t.rvs(data0.size - 2, loc=bmean, scale=berror, size=N)
-        # as_ = stats.t.rvs(data0.size - 2, loc=amean, scale=aerror, size=N)
+        # bs_ = stats.t(loc=bmean, scale=berror, df=data0.size - 2).rvs(N)
+        # as_ = stats.t(loc=amean, scale=aerror, df=data0.size - 2).rvs(N)
         # ys = err + as_ + bs_ * xs  # include both uncertainties
         # ys = mean1 + bs_ * (xs - mean0)  # include slope uncertainty only
         rscale = np.std(data1 - fit, ddof=1)  # model residual sigma
         rdof = data0.size - 2  # inter-model regression dof
-        xs = stats.t.rvs(xdof, loc=xmean, scale=xscale, size=N)  # observations
-        rs = stats.t.rvs(rdof, loc=0, scale=rscale, size=N)  # regression
+        xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)  # observations
+        rs = stats.t(df=rdof, loc=0, scale=rscale).rvs(N)  # regression
         ys = rs + mean1 + bmean * (xs - mean0)
         constrained = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
         ys = mean1 + bmean * (xs - mean0)  # no regression uncertainty
@@ -540,8 +551,8 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
         The output plotting arrays.
     method : str
         The method used to reduce the data.
-    kwargs : dict
-        The plotting and `_infer_command` keyword arguments.
+    defaults : dict
+        The default plotting arguments.
     """
     # Split instructions along operators
     # NOTE: Initial kw_red values are formatted as (('[+-]', value), ...) to
@@ -631,7 +642,7 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
     # to late+early (i.e. average) so try to use sign from non-control experiment.
     print('.', end='')
     warming = ('tpat', 'tdev', 'tstd', 'tabs', 'rfnt_ecs')
-    kwargs = {}
+    defaults = {}  # default plotting arguments
     datas_persum = []  # each item part of a summation
     methods_persum = set()
     kws_data = _expand_lists(*kws_data)
@@ -656,7 +667,7 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
             exps.append(experiment)
         datas, method, default = reduce_facets(*datas, **kw_reduce)
         for key, value in default.items():
-            kwargs.setdefault(key, value)
+            defaults.setdefault(key, value)
         if len(datas) == 1:  # e.g. regression applied
             idxs = tuple(i for i, exp in enumerate(exps) if i != 'picontrol')
             signs = (signs[idxs[-1] if idxs else -1],)  # WARNING: see _group_parts
@@ -697,20 +708,20 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
             suffix = 'anomaly' if suffix is True else suffix
             arg.attrs['short_suffix'] = arg.attrs['long_suffix'] = suffix
         if 'sigma' in datas[0].dims:  # see _apply_single and _apply_double
-            dof = kwargs.pop('dof', None)
+            dof = defaults.pop('dof', None)
             sigma = sum(data.isel(sigma=1) for data in datas) ** 0.5
             for which in ('shade', 'fade'):
-                pctile = kwargs.pop(f'{which}pctiles', None)
-                std = kwargs.pop(f'{which}stds', None)
-                if pctile is not None:
-                    bounds = _get_bounds(sigma, 100 - pctile, dof=dof)
+                pctile = defaults.pop(f'{which}pctiles', None)
+                std = defaults.pop(f'{which}stds', None)
+                if pctile is not None:  # should be scalar
+                    bounds = _dist_bounds(sigma, pctile, dof=dof)
                 elif std is not None:
                     bounds = (-std * sigma, std * sigma)
                 else:
                     continue
                 bounds = (arg + bounds[0], arg + bounds[1])
                 bounds = xr.concat(bounds, dim='bounds')
-                kwargs[f'{which}data'] = bounds.transpose('bounds', ...).values
+                defaults[f'{which}data'] = bounds.transpose('bounds', ...).values
         args.append(arg)
 
     # Align and restore coordinates
@@ -753,4 +764,4 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
             for key, value in kw_input.items():  # e.g. regress lat on feedback map
                 if key not in arg.sizes:
                     arg.coords[key] = value
-    return args, method, kwargs
+    return args, method, defaults

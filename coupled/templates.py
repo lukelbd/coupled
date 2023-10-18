@@ -8,12 +8,15 @@ from pathlib import Path
 import climopy as climo  # noqa: F401
 import numpy as np
 import xarray as xr
+from climopy.var import _dist_bounds
 from climopy import ureg, vreg  # noqa: F401
-from coupled import plotting, _warn_coupled
 from icecream import ic  # noqa: F401
 
 from .plotting import CYCLE_DEFAULT
+from .plotting import generate_plot
+from .process import get_data
 from .results import ALIAS_FEEDBACKS
+from . import _warn_coupled
 
 __all__ = [
     'divide_specs',
@@ -48,7 +51,7 @@ KEYS_PLOT = (
     'method', 'pctile', 'std', 'normalize', 'hemisphere', 'hemi',
     'name', 'period', 'spatial', 'volume', 'area', 'plev', 'lat', 'lon',
     'project', 'institute', 'experiment', 'ensemble', 'model', 'base',  # TODO: remove
-    'source', 'style', 'region', 'start', 'stop',
+    'source', 'style', 'region', 'start', 'stop', 'dist', 'count',  # TODO: monitor
     'alpha', 'edgecolor', 'linewidth', 'linestyle', 'color', 'facecolor',
     'xmin', 'xmax', 'ymin', 'ymax', 'xlabel', 'ylabel',
     'vmin', 'vmax', 'cmap', 'cmap_kw', 'norm', 'norm_kw', 'robust', 'extend', 'extendsize',  # noqa: E501
@@ -122,85 +125,195 @@ SPECS_FEEDBACK = {
 }
 
 
-def _adjust_warming(dataset, source='~/scratch/cmip-processed'):
+def _find_data(
+    source, variable, model, experiment, project=None, annual=True, average=True, fluxes=None,  # noqa: E501
+):
     """
-    Update with ad hoc scaled warming projection terms. In future should
-    be stored in feedback files with regression warming patterns.
+    Return dataset for particular model and experiment.
+
+    Parameters
+    ----------
+    source : path-like
+        The source directory.
+    variable, model, experiment : str
+        The variable model and experiment.
+    project : str, optional
+        The project folder to search.
+    annual : bool, optional
+        Whether to return annual average.
+    average : bool, optional
+        Whether to return global average.
+    fluxes : sequence, optional
+        The variables to preserve for flux files.
+
+    Returns
+    -------
+    data : xarray.Dataset or xarray.DataArray
+        The resulting data.
+    """
+    # NOTE: This is used both in below _calc_warming and _calc_bootstrap and
+    # in figures.py function for plotting Gregory regressions of model fluxes.
+    from cmip_data.utils import average_periods
+    source = Path(source).expanduser()
+    project = project or '*'  # search either folder
+    fluxes = fluxes or ('rlnt', 'rlntcs', 'rsnt', 'rsntcs', 'ts')
+    fluxes = (fluxes,) if isinstance(fluxes, str) else tuple(fluxes)
+    patterns = {'abrupt4xco2': 'abrupt*', 'picontrol': 'pi*'}
+    pattern = patterns.get(experiment, experiment)
+    folder = '-'.join((project.lower(), experiment.lower(), 'amon'))
+    glob = f'{folder}/{variable}_Amon_{model}_{pattern}_0000-0150-eraint-series.nc'
+    paths = list(source.glob(glob))
+    if not paths:
+        _warn_coupled(f'Invalid pattern {glob!r} for path {folder}.')
+        return
+    if len(paths) > 1:
+        _warn_coupled(f'Duplicate results for pattern {glob!r} in path {folder}.')
+        return
+    data = xr.open_dataset(paths[0], use_cftime=True)
+    keys = fluxes if variable == 'fluxes' else (variable,)
+    data = data.drop(data.data_vars.keys() - set(keys))
+    if annual:
+        data = average_periods(data, seasonal=False, monthly=False)
+        data = data.sel(period='ann', drop=True)
+    if average:
+        data = data.climo.add_cell_measures()
+        data = xr.Dataset({key: data[key].climo.average('area') for key in keys})
+    return data[keys[0]] if len(keys) == 1 else data
+
+
+def _calc_bootstrap(
+    dataset, source='~/scratch/cmip-fluxes', bootstrap=None, wav=None, sky=None,
+):
+    """
+    Calculate ad hoc bootstrap feedback uncertainty.
 
     Parameters
     ----------
     dataset : xarray.Dataset
         The input dataset.
+    source : path-like, optional
+        The source directory.
+    bootstrap : bool or int, optional
+        The years to select.
+    wav, sky : str or sequence, optional
+        The wavelengths and skies to use.
 
     Returns
     -------
+    result : xarray.Dataset
+        The resulting terms.
+    """
+    # NOTE: Use standard deviation instead of percentiles for consistency with
+    # NOTE: This is used both to return global average time series for use with
+    # plot_feedback() and to actually calculate results for storing on dataset.
+    from constraints.observed import calc_feedback
+    skies = sky or ('', 'cs', 'ce')
+    skies = (skies,) if isinstance(skies, str) else tuple(skies)
+    wavs = wav or ('f', 'l', 's')
+    wavs = (wavs,) if isinstance(wavs, str) else tuple(wavs)
+    names = tuple(f'r{wav}nt{sky}_lam' for wav, sky in itertools.product(wavs, skies))
+    bootstraps = np.atleast_1d(bootstrap or 20)  # number of bootstrap years
+    count = xr.DataArray(bootstraps, dims='count')
+    dist = xr.DataArray(['mean', 'sigma', 'spread'], dims='dist')
+    base = dataset.rlnt_lam.isel(lon=0, lat=0, version=0, drop=True)
+    base = base.expand_dims(dist=dist, count=count)
+    base.attrs.clear()
+    base.coords['count'].attrs.update(units='years')
+    result = xr.Dataset({name: xr.full_like(base, np.nan) for name in names})
+    print('Getting bootstrap results.')
+    print('Model:', end=' ')
+    for project, model, experiment, ensemble in dataset.facets.values:
+        if ensemble != 'flagship' or experiment != 'picontrol':
+            continue
+        facets = (project, model, experiment, ensemble)
+        data = _find_data(source, 'fluxes', model, experiment, project=project, annual=False)  # noqa: E501
+        if data is None:
+            continue
+        pctile = 90  # use same as process.py _constrain_data
+        attrs = ('units', 'short_name', 'long_name')  # attribute to infer
+        month = data.time.dt.strftime('%b').values[0]
+        data = data.rename(ts='ts_gis')  # then passed to observed utils
+        print(f'{model}_{month} (', end=' ')
+        for wav, sky, bootstrap in itertools.product(wavs, skies, bootstraps):
+            kw = dict(wav=wav, sky=sky, bootstrap=bootstrap, pctile=False, detrend=True)
+            lam, lam_lower, lam_upper, *_ = calc_feedback(data, **kw)
+            sigma = 0.5 * (lam_upper - lam_lower)  # pctile=False returns +/- one sigma
+            lam_lower, lam_upper = _dist_bounds(sigma, pctile=pctile)
+            spread = lam_upper - lam_lower  # interval assuming gaussian distribution
+            print(f'{spread.item():.2f}', end=' ')
+            name = f'r{wav}nt{sky}_lam'  # standardized name
+            attrs = {attr: get_data(dataset, name, attr) for attr in attrs}
+            attrs['units'] = climo.encode_units(attrs['units'])
+            result[name].attrs.update(attrs)
+            index = {'facets': facets, 'count': bootstrap}
+            result[name].loc[{**index, 'dist': 'mean'}] = lam
+            result[name].loc[{**index, 'dist': 'sigma'}] = sigma
+            result[name].loc[{**index, 'dist': 'spread'}] = spread
+        print(')', end=' ')
+    return result
+
+
+def _calc_warming(dataset, source='~/scratch/cmip-processed'):
+    """
+    Calculate ad hoc scaled warming projection terms.
+
+    Parameters
+    ----------
     dataset : xarray.Dataset
-        The updated dataset.
+        The input dataset.
+    source : path-like, optional
+        The source directory.
+
+    Returns
+    -------
+    result : xarray.Dataset
+        The resulting terms.
     """
     # NOTE: Tried scaling with feedback to get 'absolute' climate sensitivity implied
     # by feedback but unperturbed can be very small! So now use vector projections.
     # tpar = (1 + dataset['tpat']) / dataset['rfnt_lam'].climo.average('area')
-    from cmip_data.utils import average_periods
-    if 'tstd' in dataset and 'tdev' not in dataset:  # added by feedback_datasets()
-        _warn_coupled("Variable 'tstd' present but 'tdev' not present.")
-    if 'tstd' in dataset:
+    if 'tstd' in dataset or 'tdev' in dataset:
         return dataset
     if 'tpat' not in dataset:
         raise ValueError('Could not find temperature pattern data.')
-    data = xr.full_like(dataset.tpat, np.nan)
-    data.data[:] = np.nan  # reset all values
+    periods = [period for _, style, _, *period in dataset.version.values if style == 'slope']  # noqa: E501
+    periods = sorted(set(map(tuple, periods)))
     attrs = dict(units='K', standard_units='K', short_name='warming', long_name='regional warming')  # noqa: E501
-    data.attrs.update(attrs)
     sel = dict(source='eraint', style='slope', region='globe')
+    data = xr.full_like(dataset.tpat, np.nan)
+    data.attrs.update(attrs)
     if 'period' in data.sizes:  # select annual
         sel['period'] = 'ann'
-    source = Path(source).expanduser()
-    periods = sorted(set(
-        (start, stop) for _, style, _, start, stop in dataset.version.values
-        if style == 'slope'
-    ))
-    print('Getting scaled temperature pattern.')
+    print('Getting scaled warming pattern.')
     print('Model:', end=' ')
-    for i, facets in enumerate(dataset.facets.values):
-        project, model, experiment, ensemble = facets
-        folder = source / f'{project.lower()}-{experiment}-amon'
+    for project, model, experiment, ensemble in dataset.facets.values:
         if ensemble != 'flagship':
             continue
-        if not folder.is_dir():
-            raise RuntimeError(f'Missing folder {folder}.')
-        files = list(folder.glob(f'ts_Amon_{model}_*_0000-0150-series.nc'))
-        if len(files) > 1:
-            print(f'Found {len(files)} files for project {project} model {model}.')
-            continue
-        if not files:  # no error
-            print(f'No files for project {project} model {model}.')
+        facets = (project, model, experiment, ensemble)
+        ranges = periods if experiment == 'abrupt4xco2' else [(0, 150)]
+        temp = _find_data(source, 'ts', model, experiment, project=project)
+        if temp is None:
             continue
         print(f'{model}_{experiment}', end=' ')
-        ranges = periods if experiment == 'abrupt4xco2' else [(0, 150)]
-        base = (project, model, 'picontrol', ensemble)  # facets selection
-        base = dataset.ts.sel(facets=base)
-        if 'period' in base.sizes:
-            base = base.sel(period='ann')
+        base = dataset.ts.sel(facets=(project, model, 'picontrol', ensemble))
+        base = base.sel({'period': 'ann'} if 'period' in base.dims else {})
         base = base.climo.add_cell_measures().climo.average('area')
-        temp = xr.open_dataset(files[0], use_cftime=True)['ts']
-        temp = average_periods(temp, seasonal=False, monthly=False)
-        temp = temp.climo.add_cell_measures().climo.average('area')
-        temp = temp.sel(period='ann', drop=True) - base  # pre-industrial anomaly
+        temp = temp - base  # pre-industrial anomaly
         for start, stop in ranges:
             if (start, stop) != (0, 150) and experiment == 'picontrol':
                 continue
-            isel = dict(facets=facets, start=start, stop=stop, **sel)
+            indexers = dict(facets=facets, start=start, stop=stop, **sel)
             scale = temp.isel(year=slice(start, stop))  # select years
             scale = np.sqrt(((scale - scale.mean('year')) ** 2).sum('year'))
-            pattern = dataset.tpat.loc[isel]  # add back global-mean warming
+            pattern = dataset.tpat.loc[indexers]  # add back global-mean warming
             print(f'{scale.item():.1f}', end=' ')
-            data.loc[isel] = scale * pattern
-    anom = data - data.climo.add_cell_measures().climo.average('area')
+            data.loc[indexers] = scale * pattern
     attrs = dict(units='K', standard_units='K', short_name='warming', long_name='relative warming')  # noqa: E501
+    base = data.climo.add_cell_measures().climo.average('area')
+    anom = data - base  # deviation from globe (now implemented in _derive_data)
     anom.attrs.update(attrs)
-    dataset['tstd'] = data
-    dataset['tdev'] = anom  # NOTE: implemented in feedback_datasets()
-    return dataset
+    result = xr.Dataset({'tstd': data, 'tdev': anom})
+    return result
 
 
 def _constraint_props(method=None):
@@ -857,7 +970,7 @@ def scalar_grid(data, forward=True, **kwargs):
             rspecs.append(ispecs or [rspec])
         for cspecs, kwargs in divide_specs('col', colspecs, **kwargs):
             # ic(rspecs, cspecs)
-            result = plotting.generate_plot(data, rspecs, cspecs, **kwargs)
+            result = generate_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results
     return result
@@ -920,7 +1033,7 @@ def pattern_rows(data, method=None, shading=True, contours=True, **kwargs):
             cspecs.append(spec)
         for cspecs, kwargs in divide_specs('col', cspecs, **kwargs):
             # ic(rspecs, cspecs)
-            result = plotting.generate_plot(data, rspecs, cspecs, **kwargs)
+            result = generate_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results
     return result
@@ -1015,7 +1128,7 @@ def constraint_rows(data, method=None, contours=True, hatching=True, **kwargs):
             cspecs.append(spec)
         for cspecs, kwargs in divide_specs('col', cspecs, **kwargs):
             # ic(rspecs, cspecs)
-            result = plotting.generate_plot(data, rspecs, cspecs, **kwargs)
+            result = generate_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results
     return result
@@ -1064,7 +1177,7 @@ def relationship_rows(data, method=None, **kwargs):
         ]
         for cspecs, kwargs in divide_specs('col', colspecs, **kwargs):
             # ic(rspecs, cspecs)
-            result = plotting.generate_plot(data, rspecs, cspecs, **kwargs)
+            result = generate_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results
     return result

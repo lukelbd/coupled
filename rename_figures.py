@@ -9,6 +9,14 @@ from pathlib import Path
 from icecream import ic  # noqa: F401
 
 # Global constants
+# NOTE: Can use the following bash code to highlight files with non-feedback
+# variables to help partition 'constraints' and 'connections' figures.
+# for dir in figures*; do
+#   mv $dir/*[-_]{cct,cl,cl[wlip],cl[wlip]vi,clt,ev,ev[lip],pr,pr[lip],\
+#   hf[ls]s,hu[rs],hu[rs]s,prw,ps,psl,r[ls][udn][tsa],r[ls][udn][tsa]cs,t[as],\
+#   tau[uv],[uv]a,[uv]as,zg,albedo,[ghdlm]se,[ghdlm]se[tfcr],c[ghdlm]se[tfcr],\
+#   ocean[tfcr],cocean[tfcr],ctotal[tfcr],total[tfcr]}[-_]*.pdf ../connections/$dir
+# done
 PART_RENAMES = {'start': 'early50', 'end': 'late50', 'pt': 'loc', 'apt': 'aloc'}
 REGION_ABBREVS = ['globe', 'hemi', 'lat', 'loc', 'aglobe', 'ahemi', 'alat', 'aloc']
 STARTSTOP_ABBREVS = ['full', 'start', 'end', 'early', 'late', 'early1', 'early2']

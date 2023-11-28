@@ -8,8 +8,7 @@ from pathlib import Path
 import climopy as climo  # noqa: F401
 import numpy as np
 import xarray as xr
-from climopy.var import _dist_bounds
-from climopy import ureg, vreg  # noqa: F401
+from climopy import var, ureg, vreg  # noqa: F401
 from icecream import ic  # noqa: F401
 
 from .plotting import CYCLE_DEFAULT
@@ -238,7 +237,7 @@ def _calc_bootstrap(
             kw = dict(wav=wav, sky=sky, bootstrap=bootstrap, pctile=False, detrend=True)
             lam, lam_lower, lam_upper, *_ = calc_feedback(data, **kw)
             sigma = 0.5 * (lam_upper - lam_lower)  # pctile=False returns +/- one sigma
-            lam_lower, lam_upper = _dist_bounds(sigma, pctile=pctile)
+            lam_lower, lam_upper = var._dist_bounds(sigma, pctile=pctile)
             spread = lam_upper - lam_lower  # interval assuming gaussian distribution
             print(f'{spread.item():.2f}', end=' ')
             name = f'r{wav}nt{sky}_lam'  # standardized name

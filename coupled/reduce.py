@@ -7,14 +7,13 @@ import climopy as climo  # noqa: F401
 import numpy as np
 import pandas as pd
 import xarray as xr
-from climopy.var import _dist_bounds, linefit
-from climopy import ureg, vreg  # noqa: F401
+from climopy import var, ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
 from .internals import ORDER_LOGICAL
 from .results import FACETS_NAME, FACETS_LEVELS, VERSION_NAME, VERSION_LEVELS
-from cmip_data.internals import MODELS_INSTITUTES, INSTITUTES_LABELS
+from cmip_data.facets import MODELS_INSTITUTES, INSTITUTES_LABELS
 
 __all__ = ['reduce_facets', 'reduce_general']
 
@@ -139,7 +138,7 @@ def _components_corr(data0, data1, dim=None, pctile=None):
     t = corr * np.sqrt((ndim - 2) / (1 - corr ** 2))  # t-statistic
     pctile = np.atleast_1d(95 if pctile is None or pctile is True else pctile)
     pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])  # see _dist_bounds
-    dt_lower, dt_upper = _dist_bounds(sigma, pctile, dof=data0.size - 2)
+    dt_lower, dt_upper = var._dist_bounds(sigma, pctile, dof=data0.size - 2)
     dt_lower = xr.DataArray(dt_lower, dims=('pctile', *sigma.dims))
     dt_upper = xr.DataArray(dt_upper, dims=('pctile', *sigma.dims))
     t_lower, t_upper = t + dt_lower, t + dt_upper
@@ -250,7 +249,7 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     axis = data0.dims.index(dim)
     isel = {dim: np.argsort(data0.values, axis=axis)}
     data0, data1 = data0.isel(isel), data1.isel(isel)
-    slope, sigma, rsquare, fit, fit_lower, fit_upper = linefit(
+    slope, sigma, rsquare, fit, fit_lower, fit_upper = var.linefit(
         data0, data1, dim=dim, adjust=adjust, pctile=pctile,
     )
     coords = {'x': data0, 'y': data1}
@@ -262,7 +261,7 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     else:  # see _dist_bounds
         pctile = np.atleast_1d(95 if pctile is None or pctile is True else pctile)
         pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])  # pctile dimension
-        sigma_lower, sigma_upper = _dist_bounds(sigma, pctile, dof=data0.size - 2)
+        sigma_lower, sigma_upper = var._dist_bounds(sigma, pctile, dof=data0.size - 2)
         slope_lower = slope + xr.DataArray(sigma_lower, dims=('pctile', *sigma.dims))
         slope_upper = slope + xr.DataArray(sigma_upper, dims=('pctile', *sigma.dims))
     return slope, slope_lower, slope_upper, rsquare, fit, fit_lower, fit_upper

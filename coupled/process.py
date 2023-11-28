@@ -10,8 +10,7 @@ import warnings
 import climopy as climo  # noqa: F401
 import numpy as np
 import xarray as xr
-from climopy.var import _dist_bounds, linefit
-from climopy import ureg, vreg  # noqa: F401
+from climopy import var, ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
@@ -102,15 +101,16 @@ def equator_pole_diffusivity(self, name):  # noqa: E302
     return transport / delta
 
 # Declare variables
+# TODO: Restore this after updating climopy and move to definitions file
 # TODO: Use this approach for flux addition terms and other stuff
-with warnings.catch_warnings():  # noqa: E305
-    warnings.simplefilter('ignore')
-    vreg.define('ta_grad', 'equator-pole air temperature difference', 'K')
-    vreg.define('ts_grad', 'equator-pole surface temperature difference', 'K')
-    vreg.define('ta_diff', 'bulk energy transport diffusivity', 'PW / K')
-    vreg.define('ts_diff', 'bulk energy transport surface diffusivity', 'PW / K')
-    climo.register_derivation(re.compile(r'\A(ta|ts)_grad\Z'))(equator_pole_delta)
-    climo.register_derivation(re.compile(r'\A(ta|ts)_diff\Z'))(equator_pole_diffusivity)
+# climo.register_derivation(re.compile(r'\A(ta|ts)_grad\Z'))(equator_pole_delta)
+# climo.register_derivation(re.compile(r'\A(ta|ts)_diff\Z'))(equator_pole_diffusivity)
+# with warnings.catch_warnings():  # noqa: E305
+#     warnings.simplefilter('ignore')
+#     vreg.define('ta_grad', 'equator-pole air temperature difference', 'K')
+#     vreg.define('ts_grad', 'equator-pole surface temperature difference', 'K')
+#     vreg.define('ta_diff', 'bulk energy transport diffusivity', 'PW / K')
+#     vreg.define('ts_diff', 'bulk energy transport surface diffusivity', 'PW / K')
 
 
 def _constrain_data(
@@ -178,7 +178,7 @@ def _constrain_data(
     idxs = np.argsort(data0, axis=0)
     data0, data1 = data0[idxs], data1[idxs]  # required for graphical error
     mean0, mean1 = data0.mean(), data1.mean()
-    bmean, berror, _, fit, fit_lower, fit_upper = linefit(data0, data1, **kwargs)
+    bmean, berror, _, fit, fit_lower, fit_upper = var.linefit(data0, data1, **kwargs)
     if graphical:  # intersection of shaded regions
         fit_lower = fit_lower.squeeze()
         fit_upper = fit_upper.squeeze()
@@ -714,7 +714,7 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
                 pctile = defaults.pop(f'{which}pctiles', None)
                 std = defaults.pop(f'{which}stds', None)
                 if pctile is not None:  # should be scalar
-                    bounds = _dist_bounds(sigma, pctile, dof=dof)
+                    bounds = var._dist_bounds(sigma, pctile, dof=dof)
                 elif std is not None:
                     bounds = (-std * sigma, std * sigma)
                 else:

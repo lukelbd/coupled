@@ -135,16 +135,16 @@ def _components_corr(data0, data1, dim=None, pctile=None):
     ndim = data0.sizes[dim]
     rsquare = corr ** 2  # variance explained == correlation squared
     sigma = np.sqrt((1 - corr ** 2) / (ndim - 2))  # standard error
-    t = corr * np.sqrt((ndim - 2) / (1 - corr ** 2))  # t-statistic
-    pctile = np.atleast_1d(95 if pctile is None or pctile is True else pctile)
-    pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])  # see _dist_bounds
-    dt_lower, dt_upper = var._dist_bounds(sigma, pctile, dof=data0.size - 2)
-    dt_lower = xr.DataArray(dt_lower, dims=('pctile', *sigma.dims))
-    dt_upper = xr.DataArray(dt_upper, dims=('pctile', *sigma.dims))
-    t_lower, t_upper = t + dt_lower, t + dt_upper
-    corr_lower = t_lower / np.sqrt(ndim - 2 + t_lower ** 2)
-    corr_upper = t_upper / np.sqrt(ndim - 2 + t_upper ** 2)
-    return corr, corr_lower, corr_upper, rsquare
+    tstat = corr * np.sqrt((ndim - 2) / (1 - rsquare))  # t-statistic
+    corrs = []  # correlation lower and upper bound
+    deltas = var._dist_bounds(sigma, pctile, dof=data0.size - 2, symmetric=True)
+    for delta in deltas:
+        if sigma.ndim == delta.ndim:
+            bound = np.expand_dims(delta, 0)  # add 'pctile' dimension
+        bound = tstat + xr.DataArray(delta, dims=('pctile', *sigma.dims))
+        bound = bound / np.sqrt(ndim - 2 + bound ** 2)  # see wiki page
+        corrs.append(bound)
+    return corr, *corrs, rsquare
 
 
 def _components_covariance(data0, data1, resid=False, dim='facets'):
@@ -256,15 +256,14 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     fit.coords.update(coords)
     fit_lower.coords.update(coords)
     fit_upper.coords.update(coords)
-    if pctile is False:  # use standard errors
-        slope_lower, slope_upper = slope - sigma, slope + sigma
-    else:  # see _dist_bounds
-        pctile = np.atleast_1d(95 if pctile is None or pctile is True else pctile)
-        pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])  # pctile dimension
-        sigma_lower, sigma_upper = var._dist_bounds(sigma, pctile, dof=data0.size - 2)
-        slope_lower = slope + xr.DataArray(sigma_lower, dims=('pctile', *sigma.dims))
-        slope_upper = slope + xr.DataArray(sigma_upper, dims=('pctile', *sigma.dims))
-    return slope, slope_lower, slope_upper, rsquare, fit, fit_lower, fit_upper
+    slopes = []  # slope lower and upper bounds
+    sigmas = var._dist_bounds(sigma, pctile, dof=data0.size - 2, symmetric=True)
+    for bound in sigmas:
+        if sigma.ndim == bound.ndim:
+            bound = np.expand_dims(bound, 0)  # add 'pctile' dimension
+        bound = slope + xr.DataArray(bound, dims=('pctile', *sigma.dims))
+        slopes.append(bound)
+    return slope, *slopes, rsquare, fit, fit_lower, fit_upper
 
 
 def _parse_project(facets, project=None):

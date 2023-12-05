@@ -37,7 +37,7 @@ CONFIG_SETTINGS = {
     'colorbar.extend': 1.0,
     'colorbar.width': 0.18,  # inches not font-sizes
     'fontname': 'Helvetica',
-    'fontsize': 8.0,  #
+    'fontsize': 9.0,
     'grid.alpha': 0.06,  # gridline opacity
     'hatch.linewidth': 0.3,
     'inlineformat': 'png',  # switch between png and retina

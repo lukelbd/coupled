@@ -22,10 +22,10 @@ __all__ = [
     'generate_specs',
     'feedback_specs',
     'transport_specs',
-    'scalar_grid',
-    'pattern_rows',
-    'constraint_rows',
-    'relationship_rows',
+    'scalar_plot',
+    'pattern_plot',
+    'constraint_plot',
+    'connection_plot',
 ]
 
 # Variable and selection keywords
@@ -58,7 +58,6 @@ KEYS_PLOT = (
     'loc', 'label', 'align', 'colorbar', 'legend', 'length', 'shrink',
 )
 
-
 # Variable name specs for feedbakc and transport breakdowns
 # NOTE: Lists below are parsed by feedback_specs() into either single columns,
 # two columns, or some fixed number of columns compatible with the decomposition.
@@ -85,7 +84,7 @@ SPECS_FEEDBACK = {
     'atm_resid': ('net', 'cld', 'resid', 'atm'),
     'atm_alb': ('net', 'cld', 'alb', 'atm'),
     'cld_net': ('net', 'cld', 'swcld', 'lwcld'),
-    'cre_net': ('net', 'cld', 'swcld', 'lwcld'),
+    'cre_net': ('net', 'cre', 'swcre', 'lwcre'),
     'wav_atm': ('net', 'swcld', 'lwcld', 'atm'),
     'wav_ncl': ('net', 'swcld', 'lwcld', 'ncl'),
     'wav_cs': ('net', 'swcre', 'lwcre', 'cs'),
@@ -412,7 +411,7 @@ def divide_specs(key, specs, **kwargs):
     # complex figures with many panels for use in presentations.
     split = kwargs.pop(f'{key}split', None)
     nosplit = split is False or split is None
-    pre = 'w' if key == 'row' else 'h'
+    pre = 'h' if key == 'row' else 'w'
     geom = 'nrows' if key == 'row' else 'ncols'
     count = kwargs.get(geom, None)
     titles = kwargs.get('titles', None)
@@ -504,7 +503,7 @@ def generate_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **
     elif kw_break:  # non-empty breakdown
         breakdown, kw_default = feedback_specs(maxcols=maxcols, **kw_break)
         kw_default = {**kw_default, 'proj_kw': {'lon_0': 210}}
-    else:  # note scalar_grid() pops the name first so permit zero arguents
+    else:  # note scalar_plot() pops the name first so permit zero arguents
         breakdown = None
         kw_default = {'ncols': ncols or maxcols}
     idxs = [i for i, keys in enumerate(outer) if 'breakdown' in keys]
@@ -918,7 +917,7 @@ def transport_specs(breakdown=None, component=None, transport=None, maxcols=None
     return names, kwargs
 
 
-def scalar_grid(data, forward=True, **kwargs):
+def scalar_plot(data, forward=True, **kwargs):
     """
     Plot scalar results in each grid slot (e.g. bars, boxes, lines).
 
@@ -933,7 +932,7 @@ def scalar_grid(data, forward=True, **kwargs):
     **kwargs
         Passed to `generate_specs`.
     """
-    # NOTE: In constraint_rows() support e.g. name=('ts', None) combined with
+    # NOTE: In constraint_plot() support e.g. name=('ts', None) combined with
     # breakdown='cld' or component=('swcld', 'lwcld') because the latter vector
     # is placed in outer specs while the former is placed in subspecs. However here
     # often need to vectorize breakdown inside subspecs (e.g. bar plots with many
@@ -975,7 +974,7 @@ def scalar_grid(data, forward=True, **kwargs):
     return result
 
 
-def pattern_rows(data, method=None, shading=True, contours=True, **kwargs):
+def pattern_plot(data, method=None, shading=True, contours=True, **kwargs):
     """
     Plot averages and standard deviations per row (e.g. maps).
 
@@ -1005,7 +1004,7 @@ def pattern_rows(data, method=None, shading=True, contours=True, **kwargs):
     elif method in ('std', 'var', 'pctile'):
         method1, method2 = method, 'avg'
     else:
-        raise ValueError(f'Invalid pattern_rows() method {method!r}.')
+        raise ValueError(f'Invalid pattern_plot() method {method!r}.')
     kwargs.update(maxcols=1)  # use custom method assignment
     rowspecs, colspecs, *_, kwargs = generate_specs(**kwargs)
     kw_shading = dict(shading) if isinstance(shading, dict) else {}
@@ -1038,7 +1037,7 @@ def pattern_rows(data, method=None, shading=True, contours=True, **kwargs):
     return result
 
 
-def constraint_rows(data, method=None, contours=True, hatching=True, **kwargs):
+def constraint_plot(data, method=None, contours=True, hatching=True, **kwargs):
     """
     Plot two quantifications of constraint relationship per row (e.g. maps).
 
@@ -1133,7 +1132,7 @@ def constraint_rows(data, method=None, contours=True, hatching=True, **kwargs):
     return result
 
 
-def relationship_rows(data, method=None, **kwargs):
+def connection_plot(data, method=None, **kwargs):
     """
     Plot average of constraint components and their relationship per row (e.g. maps).
 
@@ -1149,7 +1148,7 @@ def relationship_rows(data, method=None, **kwargs):
         Passed to `generate_specs`.
     """
     # NOTE: This is used for general circulation constraints on feedbacks
-    # TODO: Update this. It is out of date with constraint_rows.
+    # TODO: Update this. It is out of date with constraint_plot.
     if 'breakdown' not in kwargs and 'component' not in kwargs and 'outer' not in kwargs:  # noqa: E501
         raise ValueError('Feedback breakdown not specified.')
     kwargs.update(maxcols=1, method=method)

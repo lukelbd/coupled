@@ -30,12 +30,16 @@ __all__ = ['get_data', 'process_data']
 # feedback estimates (e.g. year 0-20 estimate will be related to year 5-25). For now
 # just assume implied distribution is Gaussian in _constrain_data() below.
 BOOTSTRAP_SPREAD = {
-    'net': {20: None, 40: None, 60: None},
-    'sw': {20: None, 40: None, 60: None},
-    'lw': {20: None, 40: None, 60: None},
-    'cre': {20: None, 40: None, 60: None},
-    'swcre': {20: None, 40: None, 60: None},
-    'lwcre': {20: None, 40: None, 60: None},
+    'cld': {20: np.nan, 40: np.nan, 60: np.nan},
+    'net': {20: 0.38, 40: 0.22, 60: 0.13},
+    'cs': {20: 0.24, 40: 0.15, 60: 0.10},
+    'cre': {20: 0.31, 40: 0.20, 60: 0.12},
+    'lw': {20: 0.24, 40: 0.15, 60: 0.10},
+    'lwcs': {20: 0.13, 40: 0.07, 60: 0.05},
+    'lwcre': {20: 0.15, 40: 0.10, 60: 0.07},
+    'sw': {20: 0.32, 40: 0.19, 60: 0.13},
+    'swcs': {20: 0.17, 40: 0.11, 60: 0.08},
+    'swcre': {20: 0.35, 40: 0.21, 60: 0.14},
 }
 
 # Observational constraint mean and spreads
@@ -153,25 +157,31 @@ def _constrain_data(
     # of individual feedback regressions that comprise inter-model regression because
     # their sample sizes are larger (150 years) and uncertainties are unc-rrelated so
     # should roughly cancel out across e.g. 30 members of ensemble.
-    N = N or 10000  # samples to draw
+    constraint = 'cld' if constraint is None or constraint is True else constraint
+    bootstrap = 20 if bootstrap is None or bootstrap is True else bootstrap
     pctile = 90 if pctile is None or pctile is True else pctile
     pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
     kwargs = dict(pctile=pctile, adjust=False)  # no correlation across ensembles
-    if isinstance(constraint, str):
-        constraint = FEEDBACK_CONSTRAINTS[FEEDBACK_ALIASES.get(constraint, constraint)]
+    name = constraint if isinstance(constraint, str) else None
+    name = FEEDBACK_ALIASES.get(name, name)
+    N = N or 10000  # samples to draw
+    if name is not None:
+        constraint = FEEDBACK_CONSTRAINTS[name]
     if not np.iterable(constraint) or len(constraint) != 3:
         raise ValueError(f'Invalid constraint {constraint}. Must be (mean, sigma, dof).')  # noqa: E501
     if data0.ndim != 1 or data1.ndim != 1:
         raise ValueError(f'Invalid data dims {data0.ndim} and {data1.ndim}. Must be 1D.')  # noqa: E501
     xmean, xscale, xdof = constraint  # note dof will have small effect
-    xmin, xmax = stats.t(df=xdof, loc=xmean, scale=xscale).ppf(0.01 * pctile)
     nbounds = 1 if bootstrap is False else 2  # number of bounds returned
+    if bootstrap is not False:
+        xdof *= bootstrap // 20  # e.g. if 60 then expand
+        xscale /= np.sqrt(bootstrap // 20)  # i.e. times sqrt(record / record_actual)
+        bootstrap = BOOTSTRAP_SPREAD[name][bootstrap]
+    xmin, xmax = stats.t(df=xdof, loc=xmean, scale=xscale).ppf(0.01 * pctile)
     observations = np.array([xmin, xmean, xmax])
     if bootstrap is not False:  # e.g. True or None
-        bootstrap = 20 if bootstrap is True else bootstrap
-        escale = BOOTSTRAP_SPREAD[constraint][bootstrap or 20]
         xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
-        es = stats.norm(loc=0, scale=escale).rvs(N)  # implied variability error
+        es = stats.norm(loc=0, scale=bootstrap).rvs(N)  # implied variability error
         observations = np.insert(np.percentile(xs + es, pctile), 1, observations)
     data0 = np.array(data0).squeeze()
     data1 = np.array(data1).squeeze()
@@ -203,6 +213,13 @@ def _constrain_data(
         constrained = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
         ys = mean1 + bmean * (xs - mean0)  # no regression uncertainty
         alternative = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
+        if bootstrap is not False:
+            xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
+            es = stats.norm(loc=0, scale=bootstrap).rvs(N)  # implied variability error
+            ys = rs + mean1 + bmean * (xs + es - mean0)
+            constrained = np.insert(np.percentile(ys, pctile), 1, constrained)
+            ys = mean1 + bmean * (xs + es - mean0)
+            alternative = np.insert(np.percentile(ys, pctile), 1, alternative)
     return observations, alternative, constrained
 
 

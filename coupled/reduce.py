@@ -290,14 +290,8 @@ def _parse_project(facets, project=None):
     # differences between row and column specs at given subplot entry.
     project = project or 'cmip'
     project = project.lower()
-    name_to_inst = MODELS_INSTITUTES.copy()
-    name_to_inst.update(  # support facets with institutes names instead of models
-        {
-            (proj, abbrv): inst
-            for inst, abbrv in INSTITUTES_LABELS.items()
-            for proj in ('CMIP5', 'CMIP6')
-        }
-    )
+    name_to_inst = MODELS_INSTITUTES.copy()  # translate model names or labels
+    name_to_inst.update({lab: inst for inst, lab in INSTITUTES_LABELS.items()})
     if not project.startswith('cmip'):
         raise ValueError(f'Invalid project indicator {project}. Must contain cmip.')
     _, number = project.split('cmip')
@@ -315,10 +309,9 @@ def _parse_project(facets, project=None):
             other = '6' if num[0] == '5' else '5'
             both = len(set(num)) == 2
             func = lambda key, both=both, num=num, other=other: (
-                num[0] == key[0][-1]
-                and both == any(
-                    name_to_inst.get((key[0], key[1]), object())
-                    == name_to_inst.get((facet[0], facet[1]), object())
+                num[0] == key[0][-1] and both == any(
+                    name_to_inst.get(key[1], object())
+                    == name_to_inst.get(facet[1], object())
                     for facet in facets if other == facet[0][-1]
                 )
             )
@@ -330,18 +323,22 @@ def _parse_project(facets, project=None):
     return func
 
 
-def _parse_institute(institute=None):
+def _parse_institute(facets, institute=None, project=None):
     """
     Return plot labels and facet filter for the institute indicator.
 
     Parameters
     ----------
+    facets : numpy.ndarray
+        The facets. Used to scarch for flagship models from each project.
     institute : str, default: None
         The selection. If ``'avg'`` then simply return the averaging function and
         `reduce_facets` will delay application to end of other selections. Otherwise
         this should be a specific institute name or ``'flagship'`` to select the
         curated "flagship" models from each institute, defined as the last models
         in the institute definition lists from the `cmip_data.internals` database.
+    project : str, optional
+        The project. Pass this if `facets` are strings or scalar levels.
 
     Returns
     -------
@@ -351,27 +348,33 @@ def _parse_institute(institute=None):
     # NOTE: Averages across a given institution are done using the default method='avg'
     # with e.g. institute='GFDL'. Averages across each institute followed by reductions
     # along result are instead done with institute='avg' (see _reduce_institutes)
+    project = project.item() if getattr(project, 'size', 0) == 1 else None
+    name_to_inst = {lab: inst for inst, lab in INSTITUTES_LABELS.items()}
+    name_to_proj = {
+        facet if isinstance(facet, str) else facet[int(len(facet) > 1)]:
+        (facet[0] if len(facet) > 1 else project or 'CMIP').upper() for facet in facets
+    }
+    pair_to_inst = {
+        (name_to_proj[model], model): inst
+        for model, inst in MODELS_INSTITUTES.items() if model in name_to_proj
+    }
+    pair_to_model = {
+        (proj, inst): model
+        for (proj, model), inst in pair_to_inst.items()
+    }
     if not institute:
         func = lambda key: True  # noqa: U100
     elif institute == 'avg':
         func = _reduce_institutes
     elif institute == 'flagship':
-        inst_to_model = {  # NOTE: flagship models are ordered last in list
-            (proj, inst): model
-            for (proj, model), inst in MODELS_INSTITUTES.items()
-        }
         func = lambda key: (
-            key[1]  # true if model is flagship member of its institute
-            == inst_to_model.get((key[0], MODELS_INSTITUTES.get((key[0], key[1]))))
+            pair_to_model.get((key[0], pair_to_inst.get((key[0], key[1]))))
+            == key[1]
         )
     elif any(value == institute for pair in INSTITUTES_LABELS.items() for value in pair):  # noqa: E501
-        label_to_inst = {
-            abbrv: inst
-            for inst, abbrv in INSTITUTES_LABELS.items()
-        }
-        func = lambda key: (  # true if input institute or label matches model institute
-            label_to_inst.get(institute, institute)
-            == MODELS_INSTITUTES.get((key[0], key[1]))
+        func = lambda key: (
+            name_to_inst.get(institute, institute)
+            == pair_to_inst.get((key[0], key[1]))
         )
     else:
         raise ValueError(f'Invalid institute name {institute!r}.')
@@ -438,7 +441,7 @@ def _reduce_institutes(data):
     if data.facets.attrs.get('long_name', '') == long_name:
         return data
     insts = [
-        MODELS_INSTITUTES.get((key[0], key[1]), 'UNKNOWN')
+        MODELS_INSTITUTES.get(key[1], 'UNKNOWN')
         for key in data.facets.values
     ]
     facets = [
@@ -858,7 +861,7 @@ def reduce_general(data, attrs=None, **kwargs):
     facets_name = '' if not facets.size else data.facets.attrs.get('facets_name', '')
     facets_name = facets_name or 'source facets'  # default name
     if parse and institute is not None and 'institute' not in facets_name:
-        institute = _parse_institute(institute)
+        institute = _parse_institute(data.facets.values, institute)
         if institute is not _reduce_institutes:  # otherwise delay
             facets = list(filter(institute, data.facets.values))
             data = data.sel(facets=facets)

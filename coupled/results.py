@@ -324,56 +324,6 @@ def _standardize_order(dataset):
     return dataset
 
 
-def _transport_implicit(data, descrip=None, prefix=None, adjust=True):
-    """
-    Convert implicit flux residuals to convergence and transport terms.
-
-    Parameters
-    ----------
-    data : xarray.DataArray
-        The data array.
-    descrip : str, optional
-        The long name description.
-    prefix : str, optional
-        The optional description prefix.
-    adjust : bool, optional
-        Whether to adjust with global-average residual.
-
-    Returns
-    -------
-    cdata : xarray.DataArray
-        The convergence.
-    rdata : xarray.DataArray
-        The global-average residual.
-    tdata : xarray.DataArray
-        The meridional transport.
-    """
-    # Get convergence and residual
-    # NOTE: This requires cell measures are already present for consistency with the
-    # explicit transport function, which requires a surface pressure dependence.
-    data = data.climo.quantify()
-    descrip = f'{descrip} ' if descrip else ''
-    prefix = f'{prefix} ' if prefix else ''
-    cdata = -1 * data.climo.to_units('W m^-2')  # convergence equals negative residual
-    cdata.attrs['long_name'] = f'{prefix}{descrip}energy convergence'
-    rdata = cdata.climo.average('area').drop_vars(('lon', 'lat'))
-    rdata.attrs['long_name'] = f'{prefix}{descrip}energy residual'
-    # Get meridional transport
-    # WARNING: Cumulative integration in forward or reverse direction will produce
-    # estimates respectively offset-by-one, so compensate by taking average of both.
-    tdata = cdata - rdata if adjust else cdata
-    tdata = tdata.climo.integral('lon')
-    tdata = 0.5 * (
-        -1 * tdata.climo.cumintegral('lat', reverse=False)
-        + tdata.climo.cumintegral('lat', reverse=True)
-    )
-    tdata = tdata.climo.to_units('PW')
-    tdata = tdata.drop_vars(tdata.coords.keys() - tdata.sizes.keys())
-    tdata.attrs['long_name'] = f'{prefix}{descrip}energy transport'
-    tdata.attrs['standard_units'] = 'PW'  # prevent cfvariable auto-inference
-    return cdata.climo.dequantify(), rdata.climo.dequantify(), tdata.climo.dequantify()
-
-
 def _transport_explicit(udata, vdata, qdata, descrip=None, prefix=None):
     """
     Convert explicit advection to convergence and transport terms.
@@ -441,6 +391,56 @@ def _transport_explicit(udata, vdata, qdata, descrip=None, prefix=None):
     mdata.attrs['long_name'] = f'{string}{descrip}energy transport'
     mdata.attrs['standard_units'] = 'PW'  # prevent cfvariable auto-inference
     return cdata.climo.dequantify(), sdata.climo.dequantify(), mdata.climo.dequantify()
+
+
+def _transport_implicit(data, descrip=None, prefix=None, adjust=True):
+    """
+    Convert implicit flux residuals to convergence and transport terms.
+
+    Parameters
+    ----------
+    data : xarray.DataArray
+        The data array.
+    descrip : str, optional
+        The long name description.
+    prefix : str, optional
+        The optional description prefix.
+    adjust : bool, optional
+        Whether to adjust with global-average residual.
+
+    Returns
+    -------
+    cdata : xarray.DataArray
+        The convergence.
+    rdata : xarray.DataArray
+        The global-average residual.
+    tdata : xarray.DataArray
+        The meridional transport.
+    """
+    # Get convergence and residual
+    # NOTE: This requires cell measures are already present for consistency with the
+    # explicit transport function, which requires a surface pressure dependence.
+    data = data.climo.quantify()
+    descrip = f'{descrip} ' if descrip else ''
+    prefix = f'{prefix} ' if prefix else ''
+    cdata = -1 * data.climo.to_units('W m^-2')  # convergence equals negative residual
+    cdata.attrs['long_name'] = f'{prefix}{descrip}energy convergence'
+    rdata = cdata.climo.average('area').drop_vars(('lon', 'lat'))
+    rdata.attrs['long_name'] = f'{prefix}{descrip}energy residual'
+    # Get meridional transport
+    # WARNING: Cumulative integration in forward or reverse direction will produce
+    # estimates respectively offset-by-one, so compensate by taking average of both.
+    tdata = cdata - rdata if adjust else cdata
+    tdata = tdata.climo.integral('lon')
+    tdata = 0.5 * (
+        -1 * tdata.climo.cumintegral('lat', reverse=False)
+        + tdata.climo.cumintegral('lat', reverse=True)
+    )
+    tdata = tdata.climo.to_units('PW')
+    tdata = tdata.drop_vars(tdata.coords.keys() - tdata.sizes.keys())
+    tdata.attrs['long_name'] = f'{prefix}{descrip}energy transport'
+    tdata.attrs['standard_units'] = 'PW'  # prevent cfvariable auto-inference
+    return cdata.climo.dequantify(), rdata.climo.dequantify(), tdata.climo.dequantify()
 
 
 def _update_climate_units(dataset):
@@ -1374,7 +1374,7 @@ def feedback_datasets_json(
     paths = paths or ('~/data/cmip-tables',)
     paths = tuple(Path(path).expanduser() for path in paths)
     boundary = boundary or 't'
-    project, constraints = _parse_constraints(reverse=True, **constraints)
+    project, constraints = _parse_constraints(decode=True, **constraints)
     datasets = {}
     if 't' not in boundary:  # only top-of-atmosphere feedbacks available
         return datasets
@@ -1459,7 +1459,7 @@ def feedback_datasets_text(
     paths = paths or ('~/data/cmip-tables',)
     paths = tuple(Path(path).expanduser() for path in paths)
     boundary = boundary or 't'
-    project, constraints = _parse_constraints(reverse=True, **constraints)
+    project, constraints = _parse_constraints(decode=True, **constraints)
     datasets = {}
     if 't' not in boundary:  # only top-of-atmosphere feedbacks available
         return datasets

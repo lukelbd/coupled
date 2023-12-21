@@ -194,7 +194,6 @@ KWARGS_ERRBOX = {  # thick error whiskers
     'boxlinewidth': 3.5 * pplt.rc.metawidth,
 }
 KWARGS_REFERENCE = {  # reference zero or one line
-    # 'alpha': 0.15,
     'alpha': 0.50,
     'color': 'black',
     'scalex': False,
@@ -337,9 +336,8 @@ def _get_flagships(data):
     elif 'institute' in data.coords:
         bools = [data.coords['institute'].item() == 'flagship'] * data.facets.size
     else:
-        filt = _parse_institute('flagship')
-        bools = []
-        names = data.indexes['facets'].names
+        filt = _parse_institute(data.facets.values, 'flagship', project=data.project)
+        bools, names = [], data.indexes['facets'].names
         if 'project' not in names and 'project' not in data.coords:
             raise ValueError('Project version is missing.')
         for facet in data.facets.values:
@@ -441,16 +439,15 @@ def _get_handles(args, handles, pad=None, size=None, sort=True):
     # sensitivity places on first column but has empty violin slots.
     tuples = {}
     properties = set()
-    for num, (arg, ihandles) in enumerate(zip(args, handles)):
+    for num, (arg, objects) in enumerate(zip(args, handles)):
         labels = arg.coords.get('label', None)
         if labels is None:
             raise ValueError('Input data has no label coordinate.')
         labels = [label for label in labels.values if label is not None]  # for seaborn
-        if len(ihandles) > len(labels):  # allow less than for e.g. sensitivity
-            raise ValueError(f'Number of labels ({len(labels)}) differs from handles ({len(ihandles)}).')  # noqa: E501
-        for idx in _sort_idxs(ihandles, sort=sort)[::-1]:  # e.g. cmip5 then cmip6
-            label, handle = labels[idx], ihandles[idx]
-            props = {}
+        if len(objects) > len(labels):  # allow less than for e.g. sensitivity
+            raise ValueError(f'Number of labels ({len(labels)}) differs from handles ({len(objects)}).')  # noqa: E501
+        for idx in _sort_idxs(objects, sort=sort)[::-1]:  # e.g. cmip5 then cmip6
+            props, label, handle = {}, labels[idx], objects[idx]
             if not handle:  # empty violin slot due to e.g. all-zero array
                 continue
             for key, value in handle.properties().items():
@@ -1020,10 +1017,13 @@ def _infer_commands(
         gs = pplt.GridSpec(*geom[:2], **kw_collection.gridspec)
     if fig is None:  # also support updating? or too slow?
         if any('share' in kw_collection.figure for kw_collection in kws_collection):
-            kw_figure.pop('sharex', None); kw_figure.pop('sharey', None)  # noqa: E702
+            kw_figure.pop('sharex', None)
+            kw_figure.pop('sharey', None)
         for kw_collection in kws_collection:
             kw_figure.update(kw_collection.figure)
-        fig = pplt.figure(**kw_figure)
+        with warnings.catch_warnings():  # ignore matplotlib map_projection warning
+            warnings.simplefilter('ignore')
+            fig = pplt.figure(**kw_figure)
     if ax is None:
         if max(geom[:2]) == 1:  # remove individual label
             kw_axes.pop('abc', None)
@@ -1032,7 +1032,9 @@ def _infer_commands(
                 if any(key[:len(ignore)] == ignore for ignore in keys_ignore):
                     del kw_collection.axes[key]
             kw_axes.update(kw_collection.axes)
-        ax = fig.add_subplot(gs[geom[2]], **kw_axes)
+        with warnings.catch_warnings():  # ignore matplotlib map_projection warning
+            warnings.simplefilter('ignore')
+            ax = fig.add_subplot(gs[geom[2]], **kw_axes)
         fig.auto_layout(tight=False)  # TODO: commit on master
 
     # Infer plotting commands
@@ -1509,12 +1511,12 @@ def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=
             xytext = (0, offset * (1 if above else -1))[slice_]  # as above
             res = ax.annotate(label, xydata, xytext, **kw_annotate)
             res.set_in_layout(False)
+    return handle or None
 
 
 def _setup_scatter(
-    ax, data0, data1, collection=None,
-    zeros=False, oneone=False, linefit=False, annotate=False,
-    constraint=None, bootstrap=None, graphical=False, pctile=None,
+    ax, data0, data1, handle=None, zeros=False, oneone=False, linefit=False, annotate=False,  # noqa: E501
+    constraint=None, alternative=None, original=None, bootstrap=None, graphical=False, pctile=None,  # noqa: E501
 ):
     """
     Adjust and optionally add content to scatter plots.
@@ -1525,8 +1527,8 @@ def _setup_scatter(
         The axes.
     data0, data1 : xarray.DataArray
         The input arguments.
-    collection : matplotlib.collection.Collection
-        The scatter collection.
+    handle : matplotlib.collection.Collection
+        The scatter collection handle.
 
     Other Parameters
     ----------------
@@ -1540,8 +1542,12 @@ def _setup_scatter(
         Whether to add annotations to the scatter markers.
     constraint : float, optional
         Whether to illustrate a constraint. If ``True`` uses a default value.
+    alternative : bool, optional
+        Whether to include alternative estimate that omits regression uncertainty.
+    original : str or bool, optional
+        Whether to include original unconstrained inter-model uncertainty bounds.
     bootstrap : bool or int, optional
-        Passed to `_constrain_data`. If ``False`` then only regression uncertainty used.
+        Passed to `_constrain_data`. Whether to include internal variability estimate.
     graphical : bool, optional
         Passed to `_constrain_data`. Whether to use graphical intersectoins.
     pctile : float, optional
@@ -1566,66 +1572,6 @@ def _setup_scatter(
             ones = (avg - 1e3 * span, avg + 1e3 * span)
             ax.add_artist(mlines.Line2D(ones, ones, **style))
 
-    # Add manual regression line
-    # NOTE: Here climopy automatically reapplies dataarray coordinates to fit line
-    # and lower and upper bounds so do not explicitly need sorted x coordinates.
-    if linefit or constraint is not None:
-        pctile = pctile or 90  # default percentiule range
-        ax.use_sticky_edges = False  # show end of line fit shading
-        slope, _, _, rsquare, fit, fit_lower, fit_upper = _components_slope(
-            data0, data1, dim=data0.dims[0], adjust=False, pctile=pctile,
-        )
-        sign = '(\N{MINUS SIGN})' if slope < 0 else ''  # negative r-squared
-        value = ureg.Quantity(rsquare.item(), '').to('percent')
-        label = rf'$r^2={sign}{value:~L.0f}$'
-        # label = rf'r$=${sign}${value:.2f}$'
-        # sign = '\N{MINUS SIGN}' if slope < 0 else ''  # negative r-squared
-        # value = rsquare.item() ** 0.5
-        label = re.sub(r'(?<!\\)%', r'\%', label)
-        label = label.replace(r'\ ', '')
-        datax = np.sort(data0, axis=0)  # linefit returns result for sorted data
-        c = collection[0].get_color()
-        c = 'red' if constraint is None else c  # line fit color
-        ax.plot(datax, fit, c=c, ls='-', lw=1.5 * pplt.rc.metawidth)
-        ax.area(datax, fit_lower.squeeze(), fit_upper.squeeze(), c=c, a=0.3, lw=0)
-        ax.format(lltitle=label)  # variance explained annotation
-
-    # Add constraint indicator
-    # NOTE: If bounds is False then this shows single shaded x-region and two y-regions
-    # both with and without regression uncertainty. If bounds is not False then this
-    # shows two x-regions and y-regions with and without observational feedback
-    # uncertainty implied from ensemble-mean bootstrapped pre-industrial results.
-    if constraint is not None:
-        pctile = pctile or 90  # default percentiule range
-        constraint = 'cld' if constraint is True else constraint
-        kwargs = dict(constraint=constraint, graphical=graphical, bootstrap=bootstrap)
-        xcolor, ycolor = 'cyan7', 'pink7'
-        xs, ys1, ys2 = _constrain_data(data0, data1, pctile=pctile, **kwargs)
-        nbounds = len(xs) // 2  # should be 1 or 2
-        xmins, xmean, xmaxs = xs[:nbounds], xs[nbounds], xs[-nbounds:]
-        ymins1, ymean, ymaxs1 = ys1[:nbounds], ys1[nbounds], ys1[-nbounds:]
-        ymins2, ymean, ymaxs2 = ys2[:nbounds], ys2[nbounds], ys2[-nbounds:]
-        for xmin, xmax in zip(xmins, xmaxs[::-1]):  # start with farthest out
-            ax.axvspan(xmin, xmax, color=xcolor, alpha=0.15, lw=0)
-        # bounds = np.percentile(data0, 90)  # ensemble bounds
-        # for bound in bounds:  # unconstrained x bounds
-        #     ax.axvline(bound, color=xcolor, alpha=0.5, ls='--', lw=0.7)
-        args = ([xmean, xmean], [min(ymins2) - 100, ymean])
-        ax.add_artist(mlines.Line2D(*args, color=xcolor, lw=1))
-        if nbounds == 2:  # with and without bootstrapped model-impled obs uncertainty
-            ymins, ymaxs = ymins1, ymaxs1[::-1]
-        else:  # with and without regression uncertainty
-            ymins, ymaxs = (*ymins1, *ymins2), (*ymaxs1, *ymaxs2)
-        for ymin, ymax in zip(ymins, ymaxs):
-            ax.axhspan(ymin, ymax, color=ycolor, alpha=0.15, lw=0)
-        bounds = np.percentile(data1, 90)  # ensemble bounds
-        for bound in bounds:  # unconstrained y bounds using scatter color
-            ax.axhline(bound, color=collection[0].get_color(), alpha=0.5, ls='--', lw=0.7)  # noqa: E501
-        # for bound in bounds1:  # unconstrained y bounds
-        #     ax.axhline(bound, color=ycolor, alpha=0.5, ls='--', lw=0.7)
-        args = ([min(xmins) - 100, xmean], [ymean, ymean])
-        ax.add_artist(mlines.Line2D(*args, color=ycolor, lw=1))
-
     # Add annotations
     # NOTE: Using set_in_layout False significantly improves speed since tight bounding
     # box is faster and looks nicer to allow slight overlap with axes edge.
@@ -1644,6 +1590,77 @@ def _setup_scatter(
             xytext = (2, -2)  # offset coordaintes
             res = ax.annotate(label, xy, xytext, ha='left', va='top', **kw_annotate)
             res.set_in_layout(False)
+
+    # Add manual regression line
+    # NOTE: Here climopy automatically reapplies dataarray coordinates to fit line
+    # and lower and upper bounds so do not explicitly need sorted x coordinates.
+    # sign = '(\N{MINUS SIGN})' if slope < 0 else ''  # negative r-squared
+    # label = rf'$r^2={sign}{value:~L.0f}$'
+    # label = rf'r$={np.sign(slope) * rsquare.item() ** 0.5:.2f}$'
+    # color = 'red' if constraint is None else color  # line fit color
+    if linefit or constraint is not None:
+        pctile = pctile or 90  # default percentiule range
+        ax.use_sticky_edges = False  # show end of line fit shading
+        slope, _, _, rsquare, fit, fit_lower, fit_upper = _components_slope(
+            data0, data1, dim=data0.dims[0], adjust=False, pctile=pctile,
+        )
+        value = ureg.Quantity(rsquare.item(), '').to('percent')
+        label = rf'$r^2={value:~L.0f}$'
+        label = re.sub(r'(?<!\\)%', r'\%', label)
+        label = label.replace(r'\ ', '')
+        datax = np.sort(data0, axis=0)  # linefit returns result for sorted data
+        color = 'gray8' if constraint is None or not handle else handle[0].get_color()
+        ax.plot(datax, fit, ls='-', lw=1.5 * pplt.rc.metawidth, c=color)
+        ax.area(datax, fit_lower.squeeze(), fit_upper.squeeze(), lw=0, a=0.3, c=color)
+        ax.format(lrtitle=label)  # variance explained annotation
+
+    # Add constraint indicator
+    # NOTE: Here get constrained/unconstrained standard deviation ratio using ratio of
+    # percentile intervals. Should be similar since Monte Carlo sampling used to arrive
+    # at constraint estimate comprises t-distributions with same degrees of freedom.
+    # NOTE: If bounds is False then this shows single shaded x-region and two y-regions
+    # both with and without regression uncertainty. If bounds is not False then this
+    # shows two x-regions and y-regions with and without observational feedback
+    # uncertainty implied from ensemble-mean bootstrapped pre-industrial results.
+    # param = r'\mathrm{CI}_{\mathrm{constrained}}\,/\,\mathrm{CI}_{\mathrm{unconstrained}}'  # noqa: E501
+    if constraint is not None:
+        original = 'xy' if original is True else '' if original is False else original
+        original = ''.join('y' if original is None else original)
+        pctile = pctile or 90  # default percentiule range
+        bounds = (50 - 0.5 * pctile, 50 + 0.5 * pctile)
+        xorigs = np.percentile(data0, bounds) if 'x' in original else ()
+        yorigs = np.percentile(data1, bounds) if 'y' in original else ()
+        kwargs = dict(constraint=constraint, graphical=graphical, bootstrap=bootstrap)
+        xcolor, ycolor = 'cyan7', 'pink7'
+        xs, ys1, ys2 = _constrain_data(data0, data1, pctile=pctile, **kwargs)
+        nbounds = len(xs) // 2  # should be one or two
+        xmins, xmean, xmaxs = xs[:nbounds], xs[nbounds], xs[-nbounds:]
+        ymins1, ymean, ymaxs1 = ys1[:nbounds], ys1[nbounds], ys1[-nbounds:]
+        ymins2, ymean, ymaxs2 = ys2[:nbounds], ys2[nbounds], ys2[-nbounds:]
+        horig, alphas = None, (0.1, 0.2)  # opacities of spanning shading
+        args = ([xmean, xmean], [min(ymins2) - 100, ymean])
+        xobjs = [ax.add_artist(mlines.Line2D(*args, lw=1, color=xcolor, label='observations'))]  # noqa: E501
+        color = xcolor if 'y' in original or not handle else handle[0].get_color()
+        for alph, xmin, xmax in zip(alphas[-nbounds:], xmins, xmaxs[::-1]):
+            xobjs.append(ax.axvspan(xmin, xmax, lw=0, color=xcolor, alpha=alph))
+        for bound in xorigs:  # unconstrained x bounds
+            horig = ax.axvline(bound, ls='--', lw=0.7, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
+        if alternative:  # with and without regression uncertainty
+            ymins, ymaxs = (ymins2[0], ymins1[0]), (ymaxs2[-1], ymaxs1[-1])
+        else:  # with and without bootstrapped model-impled obs uncertainty
+            ymins, ymaxs, alphas = ymins2, ymaxs2[::-1], alphas[-nbounds:]
+        args = ([min(xmins) - 100, xmean], [ymean, ymean])
+        yobjs = [ax.add_artist(mlines.Line2D(*args, lw=1, color=ycolor, label='constrained'))]  # noqa: E501
+        color = ycolor if 'x' in original or not handle else handle[0].get_color()
+        for alph, ymin, ymax in zip(alphas, ymins, ymaxs):
+            yobjs.append(ax.axhspan(ymin, ymax, lw=0, color=ycolor, alpha=alph))
+        for bound in yorigs:  # unconstrained y bounds using scatter color
+            horig = ax.axhline(bound, ls='--', lw=0.7, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
+        handle = [tuple(xobjs), tuple(yobjs)] + ([horig] if horig else [])
+        ratio = abs((ymins2[0] - ymaxs2[-1]) / (yorigs[1] - yorigs[0]))
+        param = r'\sigma_{\mathrm{constrained}}\,/\,\sigma_{\mathrm{unconstrained}}'
+        ax.format(ultitle=rf'${param}\,=\,{ratio:.2f}$')
+    return handle
 
 
 def _setup_violins(
@@ -1689,10 +1706,10 @@ def _setup_violins(
     hbase, lbase, handles, lines, locs = 0, 0, [], [], []
     for i in range(data.shape[1]):
         num = np.sum(np.isfinite(np.unique(data[:, i])))
-        if num > 0:
+        if num > 0:  # violins plotted
             locs.append(i)
-            handles.append(handle[hbase] if handle and num > 1 else None)
             lines.append(line[lbase:lbase + num] if line else ())
+            handles.append(handle[hbase] if handle and num > 1 else None)
         hbase += int(num > 1)
         lbase += num
     for key in ('alpha', 'hatch', 'linewidth', 'edgecolor'):
@@ -1732,7 +1749,6 @@ def _setup_violins(
     width = width or KWARGS_VIOLIN.get('width', 1.0)  # scaled width preserving area
     scatter = 'scatterx' if horizontal else 'scatter'
     for i, (ihandle, ilines, iloc) in enumerate(zip(handles, lines, locs)):
-        # zorder = 2 - (i + 1) / len(handles)
         zorder = 1 + (i + 1) / len(handles)
         if not ihandle:
             continue
@@ -1754,7 +1770,6 @@ def _setup_violins(
         cmd = np.nanmedian if median else np.nanmean
         point = cmd(data[:, iloc])
         getattr(ax, scatter)(center, point, zorder=zorder + 0.001, **KWARGS_CENTER)
-
     return handles  # possibly adjusted handles
 
 
@@ -2175,7 +2190,7 @@ def generate_plot(
                 if getattr(ax, '_invisible', None):
                     continue
             with warnings.catch_warnings():  # ignore 'masked to nan'
-                warnings.simplefilter('ignore', (UserWarning, RuntimeWarning))
+                warnings.simplefilter('ignore', (UserWarning, RuntimeWarning, FutureWarning))  # noqa: E501
                 if 'violin' in command:
                     handle = result = None  # seaborn violinplot returns ax! ugly!
                     sns.violinplot(*args, ax=ax, **kw_command)
@@ -2185,7 +2200,7 @@ def generate_plot(
             if command == 'contour':  # pick last contour to avoid negative dashes
                 handle = result.collections[-1] if result.collections else None
             if command == 'scatter':  # sizes empty if array not passed
-                handle = result.legend_elements('sizes')[0] or result
+                handle = result.legend_elements('sizes')[0][:1] or result
             if 'bar' in command:  # either container or (errorbar, container)
                 handle = result[-1] if type(result) is tuple else result
             if 'line' in command:  # either [line] or [(shade, line)]
@@ -2211,18 +2226,18 @@ def generate_plot(
                 keys = ('horizontal', 'annotate')
                 errdata = kw_command.get('bardata', None)
                 kw_other = {key: val for key, val in kw_other.items() if key in keys}
-                _setup_bars(ax, args, errdata, handle, **kw_other)
+                handle = _setup_bars(ax, args, errdata, handle, **kw_other)
             if 'scatter' in command:
-                keys = ('zeros', 'oneone', 'linefit', 'annotate', 'constraint', 'graphical')  # noqa: E501
+                keys = ('zeros', 'oneone', 'linefit', 'annotate', 'constraint', 'bootstrap', 'graphical')  # noqa: E501
                 oneone = oneone or kw_other.get('oneone', False)
                 kw_other = {key: val for key, val in kw_other.items() if key in keys}
-                _setup_scatter(ax, *args, handle, **kw_other)  # 'args' is 2-tuple
+                handle = _setup_scatter(ax, *args, handle, **kw_other)  # 'args' is 2-tuple
             if 'violin' in command:
                 keys = ('horizontal', 'alpha', 'hatch', 'linewidth', 'edgecolor')
                 line = [line for line in ax.lines if line not in prevlines]
                 width = kw_command.get('width', None)  # optionally override
                 kw_other = {key: val for key, val in kw_other.items() if key in keys}
-                handle = _setup_violins(ax, data, handle, line, width=width, **kw_other)  # noqa: E501
+                handle = _setup_violins(ax, data, handle, line, width=width, **kw_other)
             if 'line' in command and autoscale:  # ignore shading in axis bounds
                 arg = data.values
                 arg[~np.isfinite(arg)] = np.nan
@@ -2247,10 +2262,10 @@ def generate_plot(
             # differentiate between sensitivity, forcing, and feedbacks.
             hashable = tuple(settings)
             label = kw_guide.pop('label', None)
-            if 'label' in data.coords:  # TODO: optionally disable
-                label = None
-            if command == 'scatter':  # TODO: possibly remove this
-                handle = label = None
+            if 'label' in data.coords:
+                label = None  # TODO: optionally disable
+            if 'scatter' in command and not isinstance(handle, list):
+                handle = label = None  # TODO: optionally disable
             if command in ('contourf', 'pcolormesh') and (norm := handle.norm):
                 hashable += (('vmin', norm.vmin), ('vmax', norm.vmax), ('N', norm.N))
             identifier = (hashable, method, command, guide, label)
@@ -2266,11 +2281,13 @@ def generate_plot(
     groups_colorbars, groups_legends = {}, {}
     for identifier, tuples in groups_handles.items():
         handles = []
-        *_, guide, label = identifier
+        *_, command, guide, label = identifier
         axs, args, handles, kws_guide, _ = zip(*tuples)
         sort = any(arg.sizes.get('facets', None) for arg in args)  # only for 'version'
         if all(handles) and all('label' in arg.coords for arg in args):
             handles, labels, kw_update = _get_handles(args, handles, sort=sort)
+        elif 'scatter' in command and handles and isinstance(handles[0], list):
+            handles, labels, kw_update = handles[:1], [None], {}
         else:  # e.g. scatter
             handles, labels, kw_update = handles[:1], [label], {}
         kw_guide = {key: val for kw_guide in kws_guide for key, val in kw_guide.items()}
@@ -2282,10 +2299,10 @@ def generate_plot(
         props = _props_guide(*axs, loc=loc, **kw)
         groups = groups_colorbars if guide == 'colorbar' else groups_legends
         for ihandle, ilabel in zip(handles, labels):
-            if ihandle is None or ilabel is None:  # e.g. scatter plots
-                continue
-            if isinstance(ihandle, (list, mcontainer.Container)):
-                ihandle = ihandle[0]  # legend_elements list BarContainer container
+            if ihandle is None:
+                continue  # e.g. scatter plot
+            if isinstance(ihandle, mcontainer.Container):
+                ihandle = ihandle[:1]  # BarContainer container
             tuples = groups.setdefault(props, [])
             tuples.append((ihandle, ilabel, kw_guide))
 
@@ -2299,18 +2316,18 @@ def generate_plot(
             handles, labels, kws_guide = zip(*tuples)
             kw_guide = {key: val for kw_guide in kws_guide for key, val in kw_guide.items()}  # noqa: E501
             kw_guide.update({} if span is None else {'span': span})
+            kw_legend = {'pad': legpad, 'space': legspace, 'bbox_to_anchor': bbox}
+            kw_legend.update({'ncols': legcols or 1, 'frame': False, 'order': 'F'})
+            kw_colorbar = {'pad': cbarpad, 'space': cbarspace, 'length': length}
             if guide == 'legend':
-                kw_guide.setdefault('frame', False)
-                kw_guide.setdefault('ncols', legcols or 1)
-                kw_guide.setdefault('order', 'F')
-                kw_guide.setdefault('bbox_to_anchor', bbox)
-                kw_guide.setdefault('pad', legpad)
-                kw_guide.setdefault('space', legspace)
+                if not any(labels) and isinstance(handles[0], list):
+                    handles, labels = handles[0], (None,) * len(handles[0])
+                for key, value in kw_legend.items():
+                    kw_guide.setdefault(key, value)
                 src.legend(list(handles), list(labels), loc=loc, **kw_guide)
             else:  # TODO: explicitly support colorbars spanning multiple subplots
-                kw_guide.setdefault('length', length)
-                kw_guide.setdefault('pad', cbarpad)
-                kw_guide.setdefault('space', cbarspace)
+                for key, value in kw_colorbar.items():
+                    kw_guide.setdefault(key, value)
                 for ihandle, ilabel in zip(handles, labels):
                     ilabel = _split_label(ilabel, refwidth=size)
                     src.colorbar(ihandle, loc=loc, label=ilabel, **kw_guide)
@@ -2398,17 +2415,19 @@ def generate_plot(
     colkey = 'bottomlabels' if labelbottom else 'toplabels'
     fig.format(figtitle=figtitle, **{rowkey: rowlabels, colkey: collabels})
     if save:  # save path
-        path = Path('' if save is True else save)
-        path = path.expanduser().resolve()
+        path = Path().expanduser().resolve()
         if path.name in ('notebooks', 'meetings', 'manuscripts'):
             path = path.parent  # parent project directory
-        path = path / 'figures'
+        name = 'figures-publication' if isinstance(save, str) else 'figures'
+        path = path / name
         if not path.is_dir():
             raise ValueError(f'Path {str(path)!r} does not exist.')
-        methods = '-'.join(methods)  # prepend methods
-        commands = '-'.join(commands)  # append commands
-        if path.is_dir():
-            path = path / '_'.join((methods, pathlabel, commands, indicator))
+        name = save
+        methods = '-'.join(methods)
+        commands = '-'.join(commands)
+        if not isinstance(save, str):
+            name = '_'.join((methods, pathlabel, commands, indicator))
+        path = path / name
         figwidth, figheight = fig.get_size_inches()
         figsize = f'{figwidth:.1f}x{figheight:.1f}in'  # figure size
         print(f'Saving ({figsize}): ~/{path.relative_to(Path.home())}')

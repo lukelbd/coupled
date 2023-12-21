@@ -72,7 +72,8 @@ KEYS_GRIDSPEC = (
 )
 KEYS_OTHER = (
     'cycle', 'horizontal', 'offset', 'intersect', 'correlation',  # _combine
-    'zeros', 'oneone', 'linefit', 'annotate', 'constraint', 'graphical',  # _scatter
+    'zeros', 'oneone', 'linefit', 'annotate',  # _scatter
+    'constraint', 'alternative', 'bootstrap', 'internal', 'graphical',  # _constrain
     'transpose', 'autocolor', 'pcolor', 'area',  # _auto_props
 )
 KEYS_ATTRIBUTES = ('short_name', 'long_name', 'standard_name', 'units')

@@ -17,8 +17,8 @@ from .results import ALIAS_FEEDBACKS, FEEDBACK_ALIASES, FACETS_LEVELS, VERSION_L
 __all__ = ['get_path', 'get_label', 'get_labels', 'parse_spec', 'parse_specs']
 
 # Threshold for font wrapping
-FONT_SCALE = 1.8
-# FONT_SCALE = 1.4
+CHAR_SCALE = 1.6  # em-widths per average character (excluding e.g. 't' and 'i')
+ABC_SCALE = 4.0  # space for e.g. 'A.' (2 x 2 em-widths for centered titles)
 
 # Reduce instructions to ignore when creating paths
 # NOTE: New format will prefer either 'monthly' or 'annual'. To prevent overwriting
@@ -72,8 +72,8 @@ KEYS_GRIDSPEC = (
 )
 KEYS_OTHER = (
     'cycle', 'horizontal', 'offset', 'intersect', 'correlation',  # _combine
-    'zeros', 'oneone', 'linefit', 'annotate',  # _scatter
-    'constraint', 'alternative', 'bootstrap', 'internal', 'graphical',  # _constrain
+    'zeros', 'oneone', 'linefit', 'annotate', 'alternative', 'original',  # _scatter
+    'constraint', 'observed', 'variability', 'graphical',  # _constrain
     'transpose', 'autocolor', 'pcolor', 'area',  # _auto_props
 )
 KEYS_ATTRIBUTES = ('short_name', 'long_name', 'standard_name', 'units')
@@ -242,6 +242,42 @@ TRANSLATE_LABELS = {
     ('lat', 'max'): 'maximum',
     ('lon', 'int'): None,
     ('lon', 'avg'): None,
+    ('dist', 'sigma1'): 'regression standard error',
+    ('dist', 'sigma2'): 'bootstrapped standard deviation',
+    ('dist', 'range1'): '95% regression uncertainty',
+    ('dist', 'range2'): '95% bootstrapped uncertainty',
+}
+TRANSLATE_INSTITUTES = {  # map ids to (and alphabetize by) more familiar abbreviations
+    'AS-RCEC': 'AS (TW)',  # 'AS',  # Taipei Academia Sinica, Taiwan
+    'AWI': 'AWI (DE)',  # Alfred Wegener Institute, Germany
+    'BCC': 'BCC (CN)',  # Beijing Climate Center, China
+    'BNU': 'BNU (CN)',  # Beijing N. University, China
+    'CAMS': 'CAMS (CN)',  # Chinese Academy of Meteorological Sciences, China
+    'CAS': 'CAS (CN)',  # 'FGOALS',  # Chinese Academy of Sciences, China
+    'CCCma': 'CCCma (CA)',  # 'CanESM',  # Can. Cen. Clim. Modelling + Analaysis, Canada
+    'CMCC': 'CMCC (IT)',  # 'CMCC-Esm',  # Cen. Euro-Med. Cambiamenti Climatici, Italy
+    'CNRM-CERFACS': 'CNRM (FR)',  # Cen. National de Recherches Meteorologiques, France
+    'CSIRO': 'CSIRO (AU)',  # 'ACCESS',  # Commonwealth Sci. + Ind. Research Org.
+    'E3SM-Project': 'E3SM (US)',  # various USA institutes
+    'EC-Earth-Consortium': 'EC-Earth (EU)',  # various European institutes
+    'FIO': 'FIO (CN)',  # First Institute for Oceanography, China
+    'NOAA': 'GFDL (US)',  # 'NOAA',  # Geophysical Fluid Dynamics Laboratory, USA
+    'NASA': 'GISS (US)',  # 'NASA',  # Goddard Institute for Space Studies, USA
+    'CCCR-IITM': 'IITM (IN)',  # Indian Institute of Tropical Meteorology, India
+    'INM': 'INM (RU)',  # Institute for Numerical Mathematics, Moscow
+    'IPSL': 'IPSL (FR)',  # Institut Pierre Simon Laplace, France
+    'KIOST': 'KIOST (KR)',  # Korea Institute of Ocean Science & Technology, Korea
+    'NIMS-KMA': 'KMA (KR)',  # 'KACE',  # Korea Meteorological Administration, Korea
+    'MIROC': 'MIROC (JP)',  # jaMstec/nIes/R-ccs/aOri Consortium, Japan
+    'MOHC': 'MOHC (UK)',  # 'HadGEM',  # Met Office Hadley Centre, UK
+    'MPI-M': 'MPI (DE)',  # 'MPI-ESM',  # Max Planck Institut, Germany
+    'MRI': 'MRI (JP)',  # Meteorological Research Institute, Japan
+    'NCAR': 'NCAR (US)',  # 'CESM',  # National Center for Atmospheric Research, USA
+    'NCC': 'NCC (NO)',  # 'NorESM',  # NorESM Climate modeling Consortium, Norway
+    'NUIST': 'NUIST (CN)',  # 'NESM',  # Nanjing U. of Information Sci. and Tech., China
+    'SNU': 'SNU (KR)',  # 'SAM',  # Seoul National University, Korea
+    'THU': 'THU (CN)',  # 'CIESM',  # Beijing Tsinghua University, China
+    'UA': 'UA (US)',  # 'MCM-UA',  # University of Arizonta, USA
 }
 
 # Separate long and short label translations
@@ -402,8 +438,10 @@ def _capitalize_label(label, prefix=None, suffix=None):
         label = label[:1].lower() + label[1:]
     if prefix:
         prefix = prefix[:1].upper() + prefix[1:]
-    else:
+    elif label:
         label = label[:1].upper() + label[1:]
+    elif suffix:
+        suffix = suffix[:1].upper() + suffix[1:]
     parts = (prefix, label, suffix)
     label = ' '.join(filter(None, parts))
     return label
@@ -448,7 +486,7 @@ def _combine_labels(*labels, identical=False):
     return labels
 
 
-def _split_label(label, fontsize=None, refwidth=None, nmax=None):
+def _split_label(label, refwidth=None, fontsize=None, offset=None, nmax=None):
     """
     Helper function to split the label into separate lines.
 
@@ -458,46 +496,68 @@ def _split_label(label, fontsize=None, refwidth=None, nmax=None):
         The input label.
     refwidth : unit-spec, optional
         The reference maximum width.
+    fontsize : unit-spec, optional
+        The font size used for scaling.
+    offset : bool, optional
+        Whether to offset the final line.
     nmax : int, optional
-        Optional maximum number of breaks to use.
+        The maximum number of breaks to use.
     """
-    # NOTE: This adds extra padding to allow labels to extend into border.
-    # NOTE: Adjust contribution from math, e.g. 2$\times$CO$_2$, since this
-    # consists of mahy characters that do not contribute to actual space.
-    label = label or ''
-    label = label.replace('\n', ' ')  # remove previous wrapping just in case
-    label = label + ' '  # end with dummy space for threshold loop below
-    idxs_space = np.array([i for i, c in enumerate(label) if c == ' '])
-    idxs_check = idxs_space.astype(float)
-    for m in re.finditer(r'\$[^$]+\$', label):
-        i, j = m.span()
-        tex = label[i + 1:j - 1]  # text inside '$$'
+    # Adjust label for math text
+    # TODO: Search for existing matplotlib auto-font-wrapping utilities. Suspect
+    # could use e.g. tight layout and bounding box logic.
+    label = label or ''  # default string
+    label = label.replace('\n', ' ') + ' '  # remove previous breaks
+    imasks, imaths = [], []  # space within math
+    ispace = np.array([i for i, c in enumerate(label) if c == ' '])
+    icheck = ispace.astype(float)
+    for m in re.finditer(r'\$[^$]+\$', label):  # skip math between
+        idx, jdx = m.span()  # index range providing '$math$'
+        tex = label[idx + 1:jdx - 1]  # content inside '$math$'
         tex = re.sub(r'\\[A-Za-z]+\{([^}]*)\}', r'\1', tex)  # replace e.g. \mathrm{}
         tex = re.sub(r'[_^]\{?[0-9A-Za-z+-]*\}?', '#', tex)  # replace exponents
-        tex = re.sub(r'\s*\\[.,:;]\s*', '', tex)  # replace space between terms
-        tex = re.sub(r'\\[A-Za-z]+', 'x', tex)  # replace tex symbol
-        idxs_check[(idxs_check >= i) & (idxs_check < j)] = np.nan  # no breaks here
-        idxs_check[idxs_check >= j] -= j - i - 1 - len(tex)  # size used for wrap
-    basesize = pplt.rc['font.size']  # reference size
-    fontscale = pplt.utils._fontsize_to_pt(fontsize or basesize) / basesize
-    refwidth = pplt.units(refwidth or pplt.rc['subplots.refwidth'], 'in', 'em')
-    refscale = FONT_SCALE / fontscale  # font scaling for line wrapping detection
-    thresholds = refscale * refwidth * np.arange(1, 20)
-    seen, chars, count = set(), list(label), 0  # convert string to list
-    for thresh in thresholds:
-        idxs, = np.where(idxs_check <= thresh)
-        if not np.any(idxs_check > thresh):  # no spaces or end-of-string over this
+        tex = re.sub(r'\s*\\[.,:;]\s*', '', tex)  # replace spaces between terms
+        tex = re.sub(r'\\[A-Za-z]+', 'x', tex)  # replace tex symbols with char
+        tex = re.sub(r'[ ,.:;{}()[\]\\]', '', tex)  # remove dots and tex chars
+        span = jdx - idx - 1  # actual character span
+        mask1 = (icheck >= idx) & (icheck < jdx)
+        mask2 = icheck >= jdx
+        imaths.extend(range(idx, jdx))  # record math zones
+        imasks.append((mask1, mask2, span - len(tex)))  # adjust by span differences
+    for m in re.finditer(r'[- ,.:;iltjfI{}()[\]]', label):
+        idx = m.start()
+        if m.start() in imaths:
             continue
-        if not idxs.size:  # including empty idxs_check
+        mask1 = np.zeros(icheck.shape, dtype=bool)
+        mask2 = icheck >= idx
+        imasks.append((mask1, mask2, 0.5))  # adjust by width
+    # Select line break positions
+    # NOTE: This counts characters toward fixed em-width and optionally offsets
+    # to prevent centered axes title from overlapping left-aligned a-b-c label
+    for mask1, mask2, adjust in imasks:
+        icheck[mask1] = np.nan  # no breaks here
+        icheck[mask2] -= adjust
+    size_ = fontsize or pplt.rc['font.size']
+    scale = pplt.utils._fontsize_to_pt(size_) / pplt.rc['font.size']
+    width = refwidth or pplt.rc['subplots.refwidth']
+    width = pplt.units(width, 'in', 'em')
+    width -= ABC_SCALE * scale if offset else 0
+    splits = CHAR_SCALE * (width / scale) * np.arange(1, 20)
+    seen, chars, count = set(), list(label), 0  # convert string to list
+    for split in splits:
+        idxs, = np.where(icheck <= split)
+        if not np.any(icheck > split):  # no spaces or end-of-string over this
+            continue
+        if not idxs.size:  # including empty icheck
             continue
         if nmax and count >= nmax:
             continue
         if idxs[-1] not in seen:  # avoid infinite loop and jump to next threshold
             seen.add(idx := idxs[-1])
-            thresholds -= thresh - idxs_check[idx]  # closer to threshold by this
-            chars[idxs_space[idx]] = '\n'
+            splits -= split - icheck[idx]  # closer to threshold by this
+            chars[ispace[idx]] = '\n'
             count += 1  # update newline count
-    return ''.join(chars[:-1])
+    return ''.join(chars[:-1])  # ignore trailing space
 
 
 def get_path(dataset, *kws_process):
@@ -1104,15 +1164,13 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
     )
     pathspecs = [dspec for ikws_process in kws_process for dspec in ikws_process]
     pathlabel = get_path(dataset, *pathspecs)
-    fontwidth = pplt.utils._fontsize_to_pt(pplt.rc.fontlarge)  # a-b-c label adjustment
-    axeswidth = refwidth - 3 * pplt.units(fontwidth, 'pt', 'in')
-    kw_fit = dict(fontsize=fontwidth, refwidth=axeswidth)
+    kw_split = dict(fontsize=pplt.rc.fontlarge, refwidth=refwidth, offset=True)
     if len(rowspecs) == 1 and len(colspecs) == 1:
         gridlabels = None
     elif len(rowspecs) > 1 and len(colspecs) > 1:
         gridlabels = tuple(gridlabels)  # NOTE: tuple critical for generate_plot
     elif len(rowspecs) > 1:
-        gridlabels = [_split_label(label, **kw_fit) for label in gridlabels[0]]
+        gridlabels = [_split_label(label, **kw_split) for label in gridlabels[0]]
     else:
-        gridlabels = [_split_label(label, **kw_fit) for label in gridlabels[1]]
+        gridlabels = [_split_label(label, **kw_split) for label in gridlabels[1]]
     return kws_process, kws_collection, figlabel, pathlabel, gridlabels

@@ -29,6 +29,13 @@ __all__ = [
     'feedback_datasets_text',
 ]
 
+# Models to skip
+# NOTE: Went through trouble of processing these models but cannot compute cloud
+# feedbacks... would be confusing to include them in net feedback analyses but
+# exclude them from cloud feedback so skip for now. Also skip IPSL variant only
+# available from Zelinka et al. that does not have distinct control simulation.
+MODELS_SKIP = ('MCM-UA-1-0', 'FIO-ESM-2-0', 'IPSL-CM6A-LR-INCA')
+
 # Regular expressions
 # NOTE: This omits the final possible suffixes e.g. '_lam' or '_ecs'. The
 # specifiers relevant for use are in groups \1, \3, \5, and \6.
@@ -36,7 +43,7 @@ __all__ = [
 # radiative response (i.e. net minus effective forcing). This is good idea.
 REGEX_EXP = re.compile(r'([a-df-zA-DF-Z]+)([-+]?[0-9]+)')
 REGEX_FLUX = re.compile(r'(\A|[^_]*)(_?r)([lsf])([udner])([tsa])(cs|ce|)')
-REGEX_DIREC = re.compile(r'(upwelling|downwelling|outgoing|incident)')
+REGEX_DIRECTION = re.compile(r'(upwelling|downwelling|outgoing|incident)')
 REGEX_TRANSPORT = re.compile(r'(mse|total)')
 
 # Keyword arguments
@@ -50,15 +57,6 @@ KEYS_ENERGY = ('drop_clear', 'drop_directions', 'skip_solar')
 KEYS_TRANSPORT = ('parts_local', 'parts_eddies', 'parts_static', 'parts_fluxes')
 KEYS_VERSION = ('implicit', 'alternative', 'explicit', 'drop_components')
 KEYS_MOIST = ('parts_cloud', 'parts_precip', 'parts_phase')
-
-# Models to skip
-# NOTE: Went through trouble of processing these models but cannot compute cloud
-# feedbacks... would be confusing to include them in net feedback analyses but
-# exclude them from cloud feedback analyses. Skip until they provide more data.
-MODELS_SKIP = (
-    'MCM-UA-1-0',
-    'FIO-ESM-2-0',
-)
 
 # Renaming facets
 # NOTE: Previously renamed piControl and abrupt-4xCO2 to 'control' and 'response'
@@ -529,7 +527,7 @@ def _update_climate_energetics(
             long_name = dataset[keys[0]].attrs['long_name']
             unit = 'W m^-2'
         long_name = long_name.replace('radiation', 'flux')
-        long_name = REGEX_DIREC.sub('net', long_name)
+        long_name = REGEX_DIRECTION.sub('net', long_name)
         dataset[name].attrs.update({'units': unit, 'long_name': long_name})
     if drop_directions:
         dataset = dataset.drop_vars(keys_directions & dataset.data_vars.keys())
@@ -1391,7 +1389,7 @@ def feedback_datasets_json(
         with open(file, 'r') as f:
             source = json.load(f)
         for model, ensembles in source[project].items():
-            if model == 'IPSL-CM6ALR-INCA':  # no separate control version
+            if model in MODELS_SKIP:  # no separate control version
                 continue
             if model not in constraints.get('model', (model,)):
                 continue
@@ -1495,6 +1493,8 @@ def feedback_datasets_text(
                 continue
             for model in dataset.model.values:
                 facets = ('CMIP5', model, 'abrupt4xco2', 'flagship')
+                if model in MODELS_SKIP:
+                    continue
                 if model not in constraints.get('model', (model,)):
                     continue
                 if 'flagship' not in constraints.get('ensemble', ('flagship',)):

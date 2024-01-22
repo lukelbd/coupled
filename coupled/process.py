@@ -24,24 +24,6 @@ from cmip_data.feedbacks import FEEDBACK_DEPENDENCIES
 __all__ = ['get_data', 'process_data']
 
 
-# Model-estimated bootstrapped feedback uncertainty
-# NOTE: See templates.py _calc_bootstrap for calculation details
-# TODO: Record degrees of freedom and autocorrelation across successive bootstrap
-# feedback estimates (e.g. year 0-20 estimate will be related to year 5-25). For now
-# just assume implied distribution is Gaussian in _constrain_data() below.
-BOOTSTRAP_SPREAD = {
-    'cld': {20: np.nan, 40: np.nan, 60: np.nan},
-    'net': {20: 0.38, 40: 0.22, 60: 0.13},
-    'cs': {20: 0.24, 40: 0.15, 60: 0.10},
-    'cre': {20: 0.31, 40: 0.20, 60: 0.12},
-    'lw': {20: 0.24, 40: 0.15, 60: 0.10},
-    'lwcs': {20: 0.13, 40: 0.07, 60: 0.05},
-    'lwcre': {20: 0.15, 40: 0.10, 60: 0.07},
-    'sw': {20: 0.32, 40: 0.19, 60: 0.13},
-    'swcs': {20: 0.17, 40: 0.11, 60: 0.08},
-    'swcre': {20: 0.35, 40: 0.21, 60: 0.14},
-}
-
 # Observational constraint mean and spreads
 # TODO: Auto-generate this dictionary or save and commit then parse a text file.
 # NOTE: These show best estimate, standard errors, and degrees of freedom for feedback
@@ -63,6 +45,24 @@ FEEDBACK_CONSTRAINTS = {
     'hadcre': (0.30, 0.24, 131),
     'hadswcre': (0.15, 0.26, 140),
     'hadlwcre': (0.15, 0.14, 184),
+}
+
+# Model-estimated bootstrapped feedback uncertainty
+# NOTE: See templates.py _calc_bootstrap for calculation details
+# TODO: Record degrees of freedom and autocorrelation across successive bootstrap
+# feedback estimates (e.g. year 0-20 estimate will be related to year 5-25). For now
+# just assume implied distribution is Gaussian in _constrain_data() below.
+INTERNAL_VARIABILITY = {
+    'cld': {20: np.nan, 40: np.nan, 60: np.nan},
+    'net': {20: 0.38, 40: 0.22, 50: 0.19, 60: 0.13},
+    'cs': {20: 0.24, 40: 0.15, 50: 0.13, 60: 0.10},
+    'cre': {20: 0.31, 40: 0.20, 50: 0.18, 60: 0.12},
+    'lw': {20: 0.24, 40: 0.15, 50: 0.15, 60: 0.10},
+    'lwcs': {20: 0.13, 40: 0.07, 50: 0.07, 60: 0.05},
+    'lwcre': {20: 0.15, 40: 0.10, 50: 0.09, 60: 0.07},
+    'sw': {20: 0.32, 40: 0.19, 50: 0.17, 60: 0.13},
+    'swcs': {20: 0.17, 40: 0.11, 50: 0.10, 60: 0.08},
+    'swcre': {20: 0.35, 40: 0.21, 50: 0.18, 60: 0.14},
 }
 
 # Variable dependencies
@@ -104,21 +104,21 @@ def equator_pole_diffusivity(self, name):  # noqa: E302
     transport = transport.sel(lat=slice(0, 90)).climo.average('area')
     return transport / delta
 
-# Declare variables
+# Register variables
 # TODO: Restore this after updating climopy and move to definitions file
 # TODO: Use this approach for flux addition terms and other stuff
 # climo.register_derivation(re.compile(r'\A(ta|ts)_grad\Z'))(equator_pole_delta)
 # climo.register_derivation(re.compile(r'\A(ta|ts)_diff\Z'))(equator_pole_diffusivity)
 # with warnings.catch_warnings():  # noqa: E305
-#     warnings.simplefilter('ignore')
-#     vreg.define('ta_grad', 'equator-pole air temperature difference', 'K')
-#     vreg.define('ts_grad', 'equator-pole surface temperature difference', 'K')
-#     vreg.define('ta_diff', 'bulk energy transport diffusivity', 'PW / K')
-#     vreg.define('ts_diff', 'bulk energy transport surface diffusivity', 'PW / K')
+# warnings.simplefilter('ignore')
+# vreg.define('ta_grad', 'equator-pole air temperature difference', 'K')
+# vreg.define('ts_grad', 'equator-pole surface temperature difference', 'K')
+# vreg.define('ta_diff', 'bulk energy transport diffusivity', 'PW / K')
+# vreg.define('ts_diff', 'bulk energy transport surface diffusivity', 'PW / K')
 
 
 def _constrain_data(
-    data0, data1, constraint=None, pctile=None, N=None, bootstrap=None, graphical=False
+    data0, data1, constraint=None, pctile=None, observed=None, variability=None, graphical=False, N=None,  # noqa: E501
 ):
     """
     Return percentile bounds for observational constraint.
@@ -133,12 +133,14 @@ def _constrain_data(
         The 95% bounds on the observational constraint.
     pctile : float, default: 95
         The emergent constraint percentile bounds to be returned.
-    N : int, default: 100000
-        The number of bootstrapped samples to carry out.
-    bootstrap : bool or int, optional
-        Whether to include model bootstrap-estimated observed uncertainty.
+    observed : int, default: 20
+        Number of years to assume for observational uncertainty estimate.
+    variability : bool or int, optional
+        Number of years for variability variability estimate.
     graphical : bool, optional
         Whether to use graphical intersections instead of residual bootstrapping.
+    N : int, default: 100000
+        The number of bootstrapped samples to carry out.
 
     Returns
     -------
@@ -155,15 +157,17 @@ def _constrain_data(
     # NOTE: Use N - 2 degrees of freedom for both observed feedback and inter-model
     # coefficients since they are both linear regressions. For now ignore uncertainty
     # of individual feedback regressions that comprise inter-model regression because
-    # their sample sizes are larger (150 years) and uncertainties are unc-rrelated so
+    # their sample sizes are larger (150 years) and uncertainties are uncorrelated so
     # should roughly cancel out across e.g. 30 members of ensemble.
-    constraint = 'cld' if constraint is None or constraint is True else constraint
-    bootstrap = 20 if bootstrap is None or bootstrap is True else bootstrap
-    pctile = 90 if pctile is None or pctile is True else pctile
-    pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
-    kwargs = dict(pctile=pctile, adjust=False)  # no correlation across ensembles
     name = constraint if isinstance(constraint, str) else None
     name = FEEDBACK_ALIASES.get(name, name)
+    pctile = 95 if pctile is None or pctile is True else pctile
+    pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
+    observed = observed or 20
+    variability = observed if variability is None or variability is True else variability  # noqa: E501
+    variability = INTERNAL_VARIABILITY[name][variability] if variability else None
+    constraint = 'cld' if constraint is None or constraint is True else constraint
+    kwargs = dict(pctile=pctile, adjust=False)  # no correlation across ensembles
     N = N or 10000  # samples to draw
     if name is not None:
         constraint = FEEDBACK_CONSTRAINTS[name]
@@ -172,16 +176,14 @@ def _constrain_data(
     if data0.ndim != 1 or data1.ndim != 1:
         raise ValueError(f'Invalid data dims {data0.ndim} and {data1.ndim}. Must be 1D.')  # noqa: E501
     xmean, xscale, xdof = constraint  # note dof will have small effect
-    nbounds = 1 if bootstrap is False else 2  # number of bounds returned
-    if bootstrap is not False:
-        xdof *= bootstrap // 20  # e.g. if 60 then expand
-        xscale /= np.sqrt(bootstrap // 20)  # i.e. times sqrt(record / record_actual)
-        bootstrap = BOOTSTRAP_SPREAD[name][bootstrap]
+    xdof *= observed / 20  # increased degrees of freedom
+    xscale /= np.sqrt(observed / 20)  # reduced regression error
+    nbounds = 1 if variability is None else 2  # number of bounds returned
     xmin, xmax = stats.t(df=xdof, loc=xmean, scale=xscale).ppf(0.01 * pctile)
     observations = np.array([xmin, xmean, xmax])
-    if bootstrap is not False:  # e.g. True or None
+    if variability is not None:
         xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
-        es = stats.norm(loc=0, scale=bootstrap).rvs(N)  # implied variability error
+        es = stats.norm(loc=0, scale=variability).rvs(N)  # implied variability error
         observations = np.insert(np.percentile(xs + es, pctile), 1, observations)
     data0 = np.array(data0).squeeze()
     data1 = np.array(data1).squeeze()
@@ -213,9 +215,9 @@ def _constrain_data(
         constrained = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
         ys = mean1 + bmean * (xs - mean0)  # no regression uncertainty
         alternative = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
-        if bootstrap is not False:
+        if variability is not None:
             xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
-            es = stats.norm(loc=0, scale=bootstrap).rvs(N)  # implied variability error
+            es = stats.norm(loc=0, scale=variability).rvs(N)  # implied variability
             ys = rs + mean1 + bmean * (xs + es - mean0)
             constrained = np.insert(np.percentile(ys, pctile), 1, constrained)
             ys = mean1 + bmean * (xs + es - mean0)

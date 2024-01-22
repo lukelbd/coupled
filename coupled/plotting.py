@@ -687,7 +687,7 @@ def _props_command(data, kw_collection):
     periods = periods * (len(perturbs) if len(periods) == 1 else 1)
     options = list(zip(perturbs, *zip(*periods)))
     others = []  # other coordinates for color cycle
-    exclude = ('project', 'institute', 'experiment', 'start', 'stop')
+    exclude = ('project', 'experiment', 'start', 'stop')
     exclude += () if len(set(perturbs)) == 1 else ('style',)
     index = data.indexes[data.dims[0]]  # 'facets' or 'components' form _merge_dists()
     for key in index:  # iterate over multi-index values
@@ -1516,7 +1516,8 @@ def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=
 
 def _setup_scatter(
     ax, data0, data1, handle=None, zeros=False, oneone=False, linefit=False, annotate=False,  # noqa: E501
-    constraint=None, alternative=None, original=None, bootstrap=None, graphical=False, pctile=None,  # noqa: E501
+    constraint=None, pctile=None, observed=None, variability=None, graphical=False,
+    alternative=None, original=None,
 ):
     """
     Adjust and optionally add content to scatter plots.
@@ -1540,18 +1541,20 @@ def _setup_scatter(
         Whether to add a least-squares fit line.
     annotate : bool, optional
         Whether to add annotations to the scatter markers.
-    constraint : float, optional
-        Whether to illustrate a constraint. If ``True`` uses a default value.
+    constraint : bool or float, optional
+        Whether to plot emergent constraint results.
+    pctile : float, default: 95
+        Percentile range used for line fit and constraint bounds.
+    observed : int, default: 20
+        Passed to `_constrain_data`. Number of years for regression uncertainty spread.
+    variability : bool or int, optional
+        Passed to `_constrain_data`. Number of years for internal variability spread.
+    graphical : bool, optional
+        Passed to `_constrain_data`. Whether to use graphical intersectoins.
     alternative : bool, optional
         Whether to include alternative estimate that omits regression uncertainty.
     original : str or bool, optional
         Whether to include original unconstrained inter-model uncertainty bounds.
-    bootstrap : bool or int, optional
-        Passed to `_constrain_data`. Whether to include internal variability estimate.
-    graphical : bool, optional
-        Passed to `_constrain_data`. Whether to use graphical intersectoins.
-    pctile : float, optional
-        Percentile range used for line fit and constraint bounds.
     """
     # Add reference one:one line
     # NOTE: This also disables autoscaling so that line always looks like a diagonal
@@ -1599,7 +1602,7 @@ def _setup_scatter(
     # label = rf'r$={np.sign(slope) * rsquare.item() ** 0.5:.2f}$'
     # color = 'red' if constraint is None else color  # line fit color
     if linefit or constraint is not None:
-        pctile = pctile or 90  # default percentiule range
+        pctile = pctile or 95  # default percentile range
         ax.use_sticky_edges = False  # show end of line fit shading
         slope, _, _, rsquare, fit, fit_lower, fit_upper = _components_slope(
             data0, data1, dim=data0.dims[0], adjust=False, pctile=pctile,
@@ -1612,7 +1615,7 @@ def _setup_scatter(
         color = 'gray8' if constraint is None or not handle else handle[0].get_color()
         ax.plot(datax, fit, ls='-', lw=1.5 * pplt.rc.metawidth, c=color)
         ax.area(datax, fit_lower.squeeze(), fit_upper.squeeze(), lw=0, a=0.3, c=color)
-        ax.format(lrtitle=label)  # variance explained annotation
+        ax.format(lrtitle=label, lrtitle_kw={'size': 'med'})
 
     # Add constraint indicator
     # NOTE: Here get constrained/unconstrained standard deviation ratio using ratio of
@@ -1622,17 +1625,20 @@ def _setup_scatter(
     # both with and without regression uncertainty. If bounds is not False then this
     # shows two x-regions and y-regions with and without observational feedback
     # uncertainty implied from ensemble-mean bootstrapped pre-industrial results.
-    # param = r'\mathrm{CI}_{\mathrm{constrained}}\,/\,\mathrm{CI}_{\mathrm{unconstrained}}'  # noqa: E501
+    # param = r'1\,-\;\dfrac{CI_{\mathrm{constrained}}}{CI_{\mathrm{unconstrained}}}'  # noqa: E501
+    # ratio = 1 - (ymaxs2[-1] - ymins2[0]) / (yorigs[1] - yorigs[0])
+    # param = r'CI_{\mathrm{constrained}}\,/\,CI_{\mathrm{unconstrained}}'
+    # label = rf'${param}\,=\,{ratio:.2f}$'
     if constraint is not None:
         original = 'xy' if original is True else '' if original is False else original
         original = ''.join('y' if original is None else original)
-        pctile = pctile or 90  # default percentiule range
+        pctile = pctile or 95  # default percentile range
         bounds = (50 - 0.5 * pctile, 50 + 0.5 * pctile)
         xorigs = np.percentile(data0, bounds) if 'x' in original else ()
         yorigs = np.percentile(data1, bounds) if 'y' in original else ()
-        kwargs = dict(constraint=constraint, graphical=graphical, bootstrap=bootstrap)
+        kwargs = dict(observed=observed, variability=variability, graphical=graphical)
         xcolor, ycolor = 'cyan7', 'pink7'
-        xs, ys1, ys2 = _constrain_data(data0, data1, pctile=pctile, **kwargs)
+        xs, ys1, ys2 = _constrain_data(data0, data1, constraint, pctile=pctile, **kwargs)  # noqa: E501
         nbounds = len(xs) // 2  # should be one or two
         xmins, xmean, xmaxs = xs[:nbounds], xs[nbounds], xs[-nbounds:]
         ymins1, ymean, ymaxs1 = ys1[:nbounds], ys1[nbounds], ys1[-nbounds:]
@@ -1657,9 +1663,14 @@ def _setup_scatter(
         for bound in yorigs:  # unconstrained y bounds using scatter color
             horig = ax.axhline(bound, ls='--', lw=0.7, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
         handle = [tuple(xobjs), tuple(yobjs)] + ([horig] if horig else [])
-        ratio = abs((ymins2[0] - ymaxs2[-1]) / (yorigs[1] - yorigs[0]))
-        param = r'\sigma_{\mathrm{constrained}}\,/\,\sigma_{\mathrm{unconstrained}}'
-        ax.format(ultitle=rf'${param}\,=\,{ratio:.2f}$')
+        param = r'CI_{\mathrm{constrained}} - CI_{\mathrm{unconstrained}}'
+        param = rf'\dfrac{{{param}}}{{CI_{{\mathrm{{unconstrained}}}}}}'
+        ratio = (ymaxs2[-1] - ymins2[0]) / (yorigs[1] - yorigs[0]) - 1
+        ratio = ureg.Quantity(ratio, '').to('percent')
+        label = rf'${param}\,=\,{ratio:~L.0f}$'
+        label = re.sub(r'(?<!\\)%', r'\%', label)
+        label = re.sub(r'(?<!\s)-', '{-}', label)
+        ax.format(ultitle=label, ultitle_kw={'size': 'med'})
     return handle
 
 
@@ -2228,10 +2239,11 @@ def generate_plot(
                 kw_other = {key: val for key, val in kw_other.items() if key in keys}
                 handle = _setup_bars(ax, args, errdata, handle, **kw_other)
             if 'scatter' in command:
-                keys = ('zeros', 'oneone', 'linefit', 'annotate', 'constraint', 'bootstrap', 'graphical')  # noqa: E501
+                keys = ('zeros', 'oneone', 'linefit', 'annotate', 'alternative', 'original')  # noqa: E501
+                keys += ('constraint', 'observed', 'variability', 'graphical')
                 oneone = oneone or kw_other.get('oneone', False)
                 kw_other = {key: val for key, val in kw_other.items() if key in keys}
-                handle = _setup_scatter(ax, *args, handle, **kw_other)  # 'args' is 2-tuple
+                handle = _setup_scatter(ax, *args, handle, **kw_other)  # 'args' 2-tuple
             if 'violin' in command:
                 keys = ('horizontal', 'alpha', 'hatch', 'linewidth', 'edgecolor')
                 line = [line for line in ax.lines if line not in prevlines]
@@ -2264,7 +2276,7 @@ def generate_plot(
             label = kw_guide.pop('label', None)
             if 'label' in data.coords:
                 label = None  # TODO: optionally disable
-            if 'scatter' in command and not isinstance(handle, list):
+            if 'scatter' in command and not kw_other.get('constraint'):
                 handle = label = None  # TODO: optionally disable
             if command in ('contourf', 'pcolormesh') and (norm := handle.norm):
                 hashable += (('vmin', norm.vmin), ('vmax', norm.vmax), ('N', norm.N))
@@ -2415,19 +2427,16 @@ def generate_plot(
     colkey = 'bottomlabels' if labelbottom else 'toplabels'
     fig.format(figtitle=figtitle, **{rowkey: rowlabels, colkey: collabels})
     if save:  # save path
-        path = Path().expanduser().resolve()
-        if path.name in ('notebooks', 'meetings', 'manuscripts'):
-            path = path.parent  # parent project directory
-        name = 'figures-publication' if isinstance(save, str) else 'figures'
-        path = path / name
-        if not path.is_dir():
-            raise ValueError(f'Path {str(path)!r} does not exist.')
-        name = save
+        base = Path().expanduser().resolve()
+        if base.name in ('notebooks', 'meetings', 'manuscripts'):
+            base = base.parent  # parent project directory
+        if not base.is_dir():
+            raise ValueError(f'Path {str(base)!r} does not exist.')
         methods = '-'.join(methods)
         commands = '-'.join(commands)
-        if not isinstance(save, str):
-            name = '_'.join((methods, pathlabel, commands, indicator))
-        path = path / name
+        file = save if isinstance(save, str) else '_'.join((methods, pathlabel, commands, indicator))  # noqa: E501
+        folder = 'figures-publication' if isinstance(save, str) else 'figures'
+        path = base / folder / file  # figure path
         figwidth, figheight = fig.get_size_inches()
         figsize = f'{figwidth:.1f}x{figheight:.1f}in'  # figure size
         print(f'Saving ({figsize}): ~/{path.relative_to(Path.home())}')

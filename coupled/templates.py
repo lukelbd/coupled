@@ -41,8 +41,8 @@ KEYS_SHADING = (
 )
 
 # Keywords for generating dictionary specs from kwargs
-# NOTE: These can be passed as vectors to generate_specs for combining along rows/cols.
 # TODO: Remove 'base' kludge and permit vectors specifications on each side of pair.
+# NOTE: These can be passed as vectors to generate_specs for combining along rows/cols.
 KEYS_BREAK = (
     'breakdown', 'component', 'feedbacks', 'adjusts', 'forcing', 'sensitivity', 'transport'  # noqa: E501
 )
@@ -123,7 +123,7 @@ SPECS_FEEDBACK = {
 }
 
 
-def _find_data(
+def _load_data(
     source, variable, model, experiment, project=None, annual=True, average=True, fluxes=None,  # noqa: E501
 ):
     """
@@ -149,7 +149,7 @@ def _find_data(
     data : xarray.Dataset or xarray.DataArray
         The resulting data.
     """
-    # NOTE: This is used both in below _calc_warming and _calc_bootstrap and
+    # NOTE: This is used both in below _calc_warming and _calc_internal and
     # in figures.py function for plotting Gregory regressions of model fluxes.
     from cmip_data.utils import average_periods
     source = Path(source).expanduser()
@@ -179,7 +179,7 @@ def _find_data(
     return data[keys[0]] if len(keys) == 1 else data
 
 
-def _calc_bootstrap(
+def _calc_internal(
     dataset, source='~/scratch/cmip-fluxes', bootstrap=None, wav=None, sky=None,
 ):
     """
@@ -204,15 +204,16 @@ def _calc_bootstrap(
     # NOTE: Use standard deviation instead of percentiles for consistency with
     # NOTE: This is used both to return global average time series for use with
     # plot_feedback() and to actually calculate results for storing on dataset.
-    from constraints.observed import calc_feedback
+    from observed.feedbacks import calc_feedback
     skies = sky or ('', 'cs', 'ce')
     skies = (skies,) if isinstance(skies, str) else tuple(skies)
     wavs = wav or ('f', 'l', 's')
     wavs = (wavs,) if isinstance(wavs, str) else tuple(wavs)
     names = tuple(f'r{wav}nt{sky}_lam' for wav, sky in itertools.product(wavs, skies))
-    bootstraps = np.atleast_1d(bootstrap or 20)  # number of bootstrap years
+    bootstraps = np.atleast_1d(bootstrap or 20)
     count = xr.DataArray(bootstraps, dims='count')
-    dist = xr.DataArray(['mean', 'sigma', 'spread'], dims='dist')
+    dist = ['mean', 'sigma1', 'sigma2', 'range1', 'range2']
+    dist = xr.DataArray(dist, dims='dist')
     base = dataset.rlnt_lam.isel(lon=0, lat=0, version=0, drop=True)
     base = base.expand_dims(dist=dist, count=count)
     base.attrs.clear()
@@ -224,29 +225,33 @@ def _calc_bootstrap(
         if ensemble != 'flagship' or experiment != 'picontrol':
             continue
         facets = (project, model, experiment, ensemble)
-        data = _find_data(source, 'fluxes', model, experiment, project=project, annual=False)  # noqa: E501
+        data = _load_data(source, 'fluxes', model, experiment, project=project, annual=False)  # noqa: E501
         if data is None:
             continue
-        pctile = 90  # use same as process.py _constrain_data
         attrs = ('units', 'short_name', 'long_name')  # attribute to infer
         month = data.time.dt.strftime('%b').values[0]
         data = data.rename(ts='ts_gis')  # then passed to observed utils
         print(f'{model}_{month} (', end=' ')
         for wav, sky, bootstrap in itertools.product(wavs, skies, bootstraps):
             kw = dict(wav=wav, sky=sky, bootstrap=bootstrap, pctile=False, detrend=True)
-            lam, lam_lower, lam_upper, *_ = calc_feedback(data, **kw)
-            sigma = 0.5 * (lam_upper - lam_lower)  # pctile=False returns +/- one sigma
-            lam_lower, lam_upper = var._dist_bounds(sigma, pctile=pctile)
-            spread = lam_upper - lam_lower  # interval assuming gaussian distribution
-            print(f'{spread.item():.2f}', end=' ')
+            lam, lam_lower, lam_upper, dof, *_ = calc_feedback(data, **kw)
+            dof = dof.mean('sample')  # average regression dof
+            count = lam.sizes['sample']  # total number of samples
+            sigma1 = 0.5 * (lam_upper - lam_lower).mean('sample')  # regression sigma
+            sigma2 = lam.std('sample', ddof=1)  # internal sigma
+            range1 = np.diff(var._dist_bounds(sigma1, pctile=True, dof=dof)).squeeze()
+            range2 = np.diff(var._dist_bounds(sigma2, pctile=True, dof=count)).squeeze()
+            print(f'{range1.item():.2f}/{range2.item():.2f}', end=' ')
             name = f'r{wav}nt{sky}_lam'  # standardized name
             attrs = {attr: get_data(dataset, name, attr) for attr in attrs}
             attrs['units'] = climo.encode_units(attrs['units'])
             result[name].attrs.update(attrs)
             index = {'facets': facets, 'count': bootstrap}
-            result[name].loc[{**index, 'dist': 'mean'}] = lam
-            result[name].loc[{**index, 'dist': 'sigma'}] = sigma
-            result[name].loc[{**index, 'dist': 'spread'}] = spread
+            result[name].loc[{**index, 'dist': 'mean'}] = lam.mean('sample')
+            result[name].loc[{**index, 'dist': 'sigma1'}] = sigma1
+            result[name].loc[{**index, 'dist': 'sigma2'}] = sigma2
+            result[name].loc[{**index, 'dist': 'range1'}] = range1
+            result[name].loc[{**index, 'dist': 'range2'}] = range2
         print(')', end=' ')
     return result
 
@@ -289,7 +294,7 @@ def _calc_warming(dataset, source='~/scratch/cmip-processed'):
             continue
         facets = (project, model, experiment, ensemble)
         ranges = periods if experiment == 'abrupt4xco2' else [(0, 150)]
-        temp = _find_data(source, 'ts', model, experiment, project=project)
+        temp = _load_data(source, 'ts', model, experiment, project=project)
         if temp is None:
             continue
         print(f'{model}_{experiment}', end=' ')
@@ -638,6 +643,10 @@ def feedback_specs(
     init_names = lambda ncols: ((names := np.array([[None] * ncols] * 25)), names.flat)
     if not component and not feedbacks and not forcing and not sensitivity:
         raise ValueError('Invalid keyword argument combination.')
+    forcing = forcing or breakdown and '_erf' in breakdown
+    sensitivity = sensitivity or breakdown and '_ecs' in breakdown
+    if breakdown is not None:
+        breakdown = breakdown.split('_erf')[0].split('_ecs')[0]
     if breakdown is None or component is not None:
         components = component or 'net'  # 'component' input overrides 'breakdown'
     elif SPECS_FEEDBACK:
@@ -825,7 +834,7 @@ def feedback_specs(
                 iflat[-offset % 3] = 'ecs'  # either before or after net and erf
             if forcing and not adjusts:
                 iflat[2 - offset] = erfs[0]
-            for b, arr, hum, idx in zip((feedbacks, adjusts), (lams, erfs), (4, 16)):
+            for b, arr, idx in zip((feedbacks, adjusts), (lams, erfs), (4, 16)):
                 if not b:
                     continue
                 iflat[1 - offset] = arr[0]

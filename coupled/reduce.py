@@ -11,15 +11,11 @@ from climopy import var, ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
-from .internals import ORDER_LOGICAL
+from .internals import ORDER_LOGICAL, TRANSLATE_INSTITUTES
 from .results import FACETS_NAME, FACETS_LEVELS, VERSION_NAME, VERSION_LEVELS
-from cmip_data.facets import MODELS_INSTITUTES, INSTITUTES_LABELS
+from cmip_data.facets import MODELS_INSTITUTES
 
 __all__ = ['reduce_facets', 'reduce_general']
-
-# model_to_inst = MODELS_INSTITUTES.copy()
-# model_to_inst['CMIP6', 'CERES'] = 'CERES'  # observations placeholder
-# inst_to_label = INSTITUTES_LABELS.copy()  # see also _parse_constraints
 
 # Reduction defaults
 # NOTE: Default 'style' depends on styles present and may be overwritten, and default
@@ -33,7 +29,7 @@ DEFAULTS_GENERAL = {
 DEFAULTS_VERSION = {
     'experiment': 'abrupt4xco2',
     'source': 'eraint',
-    'style': 'slope',  # possibly overwritten
+    'style': 'annual',  # possibly overwritten
     'start': 0,
     'stop': 150,
     'region': 'globe',
@@ -291,7 +287,7 @@ def _parse_project(facets, project=None):
     project = project or 'cmip'
     project = project.lower()
     name_to_inst = MODELS_INSTITUTES.copy()  # translate model names or labels
-    name_to_inst.update({lab: inst for inst, lab in INSTITUTES_LABELS.items()})
+    name_to_inst.update({lab: inst for inst, lab in TRANSLATE_INSTITUTES.items()})
     if not project.startswith('cmip'):
         raise ValueError(f'Invalid project indicator {project}. Must contain cmip.')
     _, number = project.split('cmip')
@@ -349,7 +345,7 @@ def _parse_institute(facets, institute=None, project=None):
     # with e.g. institute='GFDL'. Averages across each institute followed by reductions
     # along result are instead done with institute='avg' (see _reduce_institutes)
     project = project.item() if getattr(project, 'size', 0) == 1 else None
-    name_to_inst = {lab: inst for inst, lab in INSTITUTES_LABELS.items()}
+    name_to_inst = {lab: inst for inst, lab in TRANSLATE_INSTITUTES.items()}
     name_to_proj = {
         facet if isinstance(facet, str) else facet[int(len(facet) > 1)]:
         (facet[0] if len(facet) > 1 else project or 'CMIP').upper() for facet in facets
@@ -371,7 +367,7 @@ def _parse_institute(facets, institute=None, project=None):
             pair_to_model.get((key[0], pair_to_inst.get((key[0], key[1]))))
             == key[1]
         )
-    elif any(value == institute for pair in INSTITUTES_LABELS.items() for value in pair):  # noqa: E501
+    elif any(value == institute for pair in TRANSLATE_INSTITUTES.items() for value in pair):  # noqa: E501
         func = lambda key: (
             name_to_inst.get(institute, institute)
             == pair_to_inst.get((key[0], key[1]))
@@ -445,7 +441,7 @@ def _reduce_institutes(data):
         for key in data.facets.values
     ]
     facets = [
-        (key[0], INSTITUTES_LABELS.get(inst, inst), *key[2:])
+        (key[0], TRANSLATE_INSTITUTES.get(inst, inst), *key[2:])
         for inst, key in zip(insts, data.facets.values)
     ]
     group = xr.DataArray(
@@ -963,11 +959,11 @@ def reduce_general(data, attrs=None, **kwargs):
         # Iterate over reductions
         # NOTE: This silently skips dummy selections (e.g. area=None) that may be needed
         # to prevent _parse_specs from merging e.g. average and non-average selections.
-        names_spatial = ('area', 'spatial', 'start', 'stop', 'experiment')
-        names_indexers = (*data.sizes, 'area', 'volume', 'spatial', 'month', 'season')
-        names_indexers += tuple(level for idx in data.indexes.values() for level in idx.names)  # noqa: E501
         for dim, value in sorted(kw.items(), key=sorter):
-            if dim not in names_indexers or value is None:
+            names_spatial = ('area', 'start', 'stop', 'experiment')
+            names_select = (*data.sizes, 'area', 'volume', 'spatial', 'month', 'season')
+            names_select += tuple(level for idx in data.indexes.values() for level in idx.names)  # noqa: E501
+            if dim not in names_select or value is None:
                 continue
             if dim in names_spatial and kw.get('spatial', None) is not None:
                 continue

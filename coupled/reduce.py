@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Coordinate reduction utilities used by plotting functions.
+Utilities for reducing coupled model data coordinates.
 """
 import cftime
 import climopy as climo  # noqa: F401
@@ -11,15 +11,20 @@ from climopy import var, ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
-from .internals import ORDER_LOGICAL, TRANSLATE_INSTITUTES
-from .results import FACETS_NAME, FACETS_LEVELS, VERSION_NAME, VERSION_LEVELS
-from cmip_data.facets import MODELS_INSTITUTES
+from .specs import (
+    FACETS_NAME,
+    FACETS_LEVELS,
+    ORDER_LOGICAL,
+    VERSION_NAME,
+    VERSION_LEVELS,
+    INSTITUTE_LABELS,
+)
 
 __all__ = ['reduce_facets', 'reduce_general']
 
 # Reduction defaults
 # NOTE: Default 'style' depends on styles present and may be overwritten, and default
-# 'time' can be overwritten by None (see below). See also PATHS_IGNORE in internals.py.
+# 'time' can be overwritten by None (see below). See also PATHS_IGNORE in specs.py.
 DEFAULTS_GENERAL = {
     'experiment': 'picontrol',
     'ensemble': 'flagship',
@@ -203,7 +208,7 @@ def _components_covariance(data0, data1, resid=False, dim='facets'):
     return covar, std, other
 
 
-def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
+def _components_slope(data0, data1, dim=None, correct=False, pctile=None):
     """
     Return components of a line fit operation.
 
@@ -215,8 +220,9 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
         The other coordinates.
     dim : str, optional
         The dimension for the regression.
-    adjust : bool, optional
-        Whether to adjust the slope for autocorrelation effects.
+    correct : bool, optional
+        Whether to correct the standard error for reduced degrees of freedom due
+        to serial correlation. If string this is the series to use for the factor.
     pctile : bool or float, default: 95
         The percentile range for the lower and upper uncertainty bounds.
         Use ``False`` to instead just show standard error ranges.
@@ -230,8 +236,6 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     fit, fit_lower, fit_upper : xarray.DataArray
         The fit to the original points with `pctile` lower and upper bounds.
     """
-    # TODO: Change slope function to interpret e.g. pctile=90 as 90% range instead
-    # of threshold. Then check timescales project and elsewhere to ensure compatibility
     # NOTE: Here np.polyfit requires monotonically increasing coordinates. Not sure
     # why... could consider switching to manual slope and stderr calculation.
     # NOTE: Unlike climopy linefit(), which returns scalar slope standard error and
@@ -246,7 +250,7 @@ def _components_slope(data0, data1, dim=None, adjust=False, pctile=None):
     isel = {dim: np.argsort(data0.values, axis=axis)}
     data0, data1 = data0.isel(isel), data1.isel(isel)
     slope, sigma, rsquare, fit, fit_lower, fit_upper = var.linefit(
-        data0, data1, dim=dim, adjust=adjust, pctile=pctile,
+        data0, data1, dim=dim, correct=correct, pctile=pctile,
     )
     coords = {'x': data0, 'y': data1}
     fit.coords.update(coords)
@@ -269,7 +273,7 @@ def _parse_project(facets, project=None):
     Parameters
     ----------
     facets : numpy.ndarray
-        The facets. Used to scarch for models from the same institute in other projects.
+        The facets. Used to search for models from the same institute in other projects.
     project : str, default: 'cmip'
         The selection. Values should start with ``'cmip'``. No integer ending indicates
         all cmip5 and cmip6 models, ``5`` (``6``) indicates just cmip5 (cmip6) models,
@@ -286,8 +290,6 @@ def _parse_project(facets, project=None):
     # differences between row and column specs at given subplot entry.
     project = project or 'cmip'
     project = project.lower()
-    name_to_inst = MODELS_INSTITUTES.copy()  # translate model names or labels
-    name_to_inst.update({lab: inst for inst, lab in TRANSLATE_INSTITUTES.items()})
     if not project.startswith('cmip'):
         raise ValueError(f'Invalid project indicator {project}. Must contain cmip.')
     _, number = project.split('cmip')
@@ -305,11 +307,8 @@ def _parse_project(facets, project=None):
             other = '6' if num[0] == '5' else '5'
             both = len(set(num)) == 2
             func = lambda key, both=both, num=num, other=other: (
-                num[0] == key[0][-1] and both == any(
-                    name_to_inst.get(key[1], object())
-                    == name_to_inst.get(facet[1], object())
-                    for facet in facets if other == facet[0][-1]
-                )
+                num[0] == key[0][-1]  # compare institute labels
+                and both == any(key[1] == obj[1] for obj in facets if other == obj[0][-1])  # noqa: E501
             )
         else:
             raise ValueError(f'Invalid project number {num!r}.')
@@ -319,7 +318,7 @@ def _parse_project(facets, project=None):
     return func
 
 
-def _parse_institute(facets, institute=None, project=None):
+def _parse_institute(facets, institute=None):
     """
     Return plot labels and facet filter for the institute indicator.
 
@@ -332,9 +331,7 @@ def _parse_institute(facets, institute=None, project=None):
         `reduce_facets` will delay application to end of other selections. Otherwise
         this should be a specific institute name or ``'flagship'`` to select the
         curated "flagship" models from each institute, defined as the last models
-        in the institute definition lists from the `cmip_data.internals` database.
-    project : str, optional
-        The project. Pass this if `facets` are strings or scalar levels.
+        in the institute definition lists from the `cmip_data.facets` database.
 
     Returns
     -------
@@ -343,41 +340,23 @@ def _parse_institute(facets, institute=None, project=None):
     """
     # NOTE: Averages across a given institution are done using the default method='avg'
     # with e.g. institute='GFDL'. Averages across each institute followed by reductions
-    # along result are instead done with institute='avg' (see _reduce_institutes)
-    project = project.item() if getattr(project, 'size', 0) == 1 else None
-    name_to_inst = {lab: inst for inst, lab in TRANSLATE_INSTITUTES.items()}
-    name_to_proj = {
-        facet if isinstance(facet, str) else facet[int(len(facet) > 1)]:
-        (facet[0] if len(facet) > 1 else project or 'CMIP').upper() for facet in facets
-    }
-    pair_to_inst = {
-        (name_to_proj[model], model): inst
-        for model, inst in MODELS_INSTITUTES.items() if model in name_to_proj
-    }
-    pair_to_model = {
-        (proj, inst): model
-        for (proj, model), inst in pair_to_inst.items()
-    }
+    # along result are instead done with institute='avg' (see _institute_average)
+    inst_to_model = {facet[-2]: facet[-1] for facet in facets}  # flagships are last
+    name_to_inst = {lab: inst for inst, lab in INSTITUTE_LABELS.items()}
     if not institute:
         func = lambda key: True  # noqa: U100
     elif institute == 'avg':
-        func = _reduce_institutes
+        func = _institute_average
     elif institute == 'flagship':
-        func = lambda key: (
-            pair_to_model.get((key[0], pair_to_inst.get((key[0], key[1]))))
-            == key[1]
-        )
-    elif any(value == institute for pair in TRANSLATE_INSTITUTES.items() for value in pair):  # noqa: E501
-        func = lambda key: (
-            name_to_inst.get(institute, institute)
-            == pair_to_inst.get((key[0], key[1]))
-        )
+        func = lambda key: key[-1] == inst_to_model.get(key[-2], None)
+    elif any(item == institute for pair in name_to_inst.items() for item in pair):  # noqa: E501
+        func = lambda key: key[-2] == name_to_inst.get(institute, institute)
     else:
         raise ValueError(f'Invalid institute name {institute!r}.')
     return func
 
 
-def _restore_index(data, facets_name=None, version_name=None):
+def _index_restore(data, facets_name=None, version_name=None):
     """
     Restore multi-index coordinates after level reductions.
 
@@ -415,9 +394,9 @@ def _restore_index(data, facets_name=None, version_name=None):
     return data
 
 
-def _reduce_institutes(data):
+def _institute_average(data):
     """
-    Reduce facets index using institute averages.
+    Reduce facets index into institute averages.
 
     Parameters
     ----------
@@ -429,38 +408,27 @@ def _reduce_institutes(data):
     data : xarray.Dataset or xarray.DataArray
         The reduced data.
     """
-    # NOTE: This will be built into _reduce_single and _reduce_double in future, with
+    # NOTE: This will be built into _reduce_data and _reduce_datas in future, with
     # optional option to weight by institute instead of averaging. See reduce_general().
-    long_name = 'source institute'  # WARNING: critical to assign this
-    if 'facets' not in data.coords:
+    index = data.indexes.get('facets', None)
+    if index is None:  # missing index
         return data
-    if data.facets.attrs.get('long_name', '') == long_name:
+    if 'model' not in index.names:  # already averaged or selected
         return data
-    insts = [
-        MODELS_INSTITUTES.get(key[1], 'UNKNOWN')
-        for key in data.facets.values
-    ]
-    facets = [
-        (key[0], TRANSLATE_INSTITUTES.get(inst, inst), *key[2:])
-        for inst, key in zip(insts, data.facets.values)
-    ]
-    group = xr.DataArray(
-        pd.MultiIndex.from_tuples(facets, names=data.indexes['facets'].names),
-        attrs=data.facets.attrs,
-        dims='facets',  # WARNING: critical for groupby() to name this 'facets'
-        name='facets',
-    )
+    index = index.droplevel('model')  # preserve institute experiment
+    group = xr.DataArray(index, dims='facets', name='facets')
+    group.attrs.update(data.facets.attrs)
     data = data.groupby(group).mean(skipna=False, keep_attrs=True)
     facets = data.indexes['facets']  # WARNING: xarray bug drops level names
     facets.names = group.indexes['facets'].names
     data = data.climo.replace_coords(facets=facets)
-    data.facets.attrs['long_name'] = long_name
+    data.facets.attrs.update(group.attrs)
     return data
 
 
-def _reduce_time(data, time=None, season=None, month=None):
+def _select_time(data, time=None, season=None, month=None):
     """
-    Reduce the time coordinate of the data.
+    Reduce the time coordinate of the data using variety of operators.
 
     Parameters
     ----------
@@ -500,9 +468,9 @@ def _reduce_time(data, time=None, season=None, month=None):
     return data
 
 
-def _reduce_single(data, method, dim=None, pctile=None, std=None, preserve=True):
+def _reduce_data(data, method, dim=None, pctile=None, std=None, preserve=True):
     """
-    Apply reduction method for single data array.
+    Reduce individual data array using arbitrary method.
 
     Parameters
     ----------
@@ -617,9 +585,9 @@ def _reduce_single(data, method, dim=None, pctile=None, std=None, preserve=True)
     return result, defaults
 
 
-def _reduce_double(data0, data1, method, dim=None, pctile=None, std=None, invert=None):
+def _reduce_datas(data0, data1, method, dim=None, pctile=None, std=None, invert=None):
     """
-    Apply reduction method for two data arrays.
+    Reduce pair of data arrays using arbitrary method.
 
     Parameters
     ----------
@@ -734,10 +702,10 @@ def _reduce_double(data0, data1, method, dim=None, pctile=None, std=None, invert
 
 
 def reduce_facets(
-    *datas, method=None, verbose=False, pctile=None, std=None, preserve=None, invert=None,  # noqa: E501
+    *datas, method=None, pctile=None, std=None, preserve=None, invert=None, verbose=False,  # noqa: E501
 ):
     """
-    Reduce along the facets coordinate using an arbitrary method.
+    Reduce along the model facets coordinate using an arbitrary method.
 
     Parameters
     ----------
@@ -749,12 +717,12 @@ def reduce_facets(
         facets dimension for a single input argument, and ``corr|diff|proj|slope``
         reduce the facets dimension for two input arguments. Can also end string
         with ``_anom`` or ``_norm`` to take global anomaly or use normalization.
+    pctile, std, preserve : optional
+        Passed to `_reduce_data`.
+    pctile, std, invert : optional
+        Passed to `_reduce_datas`.
     verbose : bool, optional
         Whether to print extra information.
-    pctile, std, preserve : optional
-        Passed to `_reduce_single`.
-    pctile, std, invert : optional
-        Passed to `_reduce_double`.
 
     Returns
     -------
@@ -776,9 +744,9 @@ def reduce_facets(
     normalize = 'norm' in options
     kwargs = dict(dim='facets', std=std, pctile=pctile)
     if len(datas) == 1:
-        data, defaults = _reduce_single(*datas, method, preserve=preserve, **kwargs)
+        data, defaults = _reduce_data(*datas, method, preserve=preserve, **kwargs)
     elif len(datas) == 2:
-        data, defaults = _reduce_double(*datas, method, invert=invert, **kwargs)
+        data, defaults = _reduce_datas(*datas, method, invert=invert, **kwargs)
     else:
         raise ValueError(f'Unexpected argument count {len(datas)}.')
     if anomaly:
@@ -844,10 +812,10 @@ def reduce_general(data, attrs=None, **kwargs):
     # TODO: In future will add 'institute' MultiIndex level (see also results.py).
     # Should replace parsers with a function that does basic project and institute
     # selections (note e.g. 'cmip65' is already an institute-based selection so should
-    # be in same function anyway), then modify _reduce_single() and _reduce_double()
-    # to support either insitute-averaging preceding the facet operations or using
-    # weights .groupby(grouper) + 1 / xr.ones_like(facets).groupby(grouper).sum(). Both
-    # will need 'groupers' e.g. a facets array without the model level. Could use
+    # be in same function anyway), then modify _reduce_data() and _reduce_datas() to
+    # support either insitute-averaging preceding the facet operations or using weights
+    # ones = xr.ones_like(facets); ones.groupby(grouper) / ones.groupby(grouper).sum().
+    # Both will need 'groupers' e.g. a facets array without the model level. Could use
     # simliar method to get ensemble average across individual model versions (similar
     # to other papers e.g. Caldwell or Brient maybe that used multiple versions?)
     institute = kwargs.pop('institute', None)  # apply after end
@@ -858,7 +826,7 @@ def reduce_general(data, attrs=None, **kwargs):
     facets_name = facets_name or 'source facets'  # default name
     if parse and institute is not None and 'institute' not in facets_name:
         institute = _parse_institute(data.facets.values, institute)
-        if institute is not _reduce_institutes:  # otherwise delay
+        if institute is not _institute_average:  # otherwise delay
             facets = list(filter(institute, data.facets.values))
             data = data.sel(facets=facets)
     if parse and project is not None:
@@ -974,7 +942,7 @@ def reduce_general(data, attrs=None, **kwargs):
             if dim == 'area' and value != 'avg':  # average over truncated region
                 data, value = data.climo.truncate(AREA_REGIONS[value]), 'avg'
             if dim in ('time', 'month', 'season'):  # TODO: use 'cell_duration'?
-                data = _reduce_time(data, **{dim: value})
+                data = _select_time(data, **{dim: value})
             else:  # reduce non-time coordinate
                 if dim in data.coords and not isinstance(value, (str, tuple)):
                     value = ureg.Quantity(value, data.coords[dim].climo.units)
@@ -986,26 +954,24 @@ def reduce_general(data, attrs=None, **kwargs):
         result.append(data)
 
     # Re-combine and return
-    # NOTE: Dropping then restoring the project below both simplifies annotations
-    # in generate_plot() and permits alignment of linear operations along institutes
-    # from different projects in reduce_general().
+    # NOTE: Here dropping then restoring the project both simplifies annotations
+    # in general_plot() and permits alignment of linear operations along institutes
+    # from different projects for e.g. reduce_general() reductions.
     # NOTE: Faster to delay institute averaging until after selections. Only concern
-    # is if 'reduce' methods were non-linear but current processing workflow with
-    # _find_data() and _derive_data() already presumes linearity. Non-linear
-    # operations only used *after* this step in _reduce_single() and _reduce_double().
-    # height = height.groupby(institute).mean(skipna=False, keep_attrs=True)
+    # is 'reduce' methods may be non-linear but get_result() already presumes linearity.
+    # Non-linear operations only used *after* this step in _reduce_data/_reduce_datas().
     if is_dataset:
         data = xr.Dataset({data.name: data for data in result})
     else:
         data, = result
     names = [name for index in data.indexes.values() for name in index.names]
-    if institute is _reduce_institutes:
-        data = _reduce_institutes(data)
+    if institute is _institute_average:
+        data = _institute_average(data)
     names = data.indexes['facets'].names if 'facets' in data.sizes else ()
     facets_name = data.facets.attrs.get('long_name') if 'facets' in data.sizes else None
     if 'project' in names and len(set(data.project.values)) == 1:
         project = data.project.values[0]
         data = data.reset_index('project', drop=True)
         data.coords['project'] = project
-    data = _restore_index(data, facets_name=facets_name)
+    data = _index_restore(data, facets_name=facets_name)
     return data

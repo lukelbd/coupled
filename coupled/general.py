@@ -1432,9 +1432,7 @@ def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=
     # Add annotations
     # NOTE: Using set_in_layout False significantly improves speed since tightbbox is
     # faster and looks nicer to allow overlap into margin without affecting the space.
-    # if annotate:
-    ic(labels)
-    if False:
+    if annotate:
         for loc, point, label in zip(locs, points, labels):
             # rotation = 90
             rotation = 0 if '$' in label else 90  # assume math does not need rotation

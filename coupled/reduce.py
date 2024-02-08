@@ -68,7 +68,44 @@ AREA_REGIONS = {
 }
 
 
-def _components_composite(data0, data1, pctile=None, dim='facets'):
+def _get_regression(data0, data1, weight=False, **kwargs):
+    """
+    Return regression along facets possibly weighted by model count.
+
+    Parameters
+    ----------
+    data0 : xarray.DataArray
+        The data used to build the composite.
+    data1 : xarray.DataArray
+        The data being composited.
+    weight : bool, optional
+        Whether to weight by model count.
+    **kwargs
+        Passed to `regress_dims`.
+
+    Returns
+    -------
+    slope, lower, upper, dof, rsq, fit, fit_lower, fit_upper : xarray.DataArray
+        The regression results.
+    """
+    # TODO: Implement institute weightins in 'parse_specs' by adding 'weight=True'
+    # to the 'other' kwarg group whenever institute='weight' is passed.
+    from observed.arrays import regress_dims
+    wgts = xr.ones_like(data0.facets, dtype=float)
+    index = wgts.indexes['facets']
+    if weight:  # weight by institute count
+        ignore = list({'model', 'ensemble'} & set(index.names))
+        facets = wgts.reset_index(ignore, drop=True).facets
+        wgts = wgts.groupby(facets) / wgts.groupby(facets).sum()
+        kwargs['weights'] = wgts
+    kw_regress = dict(dim='facets', correct=False, noweight=True, **kwargs)
+    result = regress_dims(data0, data1, **kw_regress)
+    slope, slope_lower, slope_upper, fit, fit_lower, fit_upper, rsq, dof = result
+    dof = dof * (wgts.sum() - 2) / (index.size - 2)  # reduced effective dof
+    return slope, slope_lower, slope_upper, fit, fit_lower, fit_upper, rsq, dof
+
+
+def _get_composite(data0, data1, pctile=None, dim='facets'):
     """
     Return low and high composite components of `data1` based on `data0`.
 
@@ -104,166 +141,46 @@ def _components_composite(data0, data1, pctile=None, dim='facets'):
     return data_lo, data_hi
 
 
-def _components_corr(data0, data1, dim=None, pctile=None):
+def _get_datetime(data, time=None, season=None, month=None):
     """
-    Return components of a correlation evalutation.
+    Reduce the time coordinate of the data using variety of operators.
 
     Parameters
     ----------
-    data0, data1 : xarray.DataArray
-        The coordinates to be compared.
-    dim : str, optional
-        The dimension for the correlation.
-    pctile : float, default: 95
-        The percentile range for the lower and upper uncertainty bounds.
+    data : xarray.DataArray or xarray.Dataset
+        The input data.
+    time, season, month : optional
+        The time coordinate or ``'avg'`` instruction.
 
     Returns
     -------
-    corr, corr_lower, corr_upper : xarray.DataArray
-        The correlation estimates with `pctile` lower and upper bounds.
-    rsquare : xarray.DataArray
-        The variance explained by the relationship.
+    data : xarray.Dataset or xarray.DataArray
+        The reduced data.
     """
-    # NOTE: This uses a special t-statistic to infer correlation uncertainty bounds.
-    # See: https://en.wikipedia.org/wiki/Pearson_correlation_coefficient#Standard_error
-    dim = dim or data0.dims[0]
-    data0, data1 = xr.align(data0, data1)
-    anom0 = data0 - data0.mean(dim)
-    anom1 = data1 - data1.mean(dim)
-    std0 = np.sqrt((anom0 ** 2).sum(dim))
-    std1 = np.sqrt((anom1 ** 2).sum(dim))
-    corr = (anom0 * anom1).sum(dim) / (std0 * std1)  # correlation coefficient
-    ndim = data0.sizes[dim]
-    rsquare = corr ** 2  # variance explained == correlation squared
-    sigma = np.sqrt((1 - corr ** 2) / (ndim - 2))  # standard error
-    tstat = corr * np.sqrt((ndim - 2) / (1 - rsquare))  # t-statistic
-    corrs = []  # correlation lower and upper bound
-    deltas = var._dist_bounds(sigma, pctile, dof=data0.size - 2, symmetric=True)
-    for delta in deltas:
-        if sigma.ndim == delta.ndim:
-            bound = np.expand_dims(delta, 0)  # add 'pctile' dimension
-        bound = tstat + xr.DataArray(delta, dims=('pctile', *sigma.dims))
-        bound = bound / np.sqrt(ndim - 2 + bound ** 2)  # see wiki page
-        corrs.append(bound)
-    return corr, *corrs, rsquare
-
-
-def _components_covariance(data0, data1, resid=False, dim='facets'):
-    """
-    Return covariance and standard deviations of `data0` and optionally `data1`.
-
-    Parameters
-    ----------
-    data0 : xarray.DataArray
-        The first data. Standard deviation is always returned.
-    data1 : xarray.DataArray
-        The second data. Standard deviation is optionally returned.
-    resid : bool, optional
-        Whether to return the standard deviation of `data1` or of the residual.
-
-    Returns
-    -------
-    covar, std, other : xarray.DataArray
-        The covariance of `data0` and `data1`, standard deviation of `data0`, and
-        either standard deviation of `data1` or standard deviation of residual.
-    """
-    # NOTE: Currently masked arrays are used in climopy 'covar' and might also have
-    # overhead from metadata stripping stuff and permuting. So go manual here.
-    # NOTE: For simplicity this gives the *biased* weighted variance estimator (analogue
-    # for unweighted data is SS / N) instead of the complex *unbiased* weighted variance
-    # estimator (analogue for unweighted data SS / N - 1). See full formula here:
-    # https://en.wikipedia.org/wiki/Weighted_arithmetic_mean#Reliability_weights
-    # NOTE: Calculation of residual leverages facts that offset = ymean - slope * xmean
-    # and slope stderr = sqrt(resid ** 2 / xanom ** 2 / n - 2) where resid =
-    # y - ((ymean - slope * xmean) + slope * x) = (y - ymean) - slope * (x - xmean)
-    # https://en.wikipedia.org/wiki/Simple_linear_regression#Normality_assumption
-    if dim == 'area':
-        dims = ('lon', 'lat')
-    elif dim == 'volume':
-        dims = ('lon', 'lat', 'plev')
-    else:
-        dims = (dim,)
-    weight = xr.ones_like(data0)
-    if 'lon' in dims or 'lat' in dims:
-        weight *= data0.coords['cell_width']
-    if 'lat' in dims:
-        weight *= data0.coords['cell_depth']
-    if 'plev' in dims:
-        weight *= data0.coords['cell_height']
-    data0, data1, weight = xr.broadcast(data0, data1, weight)
-    mask0, mask1 = ~np.isnan(data0), ~np.isnan(data1)
-    data0, data1 = data0.fillna(0), data1.fillna(0)
-    data0, data1 = data0.climo.quantify(), data1.climo.quantify()
-    anom0 = data0 - (weight * data0).sum(dims) / (weight * mask0).sum(dims)
-    anom1 = data1 - (weight * data1).sum(dims) / (weight * mask1).sum(dims)
-    covar = (weight * anom0 * anom1).sum(dims) / (weight * mask0 * mask1).sum(dims)
-    std = np.sqrt((weight * anom0 ** 2).sum(dims) / (weight * mask0).sum(dims))
-    if not resid:
-        other = np.sqrt((weight * anom1 ** 2).sum(dims) / (weight * mask1).sum(dims))
-    elif not any(key in dims for key in ('lon', 'lat', 'plev')):
-        resid = anom1 - (covar / std ** 2) * anom0  # NOTE: n - 2 is factored in later
-        other = np.sqrt((weight * resid ** 2).sum(dims) / (weight * mask0 * mask1).sum(dims))  # noqa: E501
-    else:
-        raise NotImplementedError('Unsure how to calculate weighted standard error.')
-    return covar, std, other
-
-
-def _components_slope(data0, data1, dim=None, correct=False, pctile=None):
-    """
-    Return components of a line fit operation.
-
-    Parameters
-    ----------
-    data0 : xarray.DataArray
-        The dependent coordinates.
-    data1 : xarray.DataArray
-        The other coordinates.
-    dim : str, optional
-        The dimension for the regression.
-    correct : bool, optional
-        Whether to correct the standard error for reduced degrees of freedom due
-        to serial correlation. If string this is the series to use for the factor.
-    pctile : bool or float, default: 95
-        The percentile range for the lower and upper uncertainty bounds.
-        Use ``False`` to instead just show standard error ranges.
-
-    Returns
-    -------
-    slope, slope_lower, slope_upper : xarray.DataArray
-        The slope estimates with `pctile` lower and upper bounds.
-    rsquare : xarray.DataArray
-        The variance explained by the fit.
-    fit, fit_lower, fit_upper : xarray.DataArray
-        The fit to the original points with `pctile` lower and upper bounds.
-    """
-    # NOTE: Here np.polyfit requires monotonically increasing coordinates. Not sure
-    # why... could consider switching to manual slope and stderr calculation.
-    # NOTE: Unlike climopy linefit(), which returns scalar slope standard error and
-    # best fit uncertainty range with *optional* percentile dimension, this returns
-    # slope estimate uncertainty range with *mandatory* percentile dimension and
-    # a single best fit uncertainy range. In this project require former for thin and
-    # thick whiskers on _merge_dists() bar plots while a single best fit range is
-    # sufficient for most scatter and regression plots. Should merge with linefit().
-    dim = dim or data0.dims[0]
-    data0, data1 = xr.align(data0, data1)
-    axis = data0.dims.index(dim)
-    isel = {dim: np.argsort(data0.values, axis=axis)}
-    data0, data1 = data0.isel(isel), data1.isel(isel)
-    slope, sigma, rsquare, fit, fit_lower, fit_upper = var.linefit(
-        data0, data1, dim=dim, correct=correct, pctile=pctile,
-    )
-    coords = {'x': data0, 'y': data1}
-    fit.coords.update(coords)
-    fit_lower.coords.update(coords)
-    fit_upper.coords.update(coords)
-    slopes = []  # slope lower and upper bounds
-    sigmas = var._dist_bounds(sigma, pctile, dof=data0.size - 2, symmetric=True)
-    for bound in sigmas:
-        if sigma.ndim == bound.ndim:
-            bound = np.expand_dims(bound, 0)  # add 'pctile' dimension
-        bound = slope + xr.DataArray(bound, dims=('pctile', *sigma.dims))
-        slopes.append(bound)
-    return slope, *slopes, rsquare, fit, fit_lower, fit_upper
+    if 'time' not in data.dims:
+        return data
+    if season is not None:
+        seasons = data.time.dt.season.str.lower()
+        data = data.isel(time=(seasons == season.lower()))
+    elif isinstance(month, str):
+        months = data.time.dt.strftime('%b').str.lower()
+        data = data.isel(time=(months == month.lower()))
+    elif month is not None:
+        months = data.time.dt.month
+        data = data.isel(time=(months == month))
+    elif not isinstance(time, str) and time is not None and time is not False:
+        time = time  # NOTE: above respects user-input 'None'
+        data = data.sel(time=time, method='nearest')
+    elif isinstance(time, str) and time != 'avg':
+        time = cftime.datetime.strptime(time, '%Y-%m-%d')  # cftime 1.6.2
+        data = data.sel(time=time, method='nearest')
+    elif isinstance(time, str) and time == 'avg':
+        days = data.time.dt.days_in_month.astype(data.dtype)
+        with xr.set_options(keep_attrs=True):  # average over entire record
+            data = (data * days).sum('time', skipna=False) / days.sum()
+    elif time is not None:
+        raise ValueError(f'Unknown time reduction method {time!r}.')
+    return data
 
 
 def _parse_project(facets, project=None):
@@ -426,48 +343,6 @@ def _institute_average(data):
     return data
 
 
-def _select_time(data, time=None, season=None, month=None):
-    """
-    Reduce the time coordinate of the data using variety of operators.
-
-    Parameters
-    ----------
-    data : xarray.DataArray or xarray.Dataset
-        The input data.
-    time, season, month : optional
-        The time coordinate or ``'avg'`` instruction.
-
-    Returns
-    -------
-    data : xarray.Dataset or xarray.DataArray
-        The reduced data.
-    """
-    if 'time' not in data.dims:
-        return data
-    if season is not None:
-        seasons = data.time.dt.season.str.lower()
-        data = data.isel(time=(seasons == season.lower()))
-    elif isinstance(month, str):
-        months = data.time.dt.strftime('%b').str.lower()
-        data = data.isel(time=(months == month.lower()))
-    elif month is not None:
-        months = data.time.dt.month
-        data = data.isel(time=(months == month))
-    elif not isinstance(time, str) and time is not None and time is not False:
-        time = time  # NOTE: above respects user-input 'None'
-        data = data.sel(time=time, method='nearest')
-    elif isinstance(time, str) and time != 'avg':
-        time = cftime.datetime.strptime(time, '%Y-%m-%d')  # cftime 1.6.2
-        data = data.sel(time=time, method='nearest')
-    elif isinstance(time, str) and time == 'avg':
-        days = data.time.dt.days_in_month.astype(data.dtype)
-        with xr.set_options(keep_attrs=True):  # average over entire record
-            data = (data * days).sum('time', skipna=False) / days.sum()
-    elif time is not None:
-        raise ValueError(f'Unknown time reduction method {time!r}.')
-    return data
-
-
 def _reduce_data(data, method, dim=None, pctile=None, std=None, preserve=True):
     """
     Reduce individual data array using arbitrary method.
@@ -525,31 +400,11 @@ def _reduce_data(data, method, dim=None, pctile=None, std=None, preserve=True):
     name = data.name
     dim = dim or data.dims[0]
     kw = {'dim': dim, 'skipna': False}
-    if method == 'avg' or method == 'med':
-        key = 'mean' if method == 'avg' else 'median'
-        cmd = getattr(data, key)
-        result = cmd(**kw, keep_attrs=True)
-        descrip = 'mean' if method == 'avg' else 'median'
-        short = f'{descrip} {data.short_name}'  # only if no range included
-        long = f'{descrip} {data.long_name}'
-        if result.ndim == 1 and any(nums is not None for nums in (pctile, std)):
-            nums = pctile if pctile is not None else std
-            which = 'pctile' if pctile is not None else 'std'
-            shade, fade = nums if nums.size == 2 else (nums.item(), None)
-            defaults.update({f'shade{which}s': shade, f'fade{which}s': fade})
-            defaults.update({'fadealpha': 0.15, 'shadealpha': 0.3})
-            if preserve:  # preserve distributions for now
-                result = data
-                defaults.update({f'{descrip}s': True})
-            else:  # reduce and record variance
-                result = xr.concat((result, data.var(ddof=1, **kw)), dim='sigma')
-                defaults['dof'] = data.sizes[dim] - 1
-    elif method == 'pctile':
-        with xr.set_options(keep_attrs=True):  # note name is already kept
-            nums = (0.5 - 0.005 * pctile.item(), 0.5 + 0.005 * pctile.item())
-            result = data.quantile(nums[1], **kw) - data.quantile(nums[0], **kw)
-        short = f'{data.short_name} spread'
-        long = f'{data.long_name} percentile range'
+    if method == 'dist':  # bars or boxes
+        if data.ndim > 1:
+            raise ValueError(f'Invalid dimensionality {data.ndim!r} for distribution.')
+        result = data[~data.isnull()]
+        name = None
     elif method == 'std':
         with xr.set_options(keep_attrs=True):  # note name is already kept
             std = std.item()
@@ -574,11 +429,31 @@ def _reduce_data(data, method, dim=None, pctile=None, std=None, preserve=True):
         data.attrs['units'] = ''
         short = f'{data.short_name} kurtosis'
         long = f'{data.long_name} kurtosis'
-    elif method == 'dist':  # bars or boxes
-        if data.ndim > 1:
-            raise ValueError(f'Invalid dimensionality {data.ndim!r} for distribution.')
-        result = data[~data.isnull()]
-        name = None
+    elif method == 'pctile':
+        with xr.set_options(keep_attrs=True):  # note name is already kept
+            nums = (0.5 - 0.005 * pctile.item(), 0.5 + 0.005 * pctile.item())
+            result = data.quantile(nums[1], **kw) - data.quantile(nums[0], **kw)
+        short = f'{data.short_name} spread'
+        long = f'{data.long_name} percentile range'
+    elif method == 'avg' or method == 'med':
+        key = 'mean' if method == 'avg' else 'median'
+        cmd = getattr(data, key)
+        result = cmd(**kw, keep_attrs=True)
+        descrip = 'mean' if method == 'avg' else 'median'
+        short = f'{descrip} {data.short_name}'  # only if no range included
+        long = f'{descrip} {data.long_name}'
+        if result.ndim == 1 and any(nums is not None for nums in (pctile, std)):
+            nums = pctile if pctile is not None else std
+            which = 'pctile' if pctile is not None else 'std'
+            shade, fade = nums if nums.size == 2 else (nums.item(), None)
+            defaults.update({f'shade{which}s': shade, f'fade{which}s': fade})
+            defaults.update({'fadealpha': 0.15, 'shadealpha': 0.3})
+            if preserve:  # preserve distributions for now
+                result = data
+                defaults.update({f'{descrip}s': True})
+            else:  # reduce and record variance
+                result = xr.concat((result, data.var(ddof=1, **kw)), dim='sigma')
+                defaults['dof'] = data.sizes[dim] - 1
     else:
         raise ValueError(f'Invalid single-variable method {method}.')
     defaults.update({'name': name, 'short_name': short, 'long_name': long})
@@ -625,6 +500,7 @@ def _reduce_datas(data0, data1, method, dim=None, pctile=None, std=None, invert=
     # and 'fadedata' arrays from the input arguments. Note resulting percentiles will
     # only be an approximation to some actual Monte Carlo sampled difference of
     # t-distributions. See: https://en.wikipedia.org/wiki/Variance#Propertieswill
+    from observed.arrays import regress_dims
     pctile = None if pctile is False else pctile
     pctile = 80 if pctile is True else pctile
     pctile = np.atleast_1d(pctile) if pctile is not None else pctile
@@ -641,11 +517,39 @@ def _reduce_datas(data0, data1, method, dim=None, pctile=None, std=None, invert=
         short_prefix, long_prefix = 'spatial ', f'{data1.short_name} spatial '
     else:  # TODO: revisit this and permit customization
         short_prefix, long_prefix = '', f'{data1.short_name} '
-    if method in ('cov', 'proj', 'slope'):
-        factor = 0 if method == 'cov' else 1 if method == 'proj' else 2
-        cov, std0, resid = _components_covariance(data0, data1, dim=dim, resid=True)
-        result = (cov / std0 ** factor).climo.dequantify()
-        # ic(data0.coords, data1.coords, result, method, factor)
+    if method == 'dist':  # scatter or bars
+        if max(data0.ndim, data1.ndim) > 1:
+            raise ValueError(f'Invalid dimensionality {data0.ndim} x {data1.ndim} for distribution.')  # noqa: E501
+        result0, result1 = data0[~data0.isnull()], data1[~data1.isnull()]
+        result0, result1 = xr.align(result0, result1)  # intersection-style broadcast
+        result = (result0, result1)
+        name = None
+    elif method == 'diff':  # composite difference along first arrays
+        result0, result1 = _get_composite(data0, data1, pctile=pctile, dim=dim)
+        result = result1 - result0
+        result = result.climo.dequantify()
+        result.attrs['units'] = data1.units
+        short = f'{data1.short_name} composite difference'
+        long = f'{data0.long_name}-composite {data1.long_name} difference'
+    elif method in ('corr', 'rsq'):
+        noweight = dim == 'facets'
+        kw_regress = dict(stat='corr', nobnds=True, noweight=noweight)
+        result = regress_dims(data0, data1, dim, **kw_regress)
+        if method == 'corr':  # correlation coefficient
+            result = result.climo.to_units('dimensionless').climo.dequantify()
+            result.attrs['units'] = ''
+            short = f'{short_prefix}correlation'
+            long = f'{long_prefix}correlation coefficient'
+        else:  # variance explained
+            result = (result ** 2).climo.to_units('percent').climo.dequantify()
+            result.attrs['units'] = '%'
+            short = f'{short_prefix}variance explained'
+            long = f'{long_prefix}variance explained'
+    elif method in ('cov', 'proj', 'slope'):
+        nobnds = all(nums is None for nums in (pctile, std))
+        noweight = dim == 'facets'
+        kw_regress = dict(stat=method, nobnds=nobnds, noweight=noweight)
+        result, *bnds = regress_dims(data0, data1, dim, **kw_regress)
         if method == 'cov':
             result.attrs['units'] = f'{data1.units} {data0.units}'
             short = f'{short_prefix}covariance'
@@ -658,43 +562,15 @@ def _reduce_datas(data0, data1, method, dim=None, pctile=None, std=None, invert=
             result.attrs['units'] = f'{data1.units} / ({data0.units})'
             short = f'{short_prefix}regression coefficient'
             long = f'{long_prefix}regression coefficient'
-        if result.ndim == 1 and any(nums is not None for nums in (pctile, std)):
-            sigma = (resid / std0) / np.sqrt(data0.sizes[dim] - 2)  # regression error
-            sigma = (sigma * std0 ** (2 - factor)).climo.dequantify()  # scaled error
-            result = xr.concat((result, sigma ** 2), dim='sigma')  # see process_data()
+        if not nobnds and result.ndim == 1:
+            key = 'pctile' if pctile is not None else 'std'
             nums = pctile if pctile is not None else std
-            which = 'pctile' if pctile is not None else 'std'
+            sigma = 0.5 * (bnds[1] - bnds[0])
+            result = xr.concat((result, sigma ** 2), dim='sigma')  # see process_data()
             shade, fade = nums if nums.size == 2 else (nums.item(), None)
             defaults['dof'] = data1.sizes[dim] - 2
-            defaults.update({f'shade{which}s': shade, f'fade{which}s': fade})
-            defaults.update({'fadealpha': 0.15, 'shadealpha': 0.25})
-    elif method in ('corr', 'rsq'):
-        cov, std0, std1 = _components_covariance(data0, data1, dim=dim, resid=False)
-        result = cov / (std0 * std1)
-        if method == 'corr':  # correlation coefficient
-            result = result.climo.to_units('dimensionless').climo.dequantify()
-            result.attrs['units'] = ''
-            short = f'{short_prefix}correlation'
-            long = f'{long_prefix}correlation coefficient'
-        else:  # variance explained
-            result = (result ** 2).climo.to_units('percent').climo.dequantify()
-            result.attrs['units'] = '%'
-            short = f'{short_prefix}variance explained'
-            long = f'{long_prefix}variance explained'
-    elif method == 'diff':  # composite difference along first arrays
-        result0, result1 = _components_composite(data0, data1, pctile=pctile, dim=dim)
-        result = result1 - result0
-        result = result.climo.dequantify()
-        result.attrs['units'] = data1.units
-        short = f'{data1.short_name} composite difference'
-        long = f'{data0.long_name}-composite {data1.long_name} difference'
-    elif method == 'dist':  # scatter or bars
-        if max(data0.ndim, data1.ndim) > 1:
-            raise ValueError(f'Invalid dimensionality {data0.ndim} x {data1.ndim} for distribution.')  # noqa: E501
-        result0, result1 = data0[~data0.isnull()], data1[~data1.isnull()]
-        result0, result1 = xr.align(result0, result1)  # intersection-style broadcast
-        result = (result0, result1)
-        name = None
+            defaults.update({f'shade{key}s': shade, f'fade{key}s': fade})
+            defaults.update({'shadealpha': 0.25, 'fadealpha': 0.15})
     else:
         raise ValueError(f'Invalid double-variable method {method}')
     defaults.update({'name': name, 'short_name': short, 'long_name': long})
@@ -942,7 +818,7 @@ def reduce_general(data, attrs=None, **kwargs):
             if dim == 'area' and value != 'avg':  # average over truncated region
                 data, value = data.climo.truncate(AREA_REGIONS[value]), 'avg'
             if dim in ('time', 'month', 'season'):  # TODO: use 'cell_duration'?
-                data = _select_time(data, **{dim: value})
+                data = _get_datetime(data, **{dim: value})
             else:  # reduce non-time coordinate
                 if dim in data.coords and not isinstance(value, (str, tuple)):
                     value = ureg.Quantity(value, data.coords[dim].climo.units)

@@ -21,7 +21,7 @@ import matplotlib.lines as mlines
 import seaborn as sns
 from climopy import ureg, vreg  # noqa: F401
 from .process import process_constraint, process_data
-from .reduce import _components_corr, _components_slope, _parse_institute, _parse_project  # noqa: E501
+from .reduce import _get_regression, _parse_institute, _parse_project
 from .specs import _pop_kwargs, _split_label, get_heading, get_label, get_labels, parse_specs  # noqa: E501
 
 __all__ = ['general_plot']
@@ -983,13 +983,15 @@ def _merge_dists(
         refheight = 2.0  # default thickness (compare with above)
         args, boxdata, bardata, annotations = [], [], [], []
         units = [data.climo.units for *_, data in arguments]
+        weight = kw_collection.other.get('weight', False)
         kw_collection.command['width'] = 1.0  # ignore staggered bars
         kw_collection.command['absolute_width'] = True
         for iargs, iunits in zip(arguments, units):  # merge into slope estimators
-            cmd = _components_corr if correlation else _components_slope
+            dim = iargs[0].dims[0]  # currently always 'facets'
             keys = sorted(set(key for arg in iargs for key in arg.coords))
-            result = cmd(*iargs, dim=iargs[0].dims[0], pctile=(50, 95))
-            data, data_lower, data_upper, rsquare, *_ = result
+            kw_regress = dict(dim=dim, pctile=(50, 95), nofit=True)
+            result = _get_regression(*iargs, weight=weight, **kw_regress)  # noqa: E501
+            data, data_lower, data_upper, rsquare, _ = result
             if correlation:
                 data.attrs['units'] = ''
                 data.attrs['short_name'] = 'correlation coefficient'
@@ -1021,8 +1023,7 @@ def _merge_dists(
             rsquare = ureg.Quantity(rsquare.item(), '').to('percent')
             annotation = f'${rsquare:~L.0f}$'.replace(r'\ ', '')
             # annotation = f'${rsquare:~L.0f}$'.replace('%', r'\%').replace(r'\ ', '')
-            # rvalue = np.sign(data.item()) * rsquare.item() ** 0.5
-            # annotation = f'${rvalue:.2f}$'  # latex for long dash minus sign
+            # annotation = f'${corr.item():.2f}$'  # latex for long dash minus sign
             # annotation = '' if correlation else annotation
             args.append(data)
             boxdata.append([data_lower1, data_upper1])
@@ -1432,9 +1433,7 @@ def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=
     # Add annotations
     # NOTE: Using set_in_layout False significantly improves speed since tightbbox is
     # faster and looks nicer to allow overlap into margin without affecting the space.
-    # if annotate:
-    ic(labels)
-    if False:
+    if annotate:
         for loc, point, label in zip(locs, points, labels):
             # rotation = 90
             rotation = 0 if '$' in label else 90  # assume math does not need rotation
@@ -1456,7 +1455,7 @@ def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=
 
 def _setup_scatter(
     ax, data0, data1, handle=None, zeros=False, oneone=False, linefit=False, annotate=False,  # noqa: E501
-    constraint=None, observed=None, internal=None, original=None, alternative=False, graphical=None, pctile=None,  # noqa: E501
+    constraint=None, observed=None, internal=None, original=None, alternative=False, graphical=None, weight=False, pctile=None,  # noqa: E501
 ):
     """
     Adjust and optionally add content to scatter plots.
@@ -1492,6 +1491,8 @@ def _setup_scatter(
         Whether to include alternative estimate that omits regression uncertainty.
     graphical : bool, optional
         Passed to `process_constraint`. Whether to use graphical intersections.
+    weight : bool, optional
+        Whether to weight regressions by institute model count.
     pctile : float, optional
         Percentile range used for line fit and constraint bounds.
     """
@@ -1542,16 +1543,15 @@ def _setup_scatter(
     # color = 'red' if constraint is None else color  # line fit color
     if linefit or constraint is not None:
         pctile = pctile or 95  # default percentile range
-        ax.use_sticky_edges = False  # show end of line fit shading
-        slope, _, _, rsquare, fit, fit_lower, fit_upper = _components_slope(
-            data0, data1, dim=data0.dims[0], correct=False, pctile=pctile,
-        )
-        value = ureg.Quantity(rsquare.item(), '').to('percent')
+        result = _get_regression(data0, data1, pctile=pctile, weight=weight)
+        slope, _, _, fit, fit_lower, fit_upper, rsq, _ = result
+        value = ureg.Quantity(rsq.item(), '').to('percent')
         label = rf'$r^2={value:~L.0f}$'
         label = re.sub(r'(?<!\\)%', r'\%', label)
         label = label.replace(r'\ ', '')
         datax = np.sort(data0, axis=0)  # linefit returns result for sorted data
         color = 'gray8' if constraint is None or not handle else handle[0].get_color()
+        ax.use_sticky_edges = False  # show end of line fit shading
         ax.plot(datax, fit, ls='-', lw=1.5 * pplt.rc.metawidth, c=color)
         ax.area(datax, fit_lower.squeeze(), fit_upper.squeeze(), lw=0, a=0.3, c=color)
         ax.format(lrtitle=label, lrtitle_kw={'size': 'med'})
@@ -1576,8 +1576,9 @@ def _setup_scatter(
         xorigs = np.percentile(data0, bounds) if 'x' in original else ()
         yorigs = np.percentile(data1, bounds) if 'y' in original else ()
         kwargs = dict(observed=observed, internal=internal, graphical=graphical)
+        kwargs.update(weight=weight, pctile=pctile)  # whether to weight institutes
         xcolor, ycolor = 'cyan7', 'pink7'
-        xs, ys1, ys2 = process_constraint(data0, data1, constraint, pctile=pctile, **kwargs)  # noqa: E501
+        xs, ys1, ys2 = process_constraint(data0, data1, constraint, **kwargs)
         nbounds = len(xs) // 2  # should be one or two
         xmins, xmean, xmaxs = xs[:nbounds], xs[nbounds], xs[-nbounds:]
         ymins1, ymean, ymaxs1 = ys1[:nbounds], ys1[nbounds], ys1[-nbounds:]

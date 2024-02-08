@@ -189,9 +189,9 @@ def get_parts(dataset, name, scaled=False):  # noqa: E501
         names, signs = (param, delta), (1, -1)
         search, replace = 'temperature', 'equilibrium temperature'
     elif param == 'dt':  # temp - eqtemp anomaly inferred from feedback (see above)
-        denom = name.replace('_dt', '_lam')  # feedback in denominator
-        numer = name.replace('_dt', '').replace(f'{head}_', '')
-        names, signs, product = (numer, denom), (1, -1), (True,)
+        value = name.replace('_dt', '').replace(f'{head}_', '')  # flux anomaly
+        slope = name.replace('_dt', '_lam')  # feedback in denominator
+        names, signs, product = (value, slope), (1, -1), (True,)
         search, replace = 'flux', 'temperature'
         attrs.update(units='K', long_name='temperature difference')
     elif not scaled and re.search(temp := r'(ecs|erf)(?:([0-9.-]+)x)?', name):
@@ -380,7 +380,7 @@ def get_result(
 
 
 def process_constraint(
-    data0, data1, constraint=None, observed=None, internal=False, graphical=False, pctile=None, N=None,  # noqa: E501
+    data0, data1, constraint=None, observed=None, internal=False, graphical=False, pctile=None, N=None, **kwargs,  # noqa: E501
 ):
     """
     Return percentile bounds for observational constraint.
@@ -407,6 +407,8 @@ def process_constraint(
         The emergent constraint percentile bounds to be returned.
     N : int, default: 100000
         The number of bootstrapped samples to carry out.
+    **kwargs
+        Passed to `_get_regression`.
 
     Returns
     -------
@@ -426,12 +428,13 @@ def process_constraint(
     # their sample sizes are larger (150 years) and uncertainties are uncorrelated so
     # should roughly cancel out across e.g. 30 members of ensemble.
     from .feedbacks import VARIABLE_ALIASES
+    from .reduce import _get_regression
     constraint = 'cld' if constraint is None or constraint is True else constraint
     observed = observed or 20
     internal = observed if internal is None or internal is True else internal
-    pctile = 95 if pctile is None or pctile is True else pctile
+    # pctile = 90
+    kwargs['pctile'] = pctile = 95 if pctile is None or pctile is True else pctile
     pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
-    kwargs = dict(pctile=pctile, correct=False)  # no correlation across ensembles
     name = constraint if isinstance(constraint, str) else None
     name = VARIABLE_ALIASES.get(name, name)
     N = N or 10000  # samples to draw
@@ -446,18 +449,18 @@ def process_constraint(
     xdof *= observed / 20  # increased degrees of freedom
     xscale /= np.sqrt(observed / 20)  # reduced regression error
     xmin, xmax = stats.t(df=xdof, loc=xmean, scale=xscale).ppf(0.01 * pctile)
+    ic(xdof, xscale, xmin, xmax)
     observations = np.array([xmin, xmean, xmax])
     if internal is not False:
         internal = INTERNAL_UNCERTAINTY[name][internal]
         xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
         es = stats.norm(loc=0, scale=internal).rvs(N)  # implied variability error
         observations = np.insert(np.percentile(xs + es, pctile), 1, observations)
-    data0 = np.array(data0).squeeze()
-    data1 = np.array(data1).squeeze()
-    idxs = np.argsort(data0, axis=0)
-    data0, data1 = data0[idxs], data1[idxs]  # required for graphical error
-    mean0, mean1 = data0.mean(), data1.mean()
-    bmean, berror, _, fit, fit_lower, fit_upper = var.linefit(data0, data1, **kwargs)
+    mean0, mean1 = data0.values.mean(), data1.values.mean()
+    result = _get_regression(data0, data1, **kwargs)
+    bmean, _, _, fit, fit_lower, fit_upper, _, rdof = result
+    bmean, rdof, fit = bmean.values, rdof.values, fit.values
+    fit_lower, fit_upper = fit_lower.values, fit_upper.values
     if graphical:  # intersection of shaded regions
         fit_lower = fit_lower.squeeze()
         fit_upper = fit_upper.squeeze()
@@ -475,7 +478,6 @@ def process_constraint(
         # ys = err + as_ + bs_ * xs  # include both uncertainties
         # ys = mean1 + bs_ * (xs - mean0)  # include slope uncertainty only
         rscale = np.std(data1 - fit, ddof=1)  # model residual sigma
-        rdof = data0.size - 2  # inter-model regression dof
         xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)  # observations
         rs = stats.t(df=rdof, loc=0, scale=rscale).rvs(N)  # regression
         ys = rs + mean1 + bmean * (xs - mean0)

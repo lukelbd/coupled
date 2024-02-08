@@ -298,9 +298,9 @@ def _update_terms(
     # NOTE: Previously computed climate sensitivity 'components' based on individual
     # effective forcings and feedbacks but interpretation is not useful. Now store
     # zero sensitivity components and only compute after the fact.
-    numers = [('rfnt_erf',), ('rlnt_erf', 'rsnt_erf'), ()]
     denoms = [('rfnt_lam',), ('rlnt_lam', 'rsnt_lam'), ()]
-    for numer, denom in zip(numers, denoms):
+    numers = [('rfnt_erf',), ('rlnt_erf', 'rsnt_erf'), ()]
+    for denom, numer in zip(denoms, numers):
         if all(name in dataset for name in (*numer, *denom)):  # noqa: E501
             break
     short_name = 'climate sensitivity'
@@ -517,7 +517,7 @@ def feedback_texts(
 def feedback_datasets(
     *paths,
     boundary=None, source=None, style=None,
-    early=True, late=True, delayed=False, equaled=False,
+    early=True, late=True, delay=False, fifty=False,
     point=True, latitude=True, hemisphere=False,
     annual=True, seasonal=False, monthly=False,
     average=False, nodrift=False, standardize=True,
@@ -536,7 +536,7 @@ def feedback_datasets(
         The kernel source(s) and feedback style(s) to optionally filter.
     point, latitude, hemisphere : bool, optional
         Whether to include or drop extra regional feedbacks.
-    early, late, delayed, equaled : bool, optional
+    early, late, delay, fifty : bool, optional
         Whether to include or drop extra range feedbacks.
     annual, seasonal, monthly : bool, optional
         Whether to include or drop extra period feedbacks.
@@ -623,9 +623,9 @@ def feedback_datasets(
                 continue
             if not late and (start, stop) == (20, 150):
                 continue
-            if not delayed and start in range(1, 20):
+            if not delay and start in range(1, 20):
                 continue
-            if not equaled and stop - start == 50:
+            if not fifty and stop - start == 50:
                 continue
             if outdated := 'local' in other or 'global' in other:
                 if other.split('-')[0] != 'local':  # ignore global vs. global
@@ -747,11 +747,12 @@ def process_scalar(
     from observed.feedbacks import _parse_kwargs, process_scalar
     from .datasets import _standardize_order
     _, params, constraints = _parse_kwargs('source', **kwargs)  # skip 'source'
-    constraints['variable'] = 'fluxes'
     translate = {('years', value): label for (key, value), label in TRANSLATE_PATHS.items() if key == 'startstop'}  # noqa: E501
     testing = kwargs.get('testing', False)
+    constraints['variable'] = 'fluxes'
     correct = constraints.pop('correct', None)
-    kwargs = {'correct': correct, 'translate': translate}
+    constraints.pop('source', None)
+    kwargs = {'correct': correct, 'translate': translate, 'source': '', 'output': False}
     suffix = ['0000', '0150', 'eraint', 'series']
     paths = paths or ('~/data/cmip-fluxes', '~/scratch/cmip-fluxes')
     names = (names,) if isinstance(names, str) else names or VARIABLE_DEFINITIONS.keys()
@@ -770,31 +771,33 @@ def process_scalar(
         if database:
             print('Model:', end=' ')
         for facets, data in database.items():
-            kwarg = {**params, **kwargs}
             paths = [
                 path for paths in data.values() for path in paths
                 if path.stem.split('_')[-1].split('-') == suffix
             ]
             if not paths:
                 continue
-            if facets[3] not in ('picontrol', 'abrupt4xco2'):
-                continue
             if len(paths) > 1:
                 warnings.warn('Ambiguous', '_'.join(facets), 'paths:', ', '.join(map(str, paths)))  # noqa: E501
             for sub, replace in FACETS_RENAME.items():
                 facets = tuple(facet.replace(sub, replace) for facet in facets)
+            if facets[3] not in ('picontrol', 'abrupt4xco2'):
+                continue
             if facets[3] == 'picontrol':  # use default 'month' 'annual' 'correct'
-                kwarg['years'] = (None, 20, 50)
-                kwarg['month'] = ('dec', 'jun')
-                kwarg['anomaly'] = (True, False)
-                kwarg['detrend'] = ('', 'xy')
+                params['years'] = (None, 20, 50)
+                params['month'] = ('dec', 'jun')
+                params['anomaly'] = (True, False)
+                params['detrend'] = ('', 'xy')
             else:  # use default 'annual' 'correct'
-                kwarg['years'] = ((0, 150), (0, 20), (20, 150))
-                kwarg['month'] = (None,)
-                kwarg['anomaly'] = (False,)
-                kwarg['detrend'] = ('',)
+                params['years'] = ((0, 150), (0, 20), (20, 150))
+                params['month'] = (None,)
+                params['anomaly'] = (False,)
+                params['detrend'] = ('',)
             if testing:
-                kwarg = {key: values[:1] for key, values in kwarg.items()}
+                params = {
+                    key: values if isinstance(values, dict) else values[:1]
+                    for key, values in params.items()  # testing
+                }
             series = load_file(paths[0], lazy=True, project=facets[0])  # speed-up
             start = series.time.dt.strftime('%b').values[0]
             print(f'{facets[2]}_{facets[3]}_{start}', end=' ')
@@ -803,7 +806,7 @@ def process_scalar(
             series = series.drop_vars(ignore - {'ts'})
             series = series.climo.add_cell_measures()
             series = xr.Dataset({name: data.climo.average('area') for name, data in series.items()})  # noqa: E501
-            result = process_scalar(series, name=tuple(fluxes), **kwarg)
+            result = process_scalar(series, name=tuple(fluxes), **params, **kwargs)
             levels = ('experiment', 'ensemble', *result.indexes['version'].names)
             version = [(*facets[3:], *index) for index in result.version.values]
             version = xr.DataArray(

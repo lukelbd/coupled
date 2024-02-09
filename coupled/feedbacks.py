@@ -7,7 +7,6 @@ import warnings
 import json
 import os
 import re
-from collections import namedtuple
 from pathlib import Path
 
 import climopy as climo  # noqa: F401  # add accessor
@@ -21,7 +20,7 @@ from cmip_data.facets import ENSEMBLES_FLAGSHIP, MODELS_INSTITUTES
 from cmip_data.facets import Database, glob_files, _parse_constraints
 from cmip_data.feedbacks import FEEDBACK_DESCRIPTIONS
 from cmip_data.utils import assign_dates, load_file
-from .process import get_parts, get_result
+from .process import get_parts
 from .specs import (
     _pop_kwargs,
     FACETS_NAME,
@@ -47,6 +46,15 @@ __all__ = [
 REGEX_FLUX = re.compile(
     r'(\A|[^_]*)(_?r)([lsf])([udner])([tsa])(cs|ce|)'
 )
+
+# Translate periods
+# NOTE: Observed feedback utility concatenates along 'version' coordinate with keys and
+# labels constructed from input keyword arguments, but have no concept of 'early' or
+# 'late' response for observed data, so can supply additional translations manually.
+TRANSLATE_PERIODS = {
+    ('years', value): ('period', label)
+    for (key, value), label in TRANSLATE_PATHS.items() if key == 'startstop'
+}
 
 # Feedback aliases
 # NOTE: These are used to both translate tables from external sources into the more
@@ -747,12 +755,10 @@ def process_scalar(
     from observed.feedbacks import _parse_kwargs, process_scalar
     from .datasets import _standardize_order
     _, params, constraints = _parse_kwargs('source', **kwargs)  # skip 'source'
-    translate = {('years', value): label for (key, value), label in TRANSLATE_PATHS.items() if key == 'startstop'}  # noqa: E501
-    testing = kwargs.get('testing', False)
     constraints['variable'] = 'fluxes'
     correct = constraints.pop('correct', None)
-    constraints.pop('source', None)
-    kwargs = {'correct': correct, 'translate': translate, 'source': '', 'output': False}
+    testing = kwargs.get('testing', False)
+    kwargs = {'output': False, 'correct': correct, 'translate': TRANSLATE_PERIODS}
     suffix = ['0000', '0150', 'eraint', 'series']
     paths = paths or ('~/data/cmip-fluxes', '~/scratch/cmip-fluxes')
     names = (names,) if isinstance(names, str) else names or VARIABLE_DEFINITIONS.keys()
@@ -794,10 +800,8 @@ def process_scalar(
                 params['anomaly'] = (False,)
                 params['detrend'] = ('',)
             if testing:
-                params = {
-                    key: values if isinstance(values, dict) else values[:1]
-                    for key, values in params.items()  # testing
-                }
+                params = {key: values[:1] for key, values in params.items()}
+                names = names[:3]
             series = load_file(paths[0], lazy=True, project=facets[0])  # speed-up
             start = series.time.dt.strftime('%b').values[0]
             print(f'{facets[2]}_{facets[3]}_{start}', end=' ')
@@ -815,7 +819,11 @@ def process_scalar(
                 name='version',
                 attrs={'long_name': 'feedback version'},
             )
+            facets = facets[:3]  # project institute model
             result = result.assign_coords(version=version)
+            if facets in results:  # combine new version coordinates
+                args = (result, results[facets])
+                result = xr.concat(args, dim='version')
             results[facets] = result
 
     # Concatenate along facets and save result
@@ -826,7 +834,7 @@ def process_scalar(
     print()
     print('Concatenating datasets.')
     if not results:
-        raise ValueError('No datasets found.')
+        raise RuntimeError('No datasets found.')
     facets = xr.DataArray(
         pd.MultiIndex.from_tuples(results, names=FACETS_LEVELS[:3]),
         dims='facets',

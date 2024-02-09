@@ -5,7 +5,6 @@ Processing utilities used by plotting functions.
 import itertools
 import math
 import re
-import warnings
 
 import climopy as climo  # noqa: F401
 import numpy as np
@@ -14,10 +13,10 @@ from climopy import var, ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
-from .internals import KEYS_REDUCE
-from .internals import _expand_lists, _group_parts, _ungroup_parts
-from .results import ALIAS_FEEDBACKS, FEEDBACK_ALIASES, REGEX_FLUX
+from .datasets import ALIAS_FEEDBACKS, FEEDBACK_ALIASES, REGEX_FLUX
 from .reduce import _reduce_double, reduce_facets, reduce_general
+from .specs import KEYS_REDUCE
+from .specs import _expand_lists, _group_parts, _ungroup_parts
 from cmip_data.feedbacks import FEEDBACK_DEPENDENCIES
 
 
@@ -27,7 +26,7 @@ __all__ = ['get_data', 'process_data']
 # Observational constraint mean and spreads
 # TODO: Auto-generate this dictionary or save and commit then parse a text file.
 # NOTE: These show best estimate, standard errors, and degrees of freedom for feedback
-# regression slopes using either GISTEMP4 or HadCRUT5 and using surface temp autocorr
+# regression slopes using either GISTEMP4 or HadCRUT5 and using residual autocorr
 # adjustment (consistent with Dessler et al.). See observed.ipynb notebook.
 FEEDBACK_CONSTRAINTS = {
     # 'cld': (0.69, (1.04 - 0.31) / 2,  # He et al. with 95% uncertainty
@@ -88,6 +87,7 @@ VARIABLE_DEPENDENCIES = {
 
 # Variable derivations
 # NOTE: See timescales definitions.py (eventually will be copied to climopy)
+# TODO: Use this approach for flux addition terms and other stuff
 def equator_pole_delta(self, name):  # noqa: E302
     temp, _ = name.split('_')
     temp = self[temp]  # also quantifies
@@ -106,7 +106,6 @@ def equator_pole_diffusivity(self, name):  # noqa: E302
 
 # Register variables
 # TODO: Restore this after updating climopy and move to definitions file
-# TODO: Use this approach for flux addition terms and other stuff
 # climo.register_derivation(re.compile(r'\A(ta|ts)_grad\Z'))(equator_pole_delta)
 # climo.register_derivation(re.compile(r'\A(ta|ts)_diff\Z'))(equator_pole_diffusivity)
 # with warnings.catch_warnings():  # noqa: E305

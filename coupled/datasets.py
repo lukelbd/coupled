@@ -51,7 +51,7 @@ REGEX_TRANSPORT = re.compile(r'(mse|total)')
 # feedback files but for climate data simply load monthly data, average later.
 KEYS_PERIODS = ('annual', 'seasonal', 'monthly')
 KEYS_REGIONS = ('point', 'latitude', 'hemisphere')
-KEYS_RANGES = ('early', 'late', 'delayed', 'historical')
+KEYS_RANGES = ('early', 'late', 'delay', 'fifty')
 KEYS_FEEDBACKS = ('parts_erf', 'parts_wav', 'parts_clear', 'parts_kernels', 'parts_planck', 'parts_relative', 'parts_absolute')  # noqa: E501
 KEYS_ENERGY = ('drop_clear', 'drop_directions', 'skip_solar')
 KEYS_TRANSPORT = ('parts_local', 'parts_eddies', 'parts_static', 'parts_fluxes')
@@ -1161,7 +1161,7 @@ def climate_datasets(
 def feedback_datasets(
     *paths,
     boundary=None, source=None, style=None,
-    early=True, late=True, historical=False, delayed=False,
+    early=True, late=True, fifty=False, delay=False,
     point=True, latitude=True, hemisphere=False,
     annual=True, seasonal=False, monthly=False,
     average=False, nodrift=False, standardize=True,
@@ -1180,7 +1180,7 @@ def feedback_datasets(
         The kernel source(s) and feedback style(s) to optionally filter.
     point, latitude, hemisphere : bool, optional
         Whether to include or drop extra regional feedbacks.
-    early, late, historical, delayed : bool, optional
+    early, late, fifty, delay : bool, optional
         Whether to include or drop extra range feedbacks.
     annual, seasonal, monthly : bool, optional
         Whether to include or drop extra period feedbacks.
@@ -1268,9 +1268,9 @@ def feedback_datasets(
                 continue
             if not late and (start, stop) == (20, 150):
                 continue
-            if not historical and stop - start == 50:
+            if not fifty and stop - start == 50:
                 continue
-            if not delayed and start in range(1, 20):
+            if not delay and start in range(1, 20):
                 continue
             if outdated := 'local' in indicator or 'global' in indicator:
                 if indicator.split('-')[0] != 'local':  # ignore global vs. global

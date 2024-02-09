@@ -11,10 +11,10 @@ import xarray as xr
 from climopy import var, ureg, vreg  # noqa: F401
 from icecream import ic  # noqa: F401
 
-from .plotting import CYCLE_DEFAULT
-from .plotting import generate_plot
+from .datasets import ALIAS_FEEDBACKS
 from .process import get_data
-from .results import ALIAS_FEEDBACKS
+from .general import CYCLE_DEFAULT
+from .general import generate_plot
 from . import _warn_coupled
 
 __all__ = [

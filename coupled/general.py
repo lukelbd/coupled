@@ -20,9 +20,9 @@ import matplotlib.container as mcontainer
 import matplotlib.lines as mlines
 import seaborn as sns
 from climopy import ureg, vreg  # noqa: F401
-from .internals import _capitalize_label, _split_label, get_labels, parse_specs
 from .process import _constrain_data, process_data
 from .reduce import _components_corr, _components_slope, _parse_institute, _parse_project  # noqa: E501
+from .specs import _capitalize_label, _split_label, get_labels, parse_specs
 
 __all__ = ['generate_plot']
 

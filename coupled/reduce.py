@@ -11,9 +11,9 @@ from climopy import var, ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
-from .internals import ORDER_LOGICAL, TRANSLATE_INSTITUTES
-from .results import FACETS_NAME, FACETS_LEVELS, VERSION_NAME, VERSION_LEVELS
 from cmip_data.facets import MODELS_INSTITUTES
+from .datasets import FACETS_NAME, FACETS_LEVELS, VERSION_NAME, VERSION_LEVELS
+from .specs import ORDER_LOGICAL, TRANSLATE_INSTITUTES
 
 __all__ = ['reduce_facets', 'reduce_general']
 

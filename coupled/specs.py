@@ -12,7 +12,7 @@ import proplot as pplt
 from climopy import ureg, vreg  # noqa: F401
 from icecream import ic  # noqa: F401
 
-from .results import ALIAS_FEEDBACKS, FEEDBACK_ALIASES, FACETS_LEVELS, VERSION_LEVELS
+from .datasets import ALIAS_FEEDBACKS, FEEDBACK_ALIASES, FACETS_LEVELS, VERSION_LEVELS
 
 __all__ = ['get_path', 'get_label', 'get_labels', 'parse_spec', 'parse_specs']
 

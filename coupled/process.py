@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Processing utilities used by plotting functions.
+Utilities for processing coupled model data variables.
 """
 import itertools
 import math
 import re
+from collections import namedtuple
+from pathlib import Path
 
 import climopy as climo  # noqa: F401
 import numpy as np
@@ -13,18 +15,17 @@ from climopy import var, ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
-from .datasets import ALIAS_FEEDBACKS, FEEDBACK_ALIASES, REGEX_FLUX
-from .reduce import _reduce_double, reduce_facets, reduce_general
-from .specs import KEYS_REDUCE
-from .specs import _expand_lists, _group_parts, _ungroup_parts
+from cmip_data.facets import ENSEMBLES_FLAGSHIP
 from cmip_data.feedbacks import FEEDBACK_DEPENDENCIES
+from .reduce import _reduce_datas, reduce_facets, reduce_general
+from .specs import _expand_lists, _expand_parts, _group_parts, _pop_kwargs
 
-
-__all__ = ['get_data', 'process_data']
+__all__ = ['get_parts', 'get_result', 'process_constraint', 'process_data']
 
 
 # Observational constraint mean and spreads
-# TODO: Auto-generate this dictionary or save and commit then parse a text file.
+# TODO: Auto-generate this dictionary or save and commit then parse a text file. For
+# now copied from jupyterlab observed.ipynb cell.
 # NOTE: These show best estimate, standard errors, and degrees of freedom for feedback
 # regression slopes using either GISTEMP4 or HadCRUT5 and using residual autocorr
 # adjustment (consistent with Dessler et al.). See observed.ipynb notebook.
@@ -46,12 +47,14 @@ FEEDBACK_CONSTRAINTS = {
     'hadlwcre': (0.15, 0.14, 184),
 }
 
-# Model-estimated bootstrapped feedback uncertainty
-# NOTE: See templates.py _calc_bootstrap for calculation details
+# Model-estimated bootstrapped uncertainty (see _calc_bootstrap)
 # TODO: Record degrees of freedom and autocorrelation across successive bootstrap
 # feedback estimates (e.g. year 0-20 estimate will be related to year 5-25). For now
-# just assume implied distribution is Gaussian in _constrain_data() below.
-INTERNAL_VARIABILITY = {
+# just assume implied distribution is Gaussian in process_constraint() below.
+# NOTE: Include bootstraps longer than observational record so that we can
+# test what uncertainty *would be* if input observed feedback was calculated
+# from longer record. Will also adjust dof on regression estimate uncertainty.
+INTERNAL_UNCERTAINTY = {
     'cld': {20: np.nan, 40: np.nan, 60: np.nan},
     'net': {20: 0.38, 40: 0.22, 50: 0.19, 60: 0.13},
     'cs': {20: 0.24, 40: 0.15, 50: 0.13, 60: 0.10},
@@ -116,8 +119,325 @@ def equator_pole_diffusivity(self, name):  # noqa: E302
 # vreg.define('ts_diff', 'bulk energy transport surface diffusivity', 'PW / K')
 
 
-def _constrain_data(
-    data0, data1, constraint=None, pctile=None, observed=None, variability=None, graphical=False, N=None,  # noqa: E501
+def _get_parts(
+    name=None, parts=None, signs=None, product=None, relative=None, search=None, replace=None, absolute=None, **attrs,  # noqa: E501
+):
+    """
+    Get the options associated with the input name.
+
+    Parameters
+    ----------
+    name : str, optional
+        The name whose components should be inferred.
+    parts : str or sequence of str, optional
+        The components required for the input `name`.
+    signs : float or sequnce of float, optional
+        The scalings to apply when combining the components.
+    product : bool, optional
+        Whether to combine components as a product or sum.
+    relative : bool, optional
+        Whether to subtract a global average from the result.
+    search, replace : str, optional
+        The regular expressions to use to replace components.
+    absolute : bool, optional
+        Whether to build atmospheric feedbacks from absolute components.
+    **attrs
+        The attributes to optionally add to the result.
+
+    Returns
+    -------
+    parts : sequence of str
+        The variable components.
+    options : dict
+        The combination options.
+    """
+    # NOTE: This is ad hoc implementation of cfvariable-like scheme for quickly
+    # retrieving names. In future should implement these as derivations with standard
+    # cfvariable properties and recursively combine / check for availability using
+    # nested lists of derivation functions rather than this restricted approach.
+    from .feedbacks import REGEX_FLUX as regex
+    trans = lambda arg, *subs: [re.sub(arg, sub, name).strip('_') for sub in subs]
+    if name and (flux := regex.search(name)):
+        head, _, wav, net, bnd, sky, *_, param = (*flux.groups(), *name.split('_'))
+    else:
+        head = wav = net = bnd = sky = param = 'NA'
+    if not name:  # user-input only
+        parts = parts or ()
+    elif 'rluscs' in name or 'rsdtcs' in name:
+        parts = (name[:-2],)  # all-sky same as clear-sky
+    elif 'total' in name:
+        parts = trans('total', 'lse', 'dse', 'ocean')
+        search, replace = 'latent', 'total'
+    elif 'mse' in name:
+        parts = trans('mse', 'lse', 'dse')
+        search, replace = 'latent', 'moist'
+    elif 'dse' in name:  # possibly missing dry term e.g. dry stationary
+        parts = trans('dse', 'hse', 'gse')
+        search, replace = 'sensible', 'dry'
+    elif name == 'tdev':  # TODO: define other 'relative' variables?
+        parts, relative = ('tstd',), (True,)
+        attrs.update(units='K', long_name='relative warming')
+    elif name == 'tabs':  # warming pattern for scaled sensitivity
+        parts, product = ('tpat', 'ecs'), (True,)
+        attrs.update(units='K', long_name='effective warming')
+    elif param == 'ts' or param == 'ta':  # eqtemp = temp - (temp - eqtemp) (see below)
+        delta = name.replace('_' + param, '_dt')  # climate minus implied deviation
+        parts, signs = (param, delta), (1, -1)
+        search, replace = 'temperature', 'equilibrium temperature'
+    elif param == 'dt':  # temp - eqtemp anomaly inferred from feedback (see above)
+        value = name.replace('_dt', '').replace(f'{head}_', '')  # flux anomaly
+        slope = name.replace('_dt', '_lam')  # feedback in denominator
+        parts, signs, product = (value, slope), (1, -1), (True,)
+        search, replace = 'flux', 'temperature'
+        attrs.update(units='K', long_name='temperature difference')
+    elif re.search(temp := r'(ecs|erf)(?:([0-9.-]+)x)?', name):
+        parts = trans(temp, r'\1')
+        scale = re.search(temp, name).group(2)
+        signs = (np.log2(float(scale or 4)),)  # default to 4xCO2 scale
+        search = r'\A'  # prepend to existing label
+        replace = rf'{scale}$\\times$CO$_2$ ' if scale else ''
+    elif head == 'atm':  # atmospheric kernels
+        names1 = trans(regex, r'pl\2\3\4\5\6', r'lr\2\3\4\5\6', r'hus\2\3\4\5\6')
+        names2 = trans(regex, r'pl*\2\3\4\5\6', r'lr*\2\3\4\5\6', r'hur\2\3\4\5\6')
+        parts = names1 if absolute else names2
+        search = r'(adjusted\s+)?Planck'
+        replace = 'temperature + humidity'
+    elif head == 'ncl':  # non-cloud kernels
+        parts = trans(regex, r'cl\2\3\4\5\6', r'\2\3\4\5\6')
+        search, replace = 'cloud', 'non-cloud'
+        signs = (-1, 1)
+    elif sky == 'ce':  # raw cloud effect
+        parts = trans(regex, r'\1\2\3\4\5cs', r'\1\2\3\4\5')
+        search, replace = 'clear-sky', 'cloud'
+        signs = (-1, 1)
+    elif bnd == 'a':  # net atmosheric (surface and TOA are positive into atmosphere)
+        parts = trans(regex, r'\1\2\3\4t\6', r'\1\2\3\4s\6')
+        search, replace = 'TOA', 'atmospheric'
+        signs = (1, 1)
+    elif net == 'e':  # effective forcing e.g. 'rlet'
+        parts = trans(regex, r'\1\2\3n\5\6_erf')
+        search, replace = 'effective ', ''  # NOTE: change?
+        signs = (1, 1)
+    elif net == 'r':  # radiative response e.g. 'rlrt'
+        parts = trans(regex, r'\1\2\3n\5\6', r'\1\2\3n\5\6_erf')
+        signs = (1, -1)
+        search, replace = 'flux', 'response'
+    elif wav == 'f':  # WARNING: critical to add wavelengths last
+        opts = FEEDBACK_DEPENDENCIES.get(head, {'longwave': True, 'shortwave': True})
+        wavs = [key[0] for key, val in opts.items() if val or head == '']
+        parts = trans(regex, *(rf'\1\2{wav}\4\5\6' for wav in wavs))
+        search = '(longwave|shortwave) '
+        replace = 'net ' if head == sky == '' else ''
+    elif net == 'n':  # WARNING: only used for CERES data currently
+        idxs = slice(1, None) if wav == 'l' and bnd == 't' else slice(None, None)
+        parts, signs = (r'\1\2\3d\5\6', r'\1\2\3u\5\6'), (1, -1)
+        parts, signs = trans(regex, *parts[idxs]), signs[idxs]
+        search = '(upwelling|downwelling|incoming|outgoing)'
+        replace = 'net'
+    else:  # defer error message
+        parts = parts or (name,)
+    parts = (parts,) if isinstance(parts, str) else tuple(parts)
+    signs = np.atleast_1d(1 if signs is None else signs)
+    signs = tuple(signs) * (1 if len(signs) == len(parts) else len(parts))
+    search = search and re.compile(search)  # re.compile(re.compile(...)) allowed
+    options = dict(signs=signs, product=product, relative=relative)
+    options = dict(**options, attrs=attrs, search=search, replace=replace)
+    return parts, options
+
+
+def _get_result(parts, combine=True, hemisphere=None, **kwargs):
+    """
+    Get the data array associated with the input parts.
+
+    Parameters
+    ----------
+    parts : namedtuple
+        The (possibly nested) components and instructions returned by `_get_parts`.
+    combine : str, optional
+        Whether to combine the arrays or just return the first component.
+    hemisphere : bool or str, optional
+        The hemisphere to optionally select.
+    **kwargs
+        The reduce instructions passed to `reduce_general`.
+
+    Returns
+    -------
+    xarray.DataArray
+        The array used
+    """
+    # TODO: This is similar to climopy recursive derivation invocation. Except delays
+    # summations until selections are performed in reduce_general()... better than
+    # re-calculating full result every time (intensive) or caching full result after
+    # calculation (excessive storage). Should add to climopy (see below).
+    keys_climo = ('quantify', 'standardize')
+    kw_climo = {key: kwargs.pop(key) for key in keys_climo if key in kwargs}
+    datas, name = [], parts.__class__.__name__
+    for part in parts.parts:
+        data = part
+        if isinstance(part, tuple):  # recurse
+            data = _get_result(part, combine=combine, **kwargs)
+        elif not combine:  # skip reduce
+            data = part if isinstance(part, xr.DataArray) else xr.DataArray([], name=name)  # noqa: E501
+        else:  # apply reduce
+            data = reduce_general(data, **kwargs)
+            if hemisphere and 'lat' in data.dims:
+                data = data.climo.sel_hemisphere(hemisphere)
+            if 'plev' in data.coords:
+                data = data.rename(plev='lev')
+            if isinstance(data, xr.Dataset):  # climopy derivation
+                data = data.climo.get(name, **kw_climo)
+            if 'lev' in data.coords:
+                data = data.rename(lev='plev')
+        datas.append(data)
+    if combine:
+        datas, signs = datas, parts.signs
+    else:
+        datas, signs = datas[:1], parts.signs[:1]
+    if not combine or not parts.relative:
+        bases = (1 if parts.product else 0,) * len(signs)
+    else:
+        bases = [data.climo.average('area') for data in datas]
+    iter_ = zip(datas, signs, bases, strict=True)
+    with xr.set_options(keep_attrs=True):
+        if not combine or len(datas) == 1 and signs[0] == 1 and not parts.relative:
+            data = datas[0]
+        elif parts.product:  # get products or ratios
+            data = math.prod(data ** sign / base for data, sign, base in iter_)
+        else:  # get sums or differences
+            data = sum(sign * data - base for data, sign, base in iter_)
+    data = data.copy(deep=False)  # update attributes on derived variable
+    data.name = name
+    data.attrs.update(parts.attrs)
+    for key in ('long_name', 'short_name', 'standard_name'):
+        value = data.attrs.get(key, None)
+        if parts.search and isinstance(value, str):
+            data.attrs[key] = parts.search.sub(parts.replace, value)
+    return data
+
+
+def get_parts(dataset, name, scaled=False, **kwargs):
+    """
+    Return the components needed to build the requested variable.
+
+    Parameters
+    ----------
+    dataset : xarray.Dataset
+        The source dataset.
+    name : str
+        The requested variable.
+    scaled : bool, optional
+        Whether CO$_2$ scaling has been applied.
+    **kwargs
+        Additional settings passed to `_get_parts`.
+
+    Returns
+    -------
+    parts : namedtuple
+        Tuple named `name` containing the components required by `get_result`.
+    """
+    # NOTE: Previously had quadruple=True default option to load all feedbacks as
+    # quadrupled versions, but meant same variable name could have different meaning
+    # depending on input arguments. Now implement scaling as a derivation below and
+    # add explicit indicator if '2x' or '4x' is specified. Preserve default of always
+    # *displaying* the unscaled experiment results by translating 'erf' or 'ecs' below.
+    from .feedbacks import ALIAS_VARIABLES as aliases
+    name = aliases.get(name, name)
+    scaled = scaled or 'ecs' not in name and 'erf' not in name
+    absolute = not any(name[:3] == 'pl*' for name in dataset)
+    if scaled and name in dataset or name in dataset.climo:
+        parts, options = _get_parts(parts=[name], **kwargs)  # manual parts
+    else:  # automatic parts
+        parts, options = _get_parts(name, absolute=absolute, **kwargs)
+    if name not in dataset and name in dataset.climo:
+        attrs = ('short_name', 'long_name', 'standard_units')
+        attrs = {attr: getattr(vreg[name], attr) for attr in attrs}
+        options['attrs'].update(attrs)
+    from .feedbacks import REGEX_FLUX as regex
+    fluxes = ', '.join(s for s in dataset.data_vars if regex.search(s))
+    results = []
+    for part in parts:
+        deps = VARIABLE_DEPENDENCIES.get(name, ())
+        scaled = name != 'tabs'  # whether input is scaled
+        if scaled and part in dataset:
+            part = dataset[part]
+        elif part in dataset.climo:
+            part = dataset.drop_vars(dataset.data_vars.keys() - set(deps))
+        elif not scaled or part != name:  # valid derivation
+            part = get_parts(dataset, part, scaled=scaled)
+        else:  # print available
+            raise KeyError(f'Required variable {name} not found. Options are: {fluxes}.')  # noqa: E501
+        results.append(part)
+    parts = namedtuple('parts', ('parts', *options))
+    parts.__name__ = name  # permit non-idenfitier
+    parts = parts(results, *options.values())
+    return parts
+
+
+def get_result(
+    *args, attr=None, spatial=None, hemi=None, hemisphere=None, quantify=False, standardize=True, **kwargs,  # noqa: E501
+):
+    """
+    Return the requested variable or attribute.
+
+    Parameters
+    ----------
+    *args : namedtuple
+        The variable arguments. If not a `namedtuple` then passed to `get_parts`.
+    attr : str, optional
+        The attribute to retrieve. Can be passed as the final positional argument.
+    spatial : str, optional
+        The spatial reduction option.
+    hemi, hemisphere : str, optional
+        Passed to `.sel_hemisphere`.
+    quantify, standardize : bool, optional
+        Passed to `accessor.get`.
+    **kwargs
+        Passed to `reduce_general`.
+
+    Returns
+    -------
+    result : xarray.DataArray or str
+        The result. If `attr` is not ``None`` this is the corresponding attribute.
+    """
+    # NOTE: This returns both data arrays and attributes. Should add to climopy by
+    # 1) translating instructions, 2) selecting relevant variables, 3) performing scalar
+    # selections first (e.g. points, maxima), 4) combining variables (e.g. products,
+    # sums), then 5) more complex coordinate operations (e.g. averages, integrals). And
+    # optionally order operations around non-linear variable or coordinate operations.
+    if not args or len(args) > 3:
+        raise TypeError(f'Expected 1 to 3 positional arguments but got {len(args)}.')  # noqa: E501
+    if len(args) == 1 and not isinstance(args[0], tuple):
+        raise TypeError('Input argument must be namedtuple returned by get_parts().')
+    kwargs['hemi'] = hemi or hemisphere  # permit either
+    kwargs['quantify'] = quantify  # detectable with _pop_kwargs
+    kwargs['standardize'] = standardize  # detectable with _pop_kwargs
+    nargs = isinstance(args[0], xr.Dataset) + 1
+    args, attrs = args[:nargs], args[nargs:]
+    parts = args[0] if nargs == 1 else get_parts(*args)
+    attr = attr or attrs and attrs[0] or None
+    data = _get_result(parts, combine=attr is None, **kwargs)
+    if spatial is not None:  # only apply custom spatial correlation
+        val0, val1 = kwargs.get('start', 0), kwargs.get('stop', 150)
+        kw0 = {'start': 0, 'stop': 150} if 'version' in data.coords else {}
+        kw1 = {'start': val0, 'stop': val1} if 'version' in data.coords else {}
+        data0 = data.sel(experiment='picontrol', **kw0)
+        data1 = data.sel(experiment='abrupt4xco2', **kw1)
+        data, attrs = _reduce_datas(data0, data1, dim='area', method=spatial)
+        data.attrs.update({**data.attrs, **attrs})
+        del data.attrs['name']  # only used in reduce_facets()
+    if attr == 'units':
+        result = data.climo.units
+    elif attr:
+        result = data.attrs.get(attr, '')
+    elif data.size:
+        result = data
+    else:
+        raise ValueError(f'Empty result {data.name} with sizes {data.sizes}.')
+    return result
+
+
+def process_constraint(
+    data0, data1, constraint=None, observed=None, internal=False, graphical=False, pctile=None, N=None, **kwargs,  # noqa: E501
 ):
     """
     Return percentile bounds for observational constraint.
@@ -130,16 +450,22 @@ def _constrain_data(
         The predictand data. Must be 1D.
     constraint : str or 2-tuple,
         The 95% bounds on the observational constraint.
+    observed : int, optional
+        The number of years to use for observational uncertainty.
+    internal : bool or int, optional
+        Whether to include model-estimated observed uncertainty due to variability. If
+        ``True`` then ``20`` is used. If passed the bounds are with and without model
+        inferred spread due to internal variability. Also adjusts the observed spread.
+    graphical : bool, optional
+        Whether to use graphical intersections instead of residual bootstrapping. If
+        ``False`` then constrained uncertainty estimated by adding t-distribution with
+        standard error calculated from residuals of regression relationship.
     pctile : float, default: 95
         The emergent constraint percentile bounds to be returned.
-    observed : int, default: 20
-        Number of years to assume for observational uncertainty estimate.
-    variability : bool or int, optional
-        Number of years for variability variability estimate.
-    graphical : bool, optional
-        Whether to use graphical intersections instead of residual bootstrapping.
-    N : int, default: 100000
+    N : int, default: 1000000
         The number of bootstrapped samples to carry out.
+    **kwargs
+        Passed to `_get_regression`.
 
     Returns
     -------
@@ -158,16 +484,16 @@ def _constrain_data(
     # of individual feedback regressions that comprise inter-model regression because
     # their sample sizes are larger (150 years) and uncertainties are uncorrelated so
     # should roughly cancel out across e.g. 30 members of ensemble.
-    name = constraint if isinstance(constraint, str) else None
-    name = FEEDBACK_ALIASES.get(name, name)
-    pctile = 95 if pctile is None or pctile is True else pctile
-    pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
-    observed = observed or 20
-    variability = observed if variability is None or variability is True else variability  # noqa: E501
-    variability = INTERNAL_VARIABILITY[name][variability] if variability else None
+    from .feedbacks import VARIABLE_ALIASES
+    from .reduce import _get_regression
     constraint = 'cld' if constraint is None or constraint is True else constraint
-    kwargs = dict(pctile=pctile, adjust=False)  # no correlation across ensembles
-    N = N or 10000  # samples to draw
+    observed = observed or 20
+    internal = observed if internal is None or internal is True else internal
+    kwargs['pctile'] = pctile = 95 if pctile is None or pctile is True else pctile
+    pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
+    name = constraint if isinstance(constraint, str) else None
+    name = VARIABLE_ALIASES.get(name, name)
+    N = N or 1000000  # samples to draw
     if name is not None:
         constraint = FEEDBACK_CONSTRAINTS[name]
     if not np.iterable(constraint) or len(constraint) != 3:
@@ -175,21 +501,25 @@ def _constrain_data(
     if data0.ndim != 1 or data1.ndim != 1:
         raise ValueError(f'Invalid data dims {data0.ndim} and {data1.ndim}. Must be 1D.')  # noqa: E501
     xmean, xscale, xdof = constraint  # note dof will have small effect
+    nbounds = 1 if internal is None else 2  # number of bounds returned
     xdof *= observed / 20  # increased degrees of freedom
     xscale /= np.sqrt(observed / 20)  # reduced regression error
-    nbounds = 1 if variability is None else 2  # number of bounds returned
     xmin, xmax = stats.t(df=xdof, loc=xmean, scale=xscale).ppf(0.01 * pctile)
     observations = np.array([xmin, xmean, xmax])
-    if variability is not None:
+    if internal is not False:
+        internal = INTERNAL_UNCERTAINTY[name][internal]
         xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
-        es = stats.norm(loc=0, scale=variability).rvs(N)  # implied variability error
+        es = stats.norm(loc=0, scale=internal).rvs(N)  # implied variability error
         observations = np.insert(np.percentile(xs + es, pctile), 1, observations)
-    data0 = np.array(data0).squeeze()
-    data1 = np.array(data1).squeeze()
-    idxs = np.argsort(data0, axis=0)
-    data0, data1 = data0[idxs], data1[idxs]  # required for graphical error
-    mean0, mean1 = data0.mean(), data1.mean()
-    bmean, berror, _, fit, fit_lower, fit_upper = var.linefit(data0, data1, **kwargs)
+    idxs = data0.argsort().values  # critical so 'fit' has same coordinates
+    data0 = data0.isel({data0.dims[0]: idxs})
+    data1 = data1.isel({data0.dims[0]: idxs})
+    mean0 = data0.values.mean()
+    mean1 = data1.values.mean()
+    result = _get_regression(data0, data1, **kwargs)
+    bmean, _, _, fit, fit_lower, fit_upper, rscale, rsquare, rdof = result
+    bmean, rdof, fit = bmean.values, rdof.values, fit.values
+    fit_lower, fit_upper = fit_lower.values, fit_upper.values
     if graphical:  # intersection of shaded regions
         fit_lower = fit_lower.squeeze()
         fit_upper = fit_upper.squeeze()
@@ -206,17 +536,16 @@ def _constrain_data(
         # as_ = stats.t(loc=amean, scale=aerror, df=data0.size - 2).rvs(N)
         # ys = err + as_ + bs_ * xs  # include both uncertainties
         # ys = mean1 + bs_ * (xs - mean0)  # include slope uncertainty only
-        rscale = np.std(data1 - fit, ddof=1)  # model residual sigma
-        rdof = data0.size - 2  # inter-model regression dof
+        # rscale = np.std(data1 - fit, ddof=1)  # model residual sigma
         xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)  # observations
         rs = stats.t(df=rdof, loc=0, scale=rscale).rvs(N)  # regression
         ys = rs + mean1 + bmean * (xs - mean0)
         constrained = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
         ys = mean1 + bmean * (xs - mean0)  # no regression uncertainty
         alternative = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
-        if variability is not None:
+        if internal is not False:
             xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
-            es = stats.norm(loc=0, scale=variability).rvs(N)  # implied variability
+            es = stats.norm(loc=0, scale=internal).rvs(N)  # implied variability error
             ys = rs + mean1 + bmean * (xs + es - mean0)
             constrained = np.insert(np.percentile(ys, pctile), 1, constrained)
             ys = mean1 + bmean * (xs + es - mean0)
@@ -224,331 +553,7 @@ def _constrain_data(
     return observations, alternative, constrained
 
 
-def _find_data(
-    dataset, name, attr=None, attrs=None, hemi=None,
-    scaled=False, quantify=False, standardize=True, **kwargs
-):
-    """
-    Find or derive the variable or variable attribute.
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The input dataset.
-    name : str
-        The requested variable.
-    attr : str, optional
-        The requested variable attribute.
-    attrs : dict, optional
-        The variable attribute overrides.
-    hemi : str, optional
-        The hemisphere to select.
-    scaled : bool, optional
-        Whether ecs/erf data has been scaled.
-    quantify : bool, optional
-        Whether to quantify the data.
-    standardize : str, optional
-        Whether to standardize the data.
-    **kwargs
-        Additional reduction instructions.
-
-    Returns
-    -------
-    data : xarray.DataArray
-        The result. If `attr` is not ``None`` this is an empty array.
-    """
-    # WARNING: Critical to only apply .reduce() operations to variables required for
-    # derivation or else takes too long. After climopy refactoring this will be taken
-    # into account automatically and derivations will require explicitly specifying
-    # the dependencies upon registration (no more retrieveing inside the function).
-    # NOTE: Here reduce_general will automatically perform selections for certain
-    # dimensions (only carry out when requesting data). Also gets net flux (longwave
-    # plus shortwave), atmospheric flux (top-of-atmosphere plus surface), cloud effect
-    # (all-sky minus clear-sky), radiative response (full minus effective forcing),
-    # net imbalance (downwelling minus upwelling), and various transport terms.
-    name = ALIAS_FEEDBACKS.get(name, name)
-    attrs = attrs or {}
-    scaled = scaled or 'ecs' not in name and 'erf' not in name
-    if scaled and name in dataset:
-        data = dataset[name]
-    elif not scaled or name not in dataset.climo:  # coupled-model derivation
-        data = _derive_data(dataset, name, attr=attr, scaled=scaled, **kwargs)
-    elif name in VARIABLE_DEPENDENCIES:  # any registered climopy derivation
-        var = vreg[name]  # specific supported derivation
-        keys = ('short_name', 'long_name', 'standard_units')
-        deps = set(VARIABLE_DEPENDENCIES[name])  # climopy derivation dependencies
-        attrs.update({attr: getattr(var, attr) for attr in keys})
-        if attr:  # TODO: throughout utilities permit cfvariable attributes
-            data = xr.DataArray([], name=name)
-        else:  # derive below with get()
-            data = dataset.drop_vars(dataset.data_vars.keys() - set(deps))
-    else:  # note in future will
-        raise RuntimeError(f'Climopy derivation {name} has unknown dependencies.')
-    if not attr:  # carry out reductions
-        data = reduce_general(data, **kwargs)
-        if 'plev' in data.coords:  # TODO: make derivations compatible with plev
-            data = data.rename(plev='lev')
-        if hemi and 'lat' in data.sizes:
-            data = data.climo.sel_hemisphere(hemi)
-        if isinstance(data, xr.Dataset):  # finally get the derived variable
-            data = data.climo.get(name, quantify=quantify, standardize=standardize)
-        if 'lev' in data.coords:
-            data = data.rename(lev='plev')
-    data.name = name
-    data.attrs.update(attrs)  # arbitrary overrides
-    return data
-
-
-def _derive_data(dataset, name, scaled=False, **kwargs):  # noqa: E501
-    """
-    Get or derive the variable or its attribute.
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The source dataset.
-    name : str
-        The requested variable.
-    scaled : bool, optional
-        Whether ecs/erf data has been scaled.
-    **kwargs
-        Additional reduction instructions.
-
-    Returns
-    -------
-    data : xarray.DataArray
-        The result with appropriate attributes.
-    """
-    # TODO: This is ad hoc implementation of cfvariable-like scheme for quickly
-    # retrieving names. In future should implement these as derivations with
-    # standardized cfvariable properties when derivation scheme is more sophisticated.
-    # NOTE: Previously had quadruple=True default option to load all feedbacks as
-    # quadrupled versions, but meant same variable name could have different meaning
-    # depending on input arguments. Now implement scaling as a derivation below and
-    # add explicit indicator if '2x' or '4x' is specified. Preserve default of always
-    # *displaying* the unscaled experiment results by translating 'erf' or 'ecs' below.
-    signs = search = replace = None
-    product = relative = False
-    regex = REGEX_FLUX  # always use this regex
-    attrs = {}  # attribute overrides
-    subs = lambda reg, *ss: tuple(reg.sub(s, name).strip('_') for s in ss)
-    head = wav = net = bnd = sky = trad = adjust = param = 'NA'
-    if flux := regex.search(name):
-        head, _, wav, net, bnd, sky = flux.groups()
-        trad, adjust = subs(regex, r'pl\2\3\4\5\6', r'pl*\2\3\4\5\6')  # see below
-        *_, param = name.split('_')
-    if 'rluscs' in name or 'rsdtcs' in name:
-        parts = name.replace('rluscs', 'rlus')  # all-sky is same as clear-sky
-        parts = parts.replace('rsdtcs', 'rsdt')  # all-sky is same as clear-sky
-    elif 'total' in name:
-        parts = subs(re.compile('total'), 'lse', 'dse', 'ocean')
-        search, replace = 'latent', 'total'
-    elif 'mse' in name:
-        parts = subs(re.compile('mse'), 'lse', 'dse')
-        search, replace = 'latent', 'moist'
-    elif 'dse' in name:  # possibly missing dry term e.g. dry stationary
-        parts = subs(re.compile('dse'), 'hse', 'gse')
-        search, replace = 'sensible', 'dry'
-    elif name == 'tdev':  # TODO: define other 'relative' variables?
-        parts, relative = 'tstd', True
-        attrs.update(units='K', long_name='relative warming')
-    elif name == 'tabs':
-        parts, product = ('tpat', 'ecs'), True
-        attrs.update(units='K', long_name='effective warming')
-        kwargs.update(scaled=False)
-    elif param == 'ts' or param == 'ta':  # eqtemp = temp - (temp - eqtemp) from below
-        delta = name.replace('_' + param, '_dt')  # climate minus implied deviation
-        parts, signs, product = (param, delta), (1, -1), False
-        search, replace = 'temperature', 'equilibrium temperature'
-    elif param == 'dt':  # temp - eqtemp anomaly inferred from feedback
-        denom = name.replace('_dt', '_lam')  # denominator
-        numer = name.replace('_dt', '').replace(head + '_', '')
-        parts, signs, product = (numer, denom), (1, -1), True
-        search, replace = 'flux', 'temperature'
-        attrs.update(units='K', long_name='temperature difference')
-    elif not scaled and re.search(temp := r'(ecs|erf)(?:([0-9.-]+)x)?', name):
-        default = 4  # display 4xCO2 by default when no scale is specified
-        scale = re.search(temp, name).group(2)
-        signs = np.log2(float(scale or default))
-        parts = subs(re.compile(temp), r'\1')
-        search = re.compile(r'\A')  # prepend to existing label
-        replace = rf'{scale}$\\times$CO$_2$ ' if scale else ''
-    elif head == 'atm':
-        if trad in dataset:
-            parts = (trad, *subs(regex, r'lr\2\3\4\5\6', r'hus\2\3\4\5\6'))
-        elif adjust in dataset:
-            parts = (adjust, *subs(regex, r'lr*\2\3\4\5\6', r'hur\2\3\4\5\6'))
-        else:
-            raise ValueError("Missing non-cloud components for 'atm' feedback.")
-        search = re.compile(r'(adjusted\s+)?Planck')
-        replace = 'temperature + humidity'
-    elif head == 'ncl':
-        parts = subs(regex, r'cl\2\3\4\5\6', r'\2\3\4\5\6')
-        search, replace = 'cloud', 'non-cloud'
-        signs = (-1, 1)
-    elif sky == 'ce':
-        parts = subs(regex, r'\1\2\3\4\5cs', r'\1\2\3\4\5')
-        search, replace = 'clear-sky', 'cloud'
-        signs = (-1, 1)
-    elif bnd == 'a':  # net atmosheric (surface and TOA are positive into atmosphere)
-        parts = subs(regex, r'\1\2\3\4t\6', r'\1\2\3\4s\6')
-        search, replace = 'TOA', 'atmospheric'
-        signs = (1, 1)
-    elif net == 'e':  # effective forcing e.g. 'rlet'
-        parts = subs(regex, r'\1\2\3n\5\6_erf')
-        search, replace = 'effective ', ''  # NOTE: change?
-        signs = (1, 1)
-    elif net == 'r':  # radiative response e.g. 'rlrt'
-        parts = subs(regex, r'\1\2\3n\5\6', r'\1\2\3n\5\6_erf')
-        signs = (1, -1)
-        search, replace = 'flux', 'response'
-    elif wav == 'f':  # WARNING: critical to add wavelengths last
-        deps = {'longwave': True, 'shortwave': True}  # e.g. atm_rfnt depends on both
-        deps = FEEDBACK_DEPENDENCIES.get(head, deps)
-        wavs = [wav[0] for wav, names in deps.items() if names or head == '']
-        patterns = [rf'\1\2{wav}\4\5\6' for wav in wavs]
-        parts = subs(regex, *patterns)
-        search = re.compile('(longwave|shortwave) ')
-        replace = 'net ' if head == sky == '' else ''
-    elif net == 'n':  # WARNING: only used for CERES data currently
-        if wav == 'l' and bnd == 't':
-            signs, patterns = (-1,), (r'\1\2\3u\5\6',)
-        else:
-            signs, patterns = (1, -1), (r'\1\2\3d\5\6', r'\1\2\3u\5\6')
-        parts = subs(regex, *patterns)
-        search = re.compile('(upwelling|downwelling|incoming|outgoing)')
-        replace = 'net'
-    else:
-        opts = ', '.join(s for s in dataset.data_vars if regex.search(s))
-        raise ValueError(f'Missing flux variable {name}. Options are: {opts}.')
-    kwargs.setdefault('scaled', True)  # see 'tabs'
-    kwargs.update(product=product, relative=relative)
-    data = _operate_data(dataset, parts, signs, search, replace, **kwargs)
-    data.attrs.update(attrs)  # manual attribute overrides
-    data.name = name
-    return data
-
-
-def _operate_data(
-    dataset, names, signs=None, search=None, replace=None, *,
-    attr=None, product=False, relative=False, **kwargs,
-):
-    """
-    Operate over input variables with sums or products and adjust their attributes.
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The input dataset.
-    names : str or sequence
-        The variables to operate along.
-    signs : int or sequence, optional
-        The signs or exponents of the variables added or multiplied.
-    search, replace : str or re.Pattern, optional
-        The attribute search pattern and replacement.
-    attr : str, optional
-        The requested variable attribute.
-    product : bool, optional
-        Whether to add or multiply the variables.
-    relative : bool, optional
-        Whether to subtract or divide the global average.
-    **kwargs
-        Passed to `reduce_general`.
-
-    Returns
-    -------
-    data : xarray.DataArray
-        The result with appropriate attributes.
-    """
-    # NOTE: When retrieving attributes only return first array in summation (whose
-    # attributes would be saved by keep_attrs=True) instead of performing operation.
-    # data = data.climo.add_cell_measures(('width', 'depth'))
-    names = (names,) if isinstance(names, str) else names
-    signs = (1,) * len(names) if signs is None else np.atleast_1d(signs).tolist()
-    if len(signs) != len(names):
-        raise RuntimeError('Length mismatch between signs and names.')
-    names = names if attr is None else names[:1]  # may just need first array attrs
-    datas = [_find_data(dataset, name, attr=attr, **kwargs) for name in names]
-    if not relative or attr is not None:
-        bases = (1 if product else 0,) * len(names)
-    else:
-        bases = [data.climo.average('area') for data in datas]
-    with xr.set_options(keep_attrs=True):
-        parts = zip(datas, signs, bases)
-        if attr is not None or len(datas) == 1 and signs[0] == 1 and not relative:
-            data = datas[0]
-        elif product:  # get products or ratios
-            data = math.prod(data ** sign / base for data, sign, base in parts)
-        else:  # get sums or differences
-            data = sum(sign * data - base for data, sign, base in parts)
-    data = data.copy(deep=False)  # update attributes on derived variable
-    for name in ('short_name', 'long_name', 'standard_name'):
-        if not search:
-            continue
-        if name not in data.attrs:
-            continue
-        value = data.attrs[name]
-        if isinstance(search, str):
-            value = value.replace(search, replace)
-        else:
-            value = search.sub(replace, value)
-        data.attrs[name] = value
-    return data
-
-
-def get_data(dataset, name, attr=None, **kwargs):
-    """
-    Get derived data component from the dataset.
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The input dataset.
-    name : str
-        The requested variable name.
-    attr : str, optional
-        The requested variable attribute.
-    **kwargs
-        Passed to `reduce_general`.
-
-    Returns
-    -------
-    result : xarray.DataArray or str
-        The result. If `attr` is not ``None`` this is the corresponding attribute.
-    """
-    # TODO: This is similar to climopy recursive derivation invocation. Except delays
-    # summations until selections are performed in reduce_general()... better than
-    # re-calculating full result every time (intensive) or caching full result after
-    # calculation (excessive storage). Should add to climopy by 1) translating
-    # instructions, 2) selecting relevant variables, 3) performing scalar selections
-    # first (e.g. points, maxima), 4) combining variables (e.g. products, sums), then
-    # 5) more complex coordinate operations (e.g. averages, integrals). And optionally
-    # order operations around non-linear variable or coordinate operations.
-    data = _find_data(dataset, name, attr=attr, **kwargs)
-    spatial = kwargs.get('spatial', None)
-    start = kwargs.get('start', 0)
-    stop = kwargs.get('stop', 150)
-    if spatial:  # only apply custom spatial correlation
-        kw0, kw1 = {}, {}
-        if 'version' in data.coords:
-            kw0, kw1 = {'start': 0, 'stop': 150}, {'start': start, 'stop': stop}
-        data0 = data.sel(experiment='picontrol', **kw0)
-        data1 = data.sel(experiment='abrupt4xco2', **kw1)
-        data, attrs = _reduce_double(data0, data1, dim='area', method=spatial)
-        data.attrs.update({**data.attrs, **attrs})
-        del data.attrs['name']  # only used in reduce_facets()
-    if attr == 'units':
-        result = data.climo.units
-    elif attr:
-        result = data.attrs.get(attr, '')
-    elif data.size:
-        result = data
-    else:
-        raise ValueError(f'Empty result {data.sizes}.')
-    return result
-
-
-def process_data(dataset, *kws_process, attrs=None, suffix=True):
+def process_data(dataset, *specs, attrs=None, suffix=True):
     """
     Combine the data based on input reduce dictionaries.
 
@@ -556,8 +561,8 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
     ----------
     dataset : xarray.Dataset
         The input dataset.
-    *kws_process : dict
-        The reduction keyword dictionaries.
+    *specs : dict
+        The variable specifiers.
     attrs : dict, optional
         The attribute dictionaries.
     suffix : bool, optional
@@ -577,36 +582,36 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
     # permit arbitrary combinations of names and indexers (see _parse_specs).
     # TODO: Possibly keep original 'signs' instead of _group_parts signs? See
     # below where arguments are combined and have to pick a sign.
-    kws_group, kws_count, kws_input, kws_reduce = [], [], [], []
-    if len(kws_process) not in (1, 2):
-        raise ValueError(f'Expected two process dictionaries. Got {len(kws_process)}.')
-    for i, kw_process in enumerate(kws_process):  # iterate method reduce arguments
-        kw_process, kw_coords, kw_count = kw_process.copy(), {}, {}
-        kw_reduce = {key: kw_process.pop(key) for key in KEYS_REDUCE if key in kw_process}  # noqa: E501
-        kw_input = {key: val for key, val in kw_process.items() if key != 'name' and val is not None}  # noqa: E501
-        kw_process = _group_parts(kw_process, keep_operators=True)
-        for key, value in kw_process.items():
+    kws_group, kws_count, kws_input, kws_facets = [], [], [], []
+    if len(specs) not in (1, 2):
+        raise ValueError(f'Expected two process dictionaries. Got {len(specs)}.')
+    for i, spec in enumerate(specs):  # iterate method reduce arguments
+        kw_data, kw_count, kw_group = spec.copy(), {}, {}
+        kw_facets = _pop_kwargs(kw_data, reduce_facets)
+        kw_input = {key: val for key, val in kw_data.items() if key != 'name' and val is not None}  # noqa: E501
+        kw_data = _group_parts(kw_data, keep_operators=True)
+        for key, value in kw_data.items():
             sels = ['+']
-            for part in _ungroup_parts(value):
+            for part in _expand_parts(value):
                 if part is None:
                     sel = None
                 elif np.iterable(part) and part[0] in ('+', '-', '*', '/'):
                     sel = part[0]
                 elif isinstance(part, (str, tuple)):  # already mapped integers
                     sel = part
-                else:
-                    unit = get_data(dataset, key, 'units')
+                else:  # retrieve unit
+                    unit = get_result(dataset, key, 'units')
                     if not isinstance(part, ureg.Quantity):
                         part = ureg.Quantity(part, unit)
                     sel = part.to(unit)
                 sels.append(sel)
             signs, values = sels[0::2], sels[1::2]
-            kw_coords[key] = tuple(zip(signs, values))
             kw_count[key] = len(values)
-        kws_group.append(kw_coords)
+            kw_group[key] = tuple(zip(signs, values))
         kws_count.append(kw_count)
+        kws_group.append(kw_group)
         kws_input.append(kw_input)
-        kws_reduce.append(kw_reduce)
+        kws_facets.append(kw_facets)
 
     # Group split reduce instructions into separate dictionaries
     # TODO: Add more grouping options (similar to _build_specs). For now just
@@ -628,17 +633,17 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
         values = kws_group[idx1].get(key, (('+', None),))
         values = values * (count[idx2] // count[idx1])  # i.e. *average* with itself
         kws_group[idx1][key] = values
-    for kw_coords, kw_reduce in zip(kws_group, kws_reduce):
-        startstop = 'startstop' in kw_coords and 'experiment' in kw_coords
+    for kw_group, kw_facets in zip(kws_group, kws_facets):
+        startstop = 'startstop' in kw_group and 'experiment' in kw_group
         groups = [('startstop', 'experiment')] if startstop else []
         for group in groups:
-            values = _expand_lists(*(kw_coords[key] for key in group))
-            kw_coords.update(dict(zip(group, values)))
+            values = _expand_lists(*(kw_group[key] for key in group))
+            kw_group.update(dict(zip(group, values)))
         groups.extend(
-            (key,) for key in kw_coords if not any(key in group for group in groups)
+            (key,) for key in kw_group if not any(key in group for group in groups)
         )
         kw_product = {
-            group: tuple(zip(*(kw_coords[key] for key in group))) for group in groups
+            group: tuple(zip(*(kw_group[key] for key in group))) for group in groups
         }
         ikws_data = []
         for values in itertools.product(*kw_product.values()):  # non-grouped coords
@@ -649,7 +654,7 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
             signs, values = zip(*items.values())
             sign = -1 if signs.count('-') % 2 else +1
             kw_data = dict(zip(items.keys(), values))
-            kw_data.update(kw_reduce)
+            kw_data.update(kw_facets)
             ikws_data.append((sign, kw_data))
         kws_data.append(ikws_data)
 
@@ -666,24 +671,23 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
     kws_data = _expand_lists(*kws_data)
     for ikws_data in zip(*kws_data):  # iterate operators
         signs, ikws_data = zip(*ikws_data)
-        datas, exps, kw_reduce = [], [], {}
+        datas, exps, kw_facets = [], [], {}
         for kw_data in ikws_data:  # iterate reduce arguments
             kw_data = kw_data.copy()
             name = kw_data.pop('name')  # NOTE: always present
             area = kw_data.get('area')
             experiment = kw_data.get('experiment')
+            for key, value in _pop_kwargs(kw_data, reduce_facets).items():
+                kw_facets.setdefault(key, value)
             if name == 'tabs' and experiment == 'picontrol':
                 name = 'tstd'  # use rfnt_ecs for e.g. abrupt minus pre-industrial
             if name in warming and area == 'avg' and len(ikws_data) == 2:
                 if name in warming[:2] or experiment == 'picontrol':
                     name = 'tstd'  # default to global average temp standard deviation
-            for key in tuple(kw_data):
-                if key in KEYS_REDUCE:
-                    kw_reduce.setdefault(key, kw_data.pop(key))
-            data = get_data(dataset, name, **kw_data)
+            data = get_result(dataset, name, **kw_data)
             datas.append(data)
             exps.append(experiment)
-        datas, method, default = reduce_facets(*datas, **kw_reduce)
+        datas, method, default = reduce_facets(*datas, **kw_facets)
         for key, value in default.items():
             defaults.setdefault(key, value)
         if len(datas) == 1:  # e.g. regression applied
@@ -704,8 +708,8 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
     # we supported percentile ranges and standard deviations of differences between
     # individual institutes from different projects by passing 2D data to line() with
     # e.g. 'shadepctiles' but now for consistency with line() plots of regression
-    # coefficients we use sum of variances (see _reduce_single and _reduce_double
-    # for details). Institute differences are now only supported for scalar plots.
+    # coefficients we use sum of variances (see _reduce_data and _reduce_datas for
+    # details). Institute differences are now only supported for scalar plots.
     print('.', end=' ')
     args = []
     method = methods_persum.pop()
@@ -715,12 +719,12 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
         parts = tuple(data.isel(sigma=0) if 'sigma' in data.dims else data for data in datas)  # noqa: E501
         sum_scale = sum(sign == 1 for sign in signs)
         if parts[0].sizes.get('facets', None) == 0:
-            raise RuntimeError('Empty facets dimension.')
+            raise RuntimeError('Empty model facets dimension.')
         with xr.set_options(keep_attrs=True):  # keep e.g. units and short_prefix
             arg = sum(sign * part for sign, part in zip(signs, parts)) / sum_scale
         if method == 'dist' and len(parts) > 1 and np.allclose(arg, 0):
             arg = parts[0]  # kludge for e.g. control late minus control early
-        if len(parts) == 1 and (name := kws_process[0].get('name')):
+        if len(parts) == 1 and (name := specs[0].get('name')):
             arg.name = name  # kluge for e.g. 'ts' minus 'tstd'
         if suffix and any(sign == -1 for sign in signs):
             suffix = 'anomaly' if suffix is True else suffix
@@ -743,14 +747,14 @@ def process_data(dataset, *kws_process, attrs=None, suffix=True):
         args.append(arg)
 
     # Align and restore coordinates
-    # WARNING: In some xarray versions seems _reduce_double with conflicting scalar
+    # WARNING: In some xarray versions seems _reduce_datas with conflicting scalar
     # coordinates will keep the first one instead of discarding. So overwrite below.
     # NOTE: Xarray automatically drops non-matching scalar coordinates (similar
     # to vector coordinate matching utilities) so try to restore them below.
     # NOTE: Global average regressions of local pre-industrial feedbacks onto global
     # pre-industrial feedbacks equal one despite regions with much larger magnitudes.
     # if args[0].sizes.keys() & {'lon', 'lat'}:  # ensure average is one
-    #     ic(kws_process, args[0].climo.average('area').item())
+    #     ic(specs, args[0].climo.average('area').item())
     args = xr.align(*args)  # re-align after summation
     if len(args) == len(kws_input):  # one or two (e.g. scatter)
         for arg, kw_input in zip(args, kws_input):

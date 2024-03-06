@@ -1,61 +1,57 @@
 #!/usr/bin/env python3
 """
-Template functions for generating complex plots.
+Helper functions for plotting coupled model output.
 """
 import itertools
-from pathlib import Path
 
 import climopy as climo  # noqa: F401
 import numpy as np
-import xarray as xr
 from climopy import var, ureg, vreg  # noqa: F401
 from icecream import ic  # noqa: F401
 
-from .datasets import ALIAS_FEEDBACKS
-from .process import get_data
 from .general import CYCLE_DEFAULT
-from .general import generate_plot
-from . import _warn_coupled
+from .general import general_plot
 
 __all__ = [
+    'build_specs',
     'divide_specs',
-    'generate_specs',
     'feedback_specs',
     'transport_specs',
     'scalar_plot',
     'pattern_plot',
-    'constraint_plot',
-    'connection_plot',
+    'regression_plot',
+    'regression_parts',
 ]
 
-# Variable and selection keywords
+# Keywords for specific commands or variables
 # NOTE: See also specs.py key lists
-KEYS_PLEV = (
-    'ta', 'zg', 'ua', 'va', 'hus', 'hur', 'cl', 'clw', 'cll', 'cli', 'clp', 'pt', 'slope',  # noqa: E501
-)
-KEYS_CONTOUR = (  # plurals not required
-    'levels', 'linewidth', 'linestyle', 'edgecolor',
+KEYS_CONTOUR = (
+    'levels',  # restricted to contours
+    'linewidth', 'linestyle', 'edgecolor',
 )
 KEYS_SHADING = (
-    'cmap', 'cmap_kw', 'norm', 'norm_kw', 'vmin', 'vmax', 'robust', 'step', 'locator', 'symmetric', 'diverging', 'sequantial',  # noqa: E501
+    'vmin', 'vmax', 'cmap', 'cmap_kw', 'norm', 'norm_kw',
+    'robust', 'step', 'locator', 'symmetric', 'diverging', 'sequantial',
+)
+KEYS_VERTICAL = (
+    'ta', 'zg', 'ua', 'va', 'hus', 'hur', 'pt', 'slope',
+    *(f'cl{s}' for s in ('', 'w', 'l', 'i', 'p')),
 )
 
 # Keywords for generating dictionary specs from kwargs
+# NOTE: These can be passed as vectors to build_specs for combining along rows/cols.
 # TODO: Remove 'base' kludge and permit vectors specifications on each side of pair.
-# NOTE: These can be passed as vectors to generate_specs for combining along rows/cols.
-KEYS_BREAK = (
+KEYS_SPECS = (
     'breakdown', 'component', 'feedbacks', 'adjusts', 'forcing', 'sensitivity', 'transport'  # noqa: E501
 )
-KEYS_PLOT = (
-    'method', 'pctile', 'std', 'normalize', 'hemisphere', 'hemi',
-    'name', 'period', 'spatial', 'volume', 'area', 'plev', 'lat', 'lon',
+KEYS_ITER = (
+    'method', 'name', 'period', 'spatial', 'volume', 'area', 'plev', 'lat', 'lon',
     'project', 'institute', 'experiment', 'ensemble', 'model', 'base',  # TODO: remove
-    'source', 'style', 'region', 'start', 'stop', 'dist', 'count',  # TODO: monitor
+    'source', 'style', 'start', 'stop', 'region', 'dist', 'count',  # NOTE: bootstrap
     'alpha', 'edgecolor', 'linewidth', 'linestyle', 'color', 'facecolor',
-    'xmin', 'xmax', 'ymin', 'ymax', 'xlabel', 'ylabel',
-    'vmin', 'vmax', 'cmap', 'cmap_kw', 'norm', 'norm_kw', 'robust', 'extend', 'extendsize',  # noqa: E501
-    'step', 'locator', 'levels', 'diverging', 'symmetric', 'sequential',
+    'xmin', 'xmax', 'ymin', 'ymax', 'xlabel', 'ylabel', 'xlocator', 'ylocator',
     'loc', 'label', 'align', 'colorbar', 'legend', 'length', 'shrink',
+    'extend', 'extendsize', *KEYS_SHADING, *KEYS_CONTOUR
 )
 
 # Variable name specs for feedbakc and transport breakdowns
@@ -123,206 +119,9 @@ SPECS_FEEDBACK = {
 }
 
 
-def _load_data(
-    source, variable, model, experiment, project=None, annual=True, average=True, fluxes=None,  # noqa: E501
-):
+def _get_props(method=None):
     """
-    Return dataset for particular model and experiment.
-
-    Parameters
-    ----------
-    source : path-like
-        The source directory.
-    variable, model, experiment : str
-        The variable model and experiment.
-    project : str, optional
-        The project folder to search.
-    annual : bool, optional
-        Whether to return annual average.
-    average : bool, optional
-        Whether to return global average.
-    fluxes : sequence, optional
-        The variables to preserve for flux files.
-
-    Returns
-    -------
-    data : xarray.Dataset or xarray.DataArray
-        The resulting data.
-    """
-    # NOTE: This is used both in below _calc_warming and _calc_internal and
-    # in figures.py function for plotting Gregory regressions of model fluxes.
-    from cmip_data.utils import average_periods
-    source = Path(source).expanduser()
-    project = project or '*'  # search either folder
-    fluxes = fluxes or ('rlnt', 'rlntcs', 'rsnt', 'rsntcs', 'ts')
-    fluxes = (fluxes,) if isinstance(fluxes, str) else tuple(fluxes)
-    patterns = {'abrupt4xco2': 'abrupt*', 'picontrol': 'pi*'}
-    pattern = patterns.get(experiment, experiment)
-    folder = '-'.join((project.lower(), experiment.lower(), 'amon'))
-    glob = f'{folder}/{variable}_Amon_{model}_{pattern}_0000-0150-eraint-series.nc'
-    paths = list(source.glob(glob))
-    if not paths:
-        _warn_coupled(f'Invalid pattern {glob!r} for path {folder}.')
-        return
-    if len(paths) > 1:
-        _warn_coupled(f'Duplicate results for pattern {glob!r} in path {folder}.')
-        return
-    data = xr.open_dataset(paths[0], use_cftime=True)
-    keys = fluxes if variable == 'fluxes' else (variable,)
-    data = data.drop(data.data_vars.keys() - set(keys))
-    if annual:
-        data = average_periods(data, seasonal=False, monthly=False)
-        data = data.sel(period='ann', drop=True)
-    if average:
-        data = data.climo.add_cell_measures()
-        data = xr.Dataset({key: data[key].climo.average('area') for key in keys})
-    return data[keys[0]] if len(keys) == 1 else data
-
-
-def _calc_internal(
-    dataset, source='~/scratch/cmip-fluxes', bootstrap=None, wav=None, sky=None,
-):
-    """
-    Calculate ad hoc bootstrap feedback uncertainty.
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The input dataset.
-    source : path-like, optional
-        The source directory.
-    bootstrap : bool or int, optional
-        The years to select.
-    wav, sky : str or sequence, optional
-        The wavelengths and skies to use.
-
-    Returns
-    -------
-    result : xarray.Dataset
-        The resulting terms.
-    """
-    # NOTE: Use standard deviation instead of percentiles for consistency with
-    # NOTE: This is used both to return global average time series for use with
-    # plot_feedback() and to actually calculate results for storing on dataset.
-    from observed.feedbacks import calc_feedback
-    skies = sky or ('', 'cs', 'ce')
-    skies = (skies,) if isinstance(skies, str) else tuple(skies)
-    wavs = wav or ('f', 'l', 's')
-    wavs = (wavs,) if isinstance(wavs, str) else tuple(wavs)
-    names = tuple(f'r{wav}nt{sky}_lam' for wav, sky in itertools.product(wavs, skies))
-    bootstraps = np.atleast_1d(bootstrap or 20)
-    count = xr.DataArray(bootstraps, dims='count')
-    dist = ['mean', 'sigma1', 'sigma2', 'range1', 'range2']
-    dist = xr.DataArray(dist, dims='dist')
-    base = dataset.rlnt_lam.isel(lon=0, lat=0, version=0, drop=True)
-    base = base.expand_dims(dist=dist, count=count)
-    base.attrs.clear()
-    base.coords['count'].attrs.update(units='years')
-    result = xr.Dataset({name: xr.full_like(base, np.nan) for name in names})
-    print('Getting bootstrap results.')
-    print('Model:', end=' ')
-    for project, model, experiment, ensemble in dataset.facets.values:
-        if ensemble != 'flagship' or experiment != 'picontrol':
-            continue
-        facets = (project, model, experiment, ensemble)
-        data = _load_data(source, 'fluxes', model, experiment, project=project, annual=False)  # noqa: E501
-        if data is None:
-            continue
-        attrs = ('units', 'short_name', 'long_name')  # attribute to infer
-        month = data.time.dt.strftime('%b').values[0]
-        data = data.rename(ts='ts_gis')  # then passed to observed utils
-        print(f'{model}_{month} (', end=' ')
-        for wav, sky, bootstrap in itertools.product(wavs, skies, bootstraps):
-            kw = dict(wav=wav, sky=sky, bootstrap=bootstrap, pctile=False, detrend=True)
-            lam, lam_lower, lam_upper, dof, *_ = calc_feedback(data, **kw)
-            dof = dof.mean('sample')  # average regression dof
-            count = lam.sizes['sample']  # total number of samples
-            sigma1 = 0.5 * (lam_upper - lam_lower).mean('sample')  # regression sigma
-            sigma2 = lam.std('sample', ddof=1)  # internal sigma
-            range1 = np.diff(var._dist_bounds(sigma1, pctile=True, dof=dof)).squeeze()
-            range2 = np.diff(var._dist_bounds(sigma2, pctile=True, dof=count)).squeeze()
-            print(f'{range1.item():.2f}/{range2.item():.2f}', end=' ')
-            name = f'r{wav}nt{sky}_lam'  # standardized name
-            attrs = {attr: get_data(dataset, name, attr) for attr in attrs}
-            attrs['units'] = climo.encode_units(attrs['units'])
-            result[name].attrs.update(attrs)
-            index = {'facets': facets, 'count': bootstrap}
-            result[name].loc[{**index, 'dist': 'mean'}] = lam.mean('sample')
-            result[name].loc[{**index, 'dist': 'sigma1'}] = sigma1
-            result[name].loc[{**index, 'dist': 'sigma2'}] = sigma2
-            result[name].loc[{**index, 'dist': 'range1'}] = range1
-            result[name].loc[{**index, 'dist': 'range2'}] = range2
-        print(')', end=' ')
-    return result
-
-
-def _calc_warming(dataset, source='~/scratch/cmip-processed'):
-    """
-    Calculate ad hoc scaled warming projection terms.
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The input dataset.
-    source : path-like, optional
-        The source directory.
-
-    Returns
-    -------
-    result : xarray.Dataset
-        The resulting terms.
-    """
-    # NOTE: Tried scaling with feedback to get 'absolute' climate sensitivity implied
-    # by feedback but unperturbed can be very small! So now use vector projections.
-    # tpar = (1 + dataset['tpat']) / dataset['rfnt_lam'].climo.average('area')
-    if 'tstd' in dataset or 'tdev' in dataset:
-        return dataset
-    if 'tpat' not in dataset:
-        raise ValueError('Could not find temperature pattern data.')
-    periods = [period for _, style, _, *period in dataset.version.values if style == 'slope']  # noqa: E501
-    periods = sorted(set(map(tuple, periods)))
-    attrs = dict(units='K', standard_units='K', short_name='warming', long_name='regional warming')  # noqa: E501
-    sel = dict(source='eraint', style='slope', region='globe')
-    data = xr.full_like(dataset.tpat, np.nan)
-    data.attrs.update(attrs)
-    if 'period' in data.sizes:  # select annual
-        sel['period'] = 'ann'
-    print('Getting scaled warming pattern.')
-    print('Model:', end=' ')
-    for project, model, experiment, ensemble in dataset.facets.values:
-        if ensemble != 'flagship':
-            continue
-        facets = (project, model, experiment, ensemble)
-        ranges = periods if experiment == 'abrupt4xco2' else [(0, 150)]
-        temp = _load_data(source, 'ts', model, experiment, project=project)
-        if temp is None:
-            continue
-        print(f'{model}_{experiment}', end=' ')
-        base = dataset.ts.sel(facets=(project, model, 'picontrol', ensemble))
-        base = base.sel({'period': 'ann'} if 'period' in base.dims else {})
-        base = base.climo.add_cell_measures().climo.average('area')
-        temp = temp - base  # pre-industrial anomaly
-        for start, stop in ranges:
-            if (start, stop) != (0, 150) and experiment == 'picontrol':
-                continue
-            indexers = dict(facets=facets, start=start, stop=stop, **sel)
-            scale = temp.isel(year=slice(start, stop))  # select years
-            scale = np.sqrt(((scale - scale.mean('year')) ** 2).sum('year'))
-            pattern = dataset.tpat.loc[indexers]  # add back global-mean warming
-            print(f'{scale.item():.1f}', end=' ')
-            data.loc[indexers] = scale * pattern
-    attrs = dict(units='K', standard_units='K', short_name='warming', long_name='relative warming')  # noqa: E501
-    base = data.climo.add_cell_measures().climo.average('area')
-    anom = data - base  # deviation from globe (now implemented in _derive_data)
-    anom.attrs.update(attrs)
-    result = xr.Dataset({'tstd': data, 'tdev': anom})
-    return result
-
-
-def _constraint_props(method=None):
-    """
-    Generate hatches and levels suitable for indicating significant
-    correlation coefficients or variance explained proportions.
+    Helper function to get contour and hatching properties from default reduction.
 
     Parameters
     ----------
@@ -350,9 +149,9 @@ def _constraint_props(method=None):
     return stipple, hatches, levels
 
 
-def _generate_dicts(*kws, expand=True, check=True):
+def _get_dicts(*kws, expand=True, check=True):
     """
-    Helper function to generate dictionaries from lists.
+    Helper function to get dictionaries from lists of dictionaries.
 
     Parameters
     ----------
@@ -389,75 +188,7 @@ def _generate_dicts(*kws, expand=True, check=True):
     return results[0] if len(results) == 1 else results
 
 
-def divide_specs(key, specs, **kwargs):
-    """
-    Divide feedback and variable specification lists.
-
-    Parameters
-    ----------
-    key : {'rows', 'cols'}
-        Whether to split rows or columns.
-    specs : list of dict
-        The feedback or variable specifications.
-    rowsplit, colsplit : bool or list of int, optional
-        The split instruction. Lists of integers indicate individual rows to select.
-        Sub-lists indicates multiple selections. Can optionally use trailing dictionary.
-    **kwargs : optional
-        Additional keywords passed to plotting function. Any subplot geometry vector
-        arguments e.g. ``hspace``, ``hratios``, ``rowlabels`` will be sub-selected.
-
-    Returns
-    -------
-    specs : list of list of dict
-        The specification iteration groups.
-    """
-    # Initial stuff
-    # NOTE: This is used to take arbitrary cross-sections of more
-    # complex figures with many panels for use in presentations.
-    split = kwargs.pop(f'{key}split', None)
-    nosplit = split is False or split is None
-    pre = 'h' if key == 'row' else 'w'
-    geom = 'nrows' if key == 'row' else 'ncols'
-    count = kwargs.get(geom, None)
-    titles = kwargs.get('titles', None)
-    labels = kwargs.get(f'{key}labels', None)
-    space = kwargs.get(f'{pre}space', None)
-    ratios = kwargs.get(f'{pre}ratios', None)
-    if nosplit:  # split nothing
-        split = ([*range(0, len(specs))],)
-    if split is True:  # split everything
-        split = [*range(0, len(specs))]
-    if not np.iterable(split):
-        split = (split,)
-
-    # Iterate over split indices
-    # NOTE: This comes *after* generating specs with _parse_specs. Simply yield
-    # subselections of resulting dictionary lists and update figure settings.
-    for idxs in split:
-        kwargs = kwargs.copy()
-        if not np.iterable(idxs):
-            idxs = (idxs,)
-        if isinstance(idxs[-1], dict):
-            kwargs = {**kwargs, **idxs[-1]}
-            idxs = idxs[:-1]
-        subs = [specs[idx] for idx in idxs]
-        noskip = np.all(np.diff(idxs) == 1)
-        kwargs[geom] = count if nosplit else None
-        kwargs.setdefault('horizontal', key == 'row')
-        if not nosplit and np.iterable(ratios):
-            kwargs[f'{pre}ratios'] = [ratios[idx] for idx in idxs]
-        if not nosplit and np.iterable(space):
-            kwargs[f'{pre}space'] = space[idxs[0]:idxs[-1]] or None if noskip else None
-        if not nosplit and np.iterable(labels) and not isinstance(labels, str):
-            if len(labels) == len(specs):  # TODO: re-address (need for tiled plots?)
-                kwargs[f'{key}labels'] = [labels[idx] for idx in idxs]
-        if not nosplit and np.iterable(titles) and not isinstance(titles, str):
-            if len(titles) == len(specs) and key == 'row':  # TODO: re-address
-                kwargs['titles'] = [titles[idx] for idx in idxs]
-        yield subs, kwargs
-
-
-def generate_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **kwargs):
+def build_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **kwargs):
     """
     Generate feedback and variable specifications based on input keywords.
 
@@ -491,15 +222,15 @@ def generate_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **
     # are not using a maxcols-modifying 'breakdown' function.
     # NOTE: Here permit generating lists of names and default keyword arguments from
     # shorthand 'breakdown' keys. Default is to generate feedback components with
-    # e.g. generate_specs(breakdown='all') but generate transport components if
-    # 'transport' is passed with e.g. generate_specs(breakdown='all', transport='t')
+    # e.g. build_specs(breakdown='all') but generate transport components if
+    # 'transport' is passed with e.g. build_specs(breakdown='all', transport='t')
     outer = [[outer]] if isinstance(outer, str) else outer or []
     outer = [[keys] if isinstance(keys, str) else list(keys) for keys in outer]
     pairs = pairs or ()
     pairs = (pairs,) if isinstance(pairs, str) else tuple(pairs)
     ncols = kwargs.get('ncols', None)
     maxcols = 1 if ncols else maxcols  # disable special arrangements
-    kw_break = {key: kwargs.pop(key) for key in tuple(kwargs) if key in KEYS_BREAK}
+    kw_break = {key: kwargs.pop(key) for key in tuple(kwargs) if key in KEYS_SPECS}
     if len(outer) > 2:  # only ever used for rows and columns
         raise ValueError('Too many outer variables specified.')
     if 'transport' in kw_break:  # transport breakdown
@@ -528,9 +259,9 @@ def generate_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **
     # NOTE: Numpy arrays should be used for e.g. scalar level lists or color values
     # and tuples or lists should be used for vectors of settings across subplots.
     # NOTE: Here 'outer' is used to specify different reduce instructions across rows
-    # or columns. For example: correlate with feedback parts in rows, generate_specs(
+    # or columns. For example: correlate with feedback parts in rows, build_specs(
     # name='psl', breakdown='net'); or correlate with parts (plus others) in subplots,
-    # generate_specs(name='psl', breakdown='net', outer=None, experiment=('picontrol', 'abrupt4xco2')).  # noqa: E501
+    # build_specs(name='psl', breakdown='net', outer=None, experiment=('picontrol', 'abrupt4xco2')).  # noqa: E501
     for keys, kw in zip(outer, kws_outer):
         for key in keys:
             if key in pairs:
@@ -553,7 +284,7 @@ def generate_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **
             kw[key] = list(value) if isinstance(value, (tuple, list)) else [value]
     kw_inner = {
         key: list(kwargs.pop(key)) for key in tuple(kwargs)
-        if key in KEYS_PLOT and isinstance(kwargs[key], (list, tuple))
+        if key in KEYS_ITER and isinstance(kwargs[key], (list, tuple))
     }
     kws_inner[0].update(kw_inner)  # remaining scalars or vectors
     kws_inner[1].update(kw_inner)
@@ -567,7 +298,7 @@ def generate_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **
     spatial = ('lon', 'lat', 'plev', 'area')  # include user input none
     product = product or ()
     product = [[keys] if isinstance(keys, str) else list(keys) for keys in product]
-    for key in KEYS_PLOT:  # add scalar versions
+    for key in KEYS_ITER:  # add scalar versions
         value = kwargs.pop(f'{key}1', sentinel)  # ignore none iteration placeholders
         if value is not sentinel and (key in spatial or value is not None):
             value = list(value) if isinstance(value, (tuple, list)) else [value]
@@ -587,14 +318,82 @@ def generate_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **
         for keys in product:  # then skip if absent
             if any(key in dict_ for key in keys):
                 kw = {key: dict_.pop(key) for key in keys if key in dict_}
-                kws.append(_generate_dicts(kw, expand=False))
+                kws.append(_get_dicts(kw, expand=False))
         keys = [key for kw in kws for key in kw]
         values = itertools.product(*(zip(*kw.values()) for kw in kws))
         values = [[v for val in vals for v in val] for vals in values]
         dict_.update({key: vals for key, vals in zip(keys, zip(*values))})
-    kws_outer = tuple(map(_generate_dicts, kws_outer))
-    kws_inner = _generate_dicts(*kws_inner)  # expand and enforce identical lengths
+    kws_outer = tuple(map(_get_dicts, kws_outer))
+    kws_inner = _get_dicts(*kws_inner)  # expand and enforce identical lengths
     return *kws_outer, *kws_inner, kwargs
+
+
+def divide_specs(name, specs, **kwargs):
+    """
+    Divide feedback and variable specification lists.
+
+    Parameters
+    ----------
+    name : {'rows', 'cols'}
+        Whether to split rows or columns.
+    specs : list of dict
+        The feedback or variable specifications.
+    rowsplit, colsplit : bool or list of int, optional
+        The split instruction. Lists of integers indicate individual rows to select.
+        Sub-lists indicates multiple selections. Can optionally use trailing dictionary.
+    **kwargs : optional
+        Additional keywords passed to plotting function. Any subplot geometry vector
+        arguments e.g. ``hspace``, ``hratios``, ``rowlabels`` will be sub-selected.
+
+    Returns
+    -------
+    specs : list of list of dict
+        The specification iteration groups.
+    """
+    # Initial stuff
+    # NOTE: This is used to take arbitrary cross-sections of more
+    # complex figures with many panels for use in presentations.
+    split = kwargs.pop(f'{name}split', None)
+    nosplit = split is False or split is None
+    side = 'h' if name == 'row' else 'w'
+    geom = 'nrows' if name == 'row' else 'ncols'
+    count = kwargs.get(geom, None)
+    titles = kwargs.get('titles', None)
+    labels = kwargs.get(f'{name}labels', None)
+    space = kwargs.get(f'{side}space', None)
+    ratios = kwargs.get(f'{side}ratios', None)
+    if nosplit:  # split nothing
+        split = ([*range(0, len(specs))],)
+    if split is True:  # split everything
+        split = [*range(0, len(specs))]
+    if not np.iterable(split):
+        split = (split,)
+
+    # Iterate over split indices
+    # NOTE: This comes *after* generating specs with _parse_specs. Simply yield
+    # subselections of resulting dictionary lists and update figure settings.
+    for idxs in split:
+        kwargs = kwargs.copy()
+        if not np.iterable(idxs):
+            idxs = (idxs,)
+        if isinstance(idxs[-1], dict):
+            kwargs = {**kwargs, **idxs[-1]}
+            idxs = idxs[:-1]
+        subs = [specs[idx] for idx in idxs]
+        noskip = np.all(np.diff(idxs) == 1)
+        kwargs[geom] = count if nosplit else None
+        kwargs.setdefault('horizontal', name == 'row')
+        if not nosplit and np.iterable(ratios):
+            kwargs[f'{side}ratios'] = [ratios[idx] for idx in idxs]
+        if not nosplit and np.iterable(space):
+            kwargs[f'{side}space'] = space[idxs[0]:idxs[-1]] or None if noskip else None
+        if not nosplit and np.iterable(labels) and not isinstance(labels, str):
+            if len(labels) == len(specs):  # TODO: re-address (need for tiled plots?)
+                kwargs[f'{name}labels'] = [labels[idx] for idx in idxs]
+        if not nosplit and np.iterable(titles) and not isinstance(titles, str):
+            if len(titles) == len(specs) and name == 'row':  # TODO: re-address
+                kwargs['titles'] = [titles[idx] for idx in idxs]
+        yield subs, kwargs
 
 
 def feedback_specs(
@@ -629,9 +428,9 @@ def feedback_specs(
     Returns
     -------
     specs : list of str
-        The variables.
+        The variable specifications.
     kwargs : dict
-        The keyword args to pass to `create_plots`.
+        The keyword args to pass to `general_plot`.
     """
     # Initial stuff
     # NOTE: User input 'ncols' will *cancel* auto gridspec arrangement and instead
@@ -656,9 +455,10 @@ def feedback_specs(
     components = (components,) if isinstance(components, str) else tuple(components)
 
     # Generate plot layouts
-    # NOTE: This is relevant for general_subplots() style figures when we wrap have
-    # wrapped rows or columns of components but not as useful for e.g. summary_rows()
-    lams = [ALIAS_FEEDBACKS.get(name, name) for name in components]
+    # NOTE: This is relevant for scalar_plot() style figures when we wrap have
+    # wrapped rows or columns of components but not as useful for e.g. pattern_plot()
+    from .feedbacks import ALIAS_VARIABLES as aliases
+    lams = [aliases.get(name, name) for name in components]
     erfs = [name.replace('_lam', '_erf') for name in lams]
     if len(lams) == 1 or len(lams) == 2:  # user input breakdowns
         gridskip = None
@@ -854,7 +654,7 @@ def feedback_specs(
 
     # Remove all-none segments and determine gridskip
     # NOTE: This flattens if there are fewer names than originally requested maxcols
-    # or if maxcols == 1 was passed e.g. for summary_rows() feedbacks along rows.
+    # or if maxcols == 1 was passed e.g. for pattern_plot() feedbacks along rows.
     # TODO: Consider re-implementing automatic application of color cycle for
     # specific variable names as with transport.
     # colors = {'ecs': 'gray', 'erf': 'gray', 'lam': 'gray'}
@@ -897,7 +697,7 @@ def transport_specs(breakdown=None, component=None, transport=None, maxcols=None
     names : list of str
         The transport components.
     kwargs : dict
-        The keyword args to pass to `create_plots`.
+        The keyword args to pass to `general_plot`.
     """
     # TODO: Expand to support mean-stationary-eddy decompositions and whatnot. Perhaps
     # indicate those with dashes and dots and/or with different shades. And/or allow
@@ -939,9 +739,9 @@ def scalar_plot(data, forward=True, **kwargs):
     rowsplit, colsplit : optional
         Passed to `divide_specs`.
     **kwargs
-        Passed to `generate_specs`.
+        Passed to `build_specs`.
     """
-    # NOTE: In constraint_plot() support e.g. name=('ts', None) combined with
+    # NOTE: In regression_plot() support e.g. name=('ts', None) combined with
     # breakdown='cld' or component=('swcld', 'lwcld') because the latter vector
     # is placed in outer specs while the former is placed in subspecs. However here
     # often need to vectorize breakdown inside subspecs (e.g. bar plots with many
@@ -954,7 +754,7 @@ def scalar_plot(data, forward=True, **kwargs):
         colspecs = kwargs.pop('colspecs', None) or [{}]
         figspecs, subspecs1, subspecs2 = [rowspecs, colspecs], {}, {}
     else:
-        *figspecs, subspecs1, subspecs2, kwargs = generate_specs(**kwargs)
+        *figspecs, subspecs1, subspecs2, kwargs = build_specs(**kwargs)
         rowspecs = figspecs[0] if len(figspecs) > 0 else [{}]
         colspecs = figspecs[1] if len(figspecs) > 1 else [{}]
     for rowspecs, kwargs in divide_specs('row', rowspecs, **kwargs):
@@ -977,7 +777,7 @@ def scalar_plot(data, forward=True, **kwargs):
             rspecs.append(ispecs or [rspec])
         for cspecs, kwargs in divide_specs('col', colspecs, **kwargs):
             # ic(rspecs, cspecs)
-            result = generate_plot(data, rspecs, cspecs, **kwargs)
+            result = general_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results
     return result
@@ -1000,7 +800,7 @@ def pattern_plot(data, method=None, shading=True, contours=True, **kwargs):
     rowsplit, colsplit : optional
         Passed to `divide_specs`.
     **kwargs
-        Passed to `generate_specs`.
+        Passed to `build_specs`.
     """
     # NOTE: Pass e.g. method=('avg', 'var') for custom shading and contour assignment
     # NOTE: For simplicity pass scalar 'outer' and other vectors are used in columns
@@ -1015,7 +815,7 @@ def pattern_plot(data, method=None, shading=True, contours=True, **kwargs):
     else:
         raise ValueError(f'Invalid pattern_plot() method {method!r}.')
     kwargs.update(maxcols=1)  # use custom method assignment
-    rowspecs, colspecs, *_, kwargs = generate_specs(**kwargs)
+    rowspecs, colspecs, *_, kwargs = build_specs(**kwargs)
     kw_shading = dict(shading) if isinstance(shading, dict) else {}
     kw_shading.update({key: kwargs.pop(key) for key in KEYS_SHADING if key in kwargs})
     kw_contour = dict(contours) if isinstance(contours, dict) else {}
@@ -1040,13 +840,13 @@ def pattern_plot(data, method=None, shading=True, contours=True, **kwargs):
             cspecs.append(spec)
         for cspecs, kwargs in divide_specs('col', cspecs, **kwargs):
             # ic(rspecs, cspecs)
-            result = generate_plot(data, rspecs, cspecs, **kwargs)
+            result = general_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results
     return result
 
 
-def constraint_plot(data, method=None, contours=True, hatching=True, **kwargs):
+def regression_plot(data, method=None, contours=True, hatching=True, **kwargs):
     """
     Plot two quantifications of constraint relationship per row (e.g. maps).
 
@@ -1065,7 +865,7 @@ def constraint_plot(data, method=None, contours=True, hatching=True, **kwargs):
     base : str, optional
         Similar to `experiment1` but applies over 'outer' arrays.
     **kwargs
-        Passed to `generate_specs`.
+        Passed to `build_specs`.
     """
     # NOTE: This permits passing vector 'method' with 'outer' unlike other templates
     # NOTE: This forbids e.g. tuple of levels to specify separate shading and contours
@@ -1074,14 +874,14 @@ def constraint_plot(data, method=None, contours=True, hatching=True, **kwargs):
         raise ValueError('Feedback breakdown not specified.')
     method = method or 'slope'
     kwargs.update(maxcols=1, method=method)
-    stipple, hatches, levels = _constraint_props(method=method)
-    rowspecs, *colspecs, subspecs1, subspecs2, kwargs = generate_specs(**kwargs)
+    stipple, hatches, levels = _get_props(method=method)
+    rowspecs, *colspecs, subspecs1, subspecs2, kwargs = build_specs(**kwargs)
     if len(subspecs1) != 1 or len(subspecs2) != 1:
         raise ValueError(f'Too many constraints {subspecs1} and {subspecs2}. Check outer argument.')  # noqa: E501
     (subspec1,), (subspec2,) = subspecs1, subspecs2
     if subspec2.get('area'):
         subspec = subspec1
-    elif subspec1.get('name') in KEYS_PLEV and not subspec1.get('plev'):
+    elif subspec1.get('name') in KEYS_VERTICAL and not subspec1.get('plev'):
         subspec = subspec1  # TODO: more complex rules?
     else:
         subspec = subspec2
@@ -1135,13 +935,13 @@ def constraint_plot(data, method=None, contours=True, hatching=True, **kwargs):
             cspecs.append(spec)
         for cspecs, kwargs in divide_specs('col', cspecs, **kwargs):
             # ic(rspecs, cspecs)
-            result = generate_plot(data, rspecs, cspecs, **kwargs)
+            result = general_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results
     return result
 
 
-def connection_plot(data, method=None, **kwargs):
+def regression_parts(data, method=None, **kwargs):
     """
     Plot average of constraint components and their relationship per row (e.g. maps).
 
@@ -1154,17 +954,17 @@ def connection_plot(data, method=None, **kwargs):
     rowsplit, colsplit : optional
         Passed to `divide_specs`.
     **kwargs
-        Passed to `generate_specs`.
+        Passed to `build_specs`.
     """
     # NOTE: This is used for general circulation constraints on feedbacks
-    # TODO: Update this. It is out of date with constraint_plot.
+    # TODO: Update this. It is out of date with regression_plot.
     if 'breakdown' not in kwargs and 'component' not in kwargs and 'outer' not in kwargs:  # noqa: E501
         raise ValueError('Feedback breakdown not specified.')
     kwargs.update(maxcols=1, method=method)
-    rowspecs, colspecs1, colspecs2, kwargs = generate_specs(**kwargs)
+    rowspecs, colspecs1, colspecs2, kwargs = build_specs(**kwargs)
     if len(colspecs1) != 1 or len(colspecs2) != 1:
         raise ValueError(f'Too many constraints {colspecs1} and {colspecs2}. Check outer argument.')  # noqa: E501
-    stipple, hatches, levels = _constraint_props(method=method)
+    stipple, hatches, levels = _get_props(method=method)
     kwargs.update(collabels=[None, None, 'Inter-model\nrelationship'])
     rplots = (
         {'method': 'avg', 'symmetric': True, 'cmap': 'ColdHot'},
@@ -1184,7 +984,7 @@ def connection_plot(data, method=None, **kwargs):
         ]
         for cspecs, kwargs in divide_specs('col', colspecs, **kwargs):
             # ic(rspecs, cspecs)
-            result = generate_plot(data, rspecs, cspecs, **kwargs)
+            result = general_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results
     return result

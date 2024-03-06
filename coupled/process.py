@@ -6,6 +6,7 @@ import itertools
 import math
 import re
 from collections import namedtuple
+from pathlib import Path
 
 import climopy as climo  # noqa: F401
 import numpy as np
@@ -14,6 +15,7 @@ from climopy import var, ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
+from cmip_data.facets import ENSEMBLES_FLAGSHIP
 from cmip_data.feedbacks import FEEDBACK_DEPENDENCIES
 from .reduce import _reduce_datas, reduce_facets, reduce_general
 from .specs import _expand_lists, _expand_parts, _group_parts, _pop_kwargs
@@ -25,24 +27,24 @@ __all__ = ['get_parts', 'get_result', 'process_constraint', 'process_data']
 # TODO: Auto-generate this dictionary or save and commit then parse a text file. For
 # now copied from jupyterlab observed.ipynb cell.
 # NOTE: These show best estimate, standard errors, and degrees of freedom for feedback
-# regression slopes using either GISTEMP4 or HadCRUT5 and using surface temp autocorr
+# regression slopes using either GISTEMP4 or HadCRUT5 and using residual autocorr
 # adjustment (consistent with Dessler et al.). See observed.ipynb notebook.
 FEEDBACK_CONSTRAINTS = {
     # 'cld': (0.69, (1.04 - 0.31) / 2,  # He et al. with 95% uncertainty
-    # 'cld': (0.68, 0.26, 110),  # He et al. trended estimate (total record is 226)
-    'cld': (0.35, 0.35, 111),  # He et al. detrended estimate (total record is 226)
-    'net': (-0.85, 0.37, 177),  # custom estimates (total record is 274)
-    'sw': (0.86, 0.29, 185),
-    'lw': (-1.71, 0.23, 198),
-    'cre': (0.27, 0.33, 129),
-    'swcre': (0.19, 0.34, 140),
-    'lwcre': (0.08, 0.16, 182),
-    'hadnet': (-0.84, 0.39, 177),
-    'hadsw': (0.89, 0.31, 183),
-    'hadlw': (-1.73, 0.25, 191),
-    'hadcre': (0.30, 0.35, 129),
-    'hadswcre': (0.15, 0.36, 140),
-    'hadlwcre': (0.15, 0.17, 182),
+    # 'cld': (0.68, 0.18, 97),  # He et al. trended estimate (total record is 226)
+    'cld': (0.35, 0.25, 108),  # He et al. detrended estimate (total record is 226)
+    'net': (-0.85, 0.29, 166),  # custom estimates (total record is 274)
+    'sw': (0.86, 0.24, 175),
+    'lw': (-1.71, 0.19, 129),
+    'cre': (0.27, 0.23, 131),
+    'swcre': (0.19, 0.24, 140),
+    'lwcre': (0.08, 0.13, 184),
+    'hadnet': (-0.84, 0.31, 166),
+    'hadsw': (0.89, 0.26, 175),
+    'hadlw': (-1.73, 0.21, 129),
+    'hadcre': (0.30, 0.24, 131),
+    'hadswcre': (0.15, 0.26, 140),
+    'hadlwcre': (0.15, 0.14, 184),
 }
 
 # Model-estimated bootstrapped uncertainty (see _calc_bootstrap)
@@ -117,7 +119,203 @@ def equator_pole_diffusivity(self, name):  # noqa: E302
 # vreg.define('ts_diff', 'bulk energy transport surface diffusivity', 'PW / K')
 
 
-def get_parts(dataset, name, scaled=False):  # noqa: E501
+def _get_parts(
+    name=None, parts=None, signs=None, product=None, relative=None, search=None, replace=None, absolute=None, **attrs,  # noqa: E501
+):
+    """
+    Get the options associated with the input name.
+
+    Parameters
+    ----------
+    name : str, optional
+        The name whose components should be inferred.
+    parts : str or sequence of str, optional
+        The components required for the input `name`.
+    signs : float or sequnce of float, optional
+        The scalings to apply when combining the components.
+    product : bool, optional
+        Whether to combine components as a product or sum.
+    relative : bool, optional
+        Whether to subtract a global average from the result.
+    search, replace : str, optional
+        The regular expressions to use to replace components.
+    absolute : bool, optional
+        Whether to build atmospheric feedbacks from absolute components.
+    **attrs
+        The attributes to optionally add to the result.
+
+    Returns
+    -------
+    parts : sequence of str
+        The variable components.
+    options : dict
+        The combination options.
+    """
+    # NOTE: This is ad hoc implementation of cfvariable-like scheme for quickly
+    # retrieving names. In future should implement these as derivations with standard
+    # cfvariable properties and recursively combine / check for availability using
+    # nested lists of derivation functions rather than this restricted approach.
+    from .feedbacks import REGEX_FLUX as regex
+    trans = lambda arg, *subs: [re.sub(arg, sub, name).strip('_') for sub in subs]
+    if name and (flux := regex.search(name)):
+        head, _, wav, net, bnd, sky, *_, param = (*flux.groups(), *name.split('_'))
+    else:
+        head = wav = net = bnd = sky = param = 'NA'
+    if not name:  # user-input only
+        parts = parts or ()
+    elif 'rluscs' in name or 'rsdtcs' in name:
+        parts = (name[:-2],)  # all-sky same as clear-sky
+    elif 'total' in name:
+        parts = trans('total', 'lse', 'dse', 'ocean')
+        search, replace = 'latent', 'total'
+    elif 'mse' in name:
+        parts = trans('mse', 'lse', 'dse')
+        search, replace = 'latent', 'moist'
+    elif 'dse' in name:  # possibly missing dry term e.g. dry stationary
+        parts = trans('dse', 'hse', 'gse')
+        search, replace = 'sensible', 'dry'
+    elif name == 'tdev':  # TODO: define other 'relative' variables?
+        parts, relative = ('tstd',), (True,)
+        attrs.update(units='K', long_name='relative warming')
+    elif name == 'tabs':  # warming pattern for scaled sensitivity
+        parts, product = ('tpat', 'ecs'), (True,)
+        attrs.update(units='K', long_name='effective warming')
+    elif param == 'ts' or param == 'ta':  # eqtemp = temp - (temp - eqtemp) (see below)
+        delta = name.replace('_' + param, '_dt')  # climate minus implied deviation
+        parts, signs = (param, delta), (1, -1)
+        search, replace = 'temperature', 'equilibrium temperature'
+    elif param == 'dt':  # temp - eqtemp anomaly inferred from feedback (see above)
+        value = name.replace('_dt', '').replace(f'{head}_', '')  # flux anomaly
+        slope = name.replace('_dt', '_lam')  # feedback in denominator
+        parts, signs, product = (value, slope), (1, -1), (True,)
+        search, replace = 'flux', 'temperature'
+        attrs.update(units='K', long_name='temperature difference')
+    elif re.search(temp := r'(ecs|erf)(?:([0-9.-]+)x)?', name):
+        parts = trans(temp, r'\1')
+        scale = re.search(temp, name).group(2)
+        signs = (np.log2(float(scale or 4)),)  # default to 4xCO2 scale
+        search = r'\A'  # prepend to existing label
+        replace = rf'{scale}$\\times$CO$_2$ ' if scale else ''
+    elif head == 'atm':  # atmospheric kernels
+        names1 = trans(regex, r'pl\2\3\4\5\6', r'lr\2\3\4\5\6', r'hus\2\3\4\5\6')
+        names2 = trans(regex, r'pl*\2\3\4\5\6', r'lr*\2\3\4\5\6', r'hur\2\3\4\5\6')
+        parts = names1 if absolute else names2
+        search = r'(adjusted\s+)?Planck'
+        replace = 'temperature + humidity'
+    elif head == 'ncl':  # non-cloud kernels
+        parts = trans(regex, r'cl\2\3\4\5\6', r'\2\3\4\5\6')
+        search, replace = 'cloud', 'non-cloud'
+        signs = (-1, 1)
+    elif sky == 'ce':  # raw cloud effect
+        parts = trans(regex, r'\1\2\3\4\5cs', r'\1\2\3\4\5')
+        search, replace = 'clear-sky', 'cloud'
+        signs = (-1, 1)
+    elif bnd == 'a':  # net atmosheric (surface and TOA are positive into atmosphere)
+        parts = trans(regex, r'\1\2\3\4t\6', r'\1\2\3\4s\6')
+        search, replace = 'TOA', 'atmospheric'
+        signs = (1, 1)
+    elif net == 'e':  # effective forcing e.g. 'rlet'
+        parts = trans(regex, r'\1\2\3n\5\6_erf')
+        search, replace = 'effective ', ''  # NOTE: change?
+        signs = (1, 1)
+    elif net == 'r':  # radiative response e.g. 'rlrt'
+        parts = trans(regex, r'\1\2\3n\5\6', r'\1\2\3n\5\6_erf')
+        signs = (1, -1)
+        search, replace = 'flux', 'response'
+    elif wav == 'f':  # WARNING: critical to add wavelengths last
+        opts = FEEDBACK_DEPENDENCIES.get(head, {'longwave': True, 'shortwave': True})
+        wavs = [key[0] for key, val in opts.items() if val or head == '']
+        parts = trans(regex, *(rf'\1\2{wav}\4\5\6' for wav in wavs))
+        search = '(longwave|shortwave) '
+        replace = 'net ' if head == sky == '' else ''
+    elif net == 'n':  # WARNING: only used for CERES data currently
+        idxs = slice(1, None) if wav == 'l' and bnd == 't' else slice(None, None)
+        parts, signs = (r'\1\2\3d\5\6', r'\1\2\3u\5\6'), (1, -1)
+        parts, signs = trans(regex, *parts[idxs]), signs[idxs]
+        search = '(upwelling|downwelling|incoming|outgoing)'
+        replace = 'net'
+    else:  # defer error message
+        parts = parts or (name,)
+    parts = (parts,) if isinstance(parts, str) else tuple(parts)
+    signs = np.atleast_1d(1 if signs is None else signs)
+    signs = tuple(signs) * (1 if len(signs) == len(parts) else len(parts))
+    search = search and re.compile(search)  # re.compile(re.compile(...)) allowed
+    options = dict(signs=signs, product=product, relative=relative)
+    options = dict(**options, attrs=attrs, search=search, replace=replace)
+    return parts, options
+
+
+def _get_result(parts, combine=True, hemisphere=None, **kwargs):
+    """
+    Get the data array associated with the input parts.
+
+    Parameters
+    ----------
+    parts : namedtuple
+        The (possibly nested) components and instructions returned by `_get_parts`.
+    combine : str, optional
+        Whether to combine the arrays or just return the first component.
+    hemisphere : bool or str, optional
+        The hemisphere to optionally select.
+    **kwargs
+        The reduce instructions passed to `reduce_general`.
+
+    Returns
+    -------
+    xarray.DataArray
+        The array used
+    """
+    # TODO: This is similar to climopy recursive derivation invocation. Except delays
+    # summations until selections are performed in reduce_general()... better than
+    # re-calculating full result every time (intensive) or caching full result after
+    # calculation (excessive storage). Should add to climopy (see below).
+    keys_climo = ('quantify', 'standardize')
+    kw_climo = {key: kwargs.pop(key) for key in keys_climo if key in kwargs}
+    datas, name = [], parts.__class__.__name__
+    for part in parts.parts:
+        data = part
+        if isinstance(part, tuple):  # recurse
+            data = _get_result(part, combine=combine, **kwargs)
+        elif not combine:  # skip reduce
+            data = part if isinstance(part, xr.DataArray) else xr.DataArray([], name=name)  # noqa: E501
+        else:  # apply reduce
+            data = reduce_general(data, **kwargs)
+            if hemisphere and 'lat' in data.dims:
+                data = data.climo.sel_hemisphere(hemisphere)
+            if 'plev' in data.coords:
+                data = data.rename(plev='lev')
+            if isinstance(data, xr.Dataset):  # climopy derivation
+                data = data.climo.get(name, **kw_climo)
+            if 'lev' in data.coords:
+                data = data.rename(lev='plev')
+        datas.append(data)
+    if combine:
+        datas, signs = datas, parts.signs
+    else:
+        datas, signs = datas[:1], parts.signs[:1]
+    if not combine or not parts.relative:
+        bases = (1 if parts.product else 0,) * len(signs)
+    else:
+        bases = [data.climo.average('area') for data in datas]
+    iter_ = zip(datas, signs, bases, strict=True)
+    with xr.set_options(keep_attrs=True):
+        if not combine or len(datas) == 1 and signs[0] == 1 and not parts.relative:
+            data = datas[0]
+        elif parts.product:  # get products or ratios
+            data = math.prod(data ** sign / base for data, sign, base in iter_)
+        else:  # get sums or differences
+            data = sum(sign * data - base for data, sign, base in iter_)
+    data = data.copy(deep=False)  # update attributes on derived variable
+    data.name = name
+    data.attrs.update(parts.attrs)
+    for key in ('long_name', 'short_name', 'standard_name'):
+        value = data.attrs.get(key, None)
+        if parts.search and isinstance(value, str):
+            data.attrs[key] = parts.search.sub(parts.replace, value)
+    return data
+
+
+def get_parts(dataset, name, scaled=False, **kwargs):
     """
     Return the components needed to build the requested variable.
 
@@ -128,140 +326,50 @@ def get_parts(dataset, name, scaled=False):  # noqa: E501
     name : str
         The requested variable.
     scaled : bool, optional
-        Whether ecs/erf data has been scaled.
+        Whether CO$_2$ scaling has been applied.
+    **kwargs
+        Additional settings passed to `_get_parts`.
 
     Returns
     -------
     parts : namedtuple
         Tuple named `name` containing the components required by `get_result`.
     """
-    # NOTE: This is ad hoc implementation of cfvariable-like scheme for quickly
-    # retrieving names. In future should implement these as derivations with standard
-    # cfvariable properties and recursively combine / check for availability using
-    # nested lists of derivation functions rather than this restricted approach.
     # NOTE: Previously had quadruple=True default option to load all feedbacks as
     # quadrupled versions, but meant same variable name could have different meaning
     # depending on input arguments. Now implement scaling as a derivation below and
     # add explicit indicator if '2x' or '4x' is specified. Preserve default of always
     # *displaying* the unscaled experiment results by translating 'erf' or 'ecs' below.
-    def _get_names(regex, *patterns):
-        if isinstance(regex, str):
-            regex = re.compile(regex)
-        names = [regex.sub(pattern, name) for pattern in patterns]
-        names = [name.strip('_') for name in names]
-        return names
     from .feedbacks import ALIAS_VARIABLES as aliases
-    from .feedbacks import REGEX_FLUX as regex
     name = aliases.get(name, name)
-    names, signs = (name,), None
-    search = replace = rescale = product = relative = None
     scaled = scaled or 'ecs' not in name and 'erf' not in name
-    attrs = {}  # attribute overrides
-    keys = ('short_name', 'long_name', 'standard_units')
-    head = wav = net = bnd = sky = param = 'NA'
-    if flux := regex.search(name):
-        head, _, wav, net, bnd, sky = flux.groups()
-        *_, param = name.split('_')
-    if scaled and name in dataset:
-        pass
-    elif 'rluscs' in name or 'rsdtcs' in name:
-        names = (name[:-2],)  # all-sky same as clear-sky
-    elif name in dataset.climo and name not in dataset:
-        attrs.update({attr: getattr(vreg[name], attr) for attr in keys})
-    elif 'total' in name:
-        names = _get_names('total', 'lse', 'dse', 'ocean')
-        search, replace = 'latent', 'total'
-    elif 'mse' in name:
-        names = _get_names('mse', 'lse', 'dse')
-        search, replace = 'latent', 'moist'
-    elif 'dse' in name:  # possibly missing dry term e.g. dry stationary
-        names = _get_names('dse', 'hse', 'gse')
-        search, replace = 'sensible', 'dry'
-    elif name == 'tdev':  # TODO: define other 'relative' variables?
-        names, relative = ('tstd',), (True,)
-        attrs.update(units='K', long_name='relative warming')
-    elif name == 'tabs':  # warming pattern for scaled sensitivity
-        rescale = True  # re-apply scaling
-        names, product = ('tpat', 'ecs'), (True,)
-        attrs.update(units='K', long_name='effective warming')
-    elif param == 'ts' or param == 'ta':  # eqtemp = temp - (temp - eqtemp) (see below)
-        delta = name.replace('_' + param, '_dt')  # climate minus implied deviation
-        names, signs = (param, delta), (1, -1)
-        search, replace = 'temperature', 'equilibrium temperature'
-    elif param == 'dt':  # temp - eqtemp anomaly inferred from feedback (see above)
-        denom = name.replace('_dt', '_lam')  # feedback in denominator
-        numer = name.replace('_dt', '').replace(f'{head}_', '')
-        names, signs, product = (numer, denom), (1, -1), (True,)
-        search, replace = 'flux', 'temperature'
-        attrs.update(units='K', long_name='temperature difference')
-    elif not scaled and re.search(temp := r'(ecs|erf)(?:([0-9.-]+)x)?', name):
-        names = _get_names(temp, r'\1')
-        scale = re.search(temp, name).group(2)
-        signs = (np.log2(float(scale or 4)),)  # default to 4xCO2 scale
-        search = r'\A'  # prepend to existing label
-        replace = rf'{scale}$\\times$CO$_2$ ' if scale else ''
-    elif head == 'atm':  # atmospheric kernels
-        names1 = _get_names(regex, r'pl\2\3\4\5\6', r'lr\2\3\4\5\6', r'hus\2\3\4\5\6')
-        names2 = _get_names(regex, r'pl*\2\3\4\5\6', r'lr*\2\3\4\5\6', r'hur\2\3\4\5\6')
-        names = names1 if names1[0] in dataset else names2
-        search = r'(adjusted\s+)?Planck'
-        replace = 'temperature + humidity'
-    elif head == 'ncl':  # non-cloud kernels
-        names = _get_names(regex, r'cl\2\3\4\5\6', r'\2\3\4\5\6')
-        search, replace = 'cloud', 'non-cloud'
-        signs = (-1, 1)
-    elif sky == 'ce':  # raw cloud effect
-        names = _get_names(regex, r'\1\2\3\4\5cs', r'\1\2\3\4\5')
-        search, replace = 'clear-sky', 'cloud'
-        signs = (-1, 1)
-    elif bnd == 'a':  # net atmosheric (surface and TOA are positive into atmosphere)
-        names = _get_names(regex, r'\1\2\3\4t\6', r'\1\2\3\4s\6')
-        search, replace = 'TOA', 'atmospheric'
-        signs = (1, 1)
-    elif net == 'e':  # effective forcing e.g. 'rlet'
-        names = _get_names(regex, r'\1\2\3n\5\6_erf')
-        search, replace = 'effective ', ''  # NOTE: change?
-        signs = (1, 1)
-    elif net == 'r':  # radiative response e.g. 'rlrt'
-        names = _get_names(regex, r'\1\2\3n\5\6', r'\1\2\3n\5\6_erf')
-        signs = (1, -1)
-        search, replace = 'flux', 'response'
-    elif wav == 'f':  # WARNING: critical to add wavelengths last
-        opts = FEEDBACK_DEPENDENCIES.get(head, {'longwave': True, 'shortwave': True})
-        wavs = [key[0] for key, val in opts.items() if val or head == '']
-        names = _get_names(regex, *(rf'\1\2{wav}\4\5\6' for wav in wavs))
-        search = '(longwave|shortwave) '
-        replace = 'net ' if head == sky == '' else ''
-    elif net == 'n':  # WARNING: only used for CERES data currently
-        if wav == 'l' and bnd == 't':
-            signs, names = (-1,), (r'\1\2\3u\5\6',)
-        else:  # upwelling downwelling components
-            signs, names = (1, -1), (r'\1\2\3d\5\6', r'\1\2\3u\5\6')
-        names = _get_names(regex, *names)
-        search = '(upwelling|downwelling|incoming|outgoing)'
-        replace = 'net'
-    else:
-        opts = ', '.join(s for s in dataset.data_vars if regex.search(s))
-        raise KeyError(f'Required variable {name} not found. Options are: {opts}.')
-    parts = []
-    for iname in names:
-        if iname in dataset or iname not in dataset.climo:
-            if scaled and iname in dataset:
-                part = dataset[iname]
-            else:  # instruction tuple
-                part = get_parts(dataset, iname, scaled=not rescale)
-        else:
-            if deps := VARIABLE_DEPENDENCIES.get(iname, ()):
-                part = dataset.drop_vars(dataset.data_vars.keys() - set(deps))
-            else:
-                raise KeyError(f'Climopy derivation {iname} has unknown dependencies.')
-        parts.append(part)
-    keys = ('parts', 'names', 'signs', 'product', 'relative', 'attrs', 'search', 'replace')  # noqa: E501
-    signs = signs or (1,) * len(names)
-    search = search and re.compile(search)  # note re.compile(re.compile(...)) allowed
-    values = (parts, names, signs, product, relative, attrs, search, replace)
-    parts = namedtuple('parts', keys)(*values)
-    parts.__class__.__name__ = name  # permit non-idenfitier
+    absolute = not any(name[:3] == 'pl*' for name in dataset)
+    if scaled and name in dataset or name in dataset.climo:
+        parts, options = _get_parts(parts=[name], **kwargs)  # manual parts
+    else:  # automatic parts
+        parts, options = _get_parts(name, absolute=absolute, **kwargs)
+    if name not in dataset and name in dataset.climo:
+        attrs = ('short_name', 'long_name', 'standard_units')
+        attrs = {attr: getattr(vreg[name], attr) for attr in attrs}
+        options['attrs'].update(attrs)
+    from .feedbacks import REGEX_FLUX as regex
+    fluxes = ', '.join(s for s in dataset.data_vars if regex.search(s))
+    results = []
+    for part in parts:
+        deps = VARIABLE_DEPENDENCIES.get(name, ())
+        scaled = name != 'tabs'  # whether input is scaled
+        if scaled and part in dataset:
+            part = dataset[part]
+        elif part in dataset.climo:
+            part = dataset.drop_vars(dataset.data_vars.keys() - set(deps))
+        elif not scaled or part != name:  # valid derivation
+            part = get_parts(dataset, part, scaled=scaled)
+        else:  # print available
+            raise KeyError(f'Required variable {name} not found. Options are: {fluxes}.')  # noqa: E501
+        results.append(part)
+    parts = namedtuple('parts', ('parts', *options))
+    parts.__name__ = name  # permit non-idenfitier
+    parts = parts(results, *options.values())
     return parts
 
 
@@ -291,62 +399,11 @@ def get_result(
     result : xarray.DataArray or str
         The result. If `attr` is not ``None`` this is the corresponding attribute.
     """
-    # TODO: This is similar to climopy recursive derivation invocation. Except delays
-    # summations until selections are performed in reduce_general()... better than
-    # re-calculating full result every time (intensive) or caching full result after
-    # calculation (excessive storage). Should add to climopy by 1) translating
-    # instructions, 2) selecting relevant variables, 3) performing scalar selections
-    # first (e.g. points, maxima), 4) combining variables (e.g. products, sums), then
-    # 5) more complex coordinate operations (e.g. averages, integrals). And optionally
-    # order operations around non-linear variable or coordinate operations.
-    def _get_array(parts, attr=None, hemi=None, **kwargs):
-        keys_climo = ('quantify', 'standardize')
-        kw_climo = {key: kwargs.pop(key) for key in keys_climo if key in kwargs}
-        datas, name = [], parts.__class__.__name__
-        for part in parts.parts:
-            data = part
-            if isinstance(part, tuple):  # recurse
-                data = _get_array(part, attr=attr, **kwargs)
-            elif attr is not None:  # skip reduce
-                if isinstance(part, xr.DataArray):  # data variable
-                    data = part
-                else:  # climopy derivation
-                    data = xr.DataArray([], name=name)
-            else:  # apply reduce
-                data = reduce_general(data, **kwargs)
-                if hemi and 'lat' in data.dims:
-                    data = data.climo.sel_hemisphere(hemi)
-                if 'plev' in data.coords:
-                    data = data.rename(plev='lev')
-                if isinstance(data, xr.Dataset):  # climopy derivation
-                    data = data.climo.get(name, **kw_climo)
-                if 'lev' in data.coords:
-                    data = data.rename(lev='plev')
-            datas.append(data)
-        if attr is None:
-            datas, names, signs = datas, parts.names, parts.signs
-        else:
-            datas, names, signs = datas[:1], parts.names[:1], parts.signs[:1]
-        if not parts.relative or attr is not None:
-            bases = (1 if parts.product else 0,) * len(names)
-        else:
-            bases = [data.climo.average('area') for data in datas]
-        iter_ = zip(datas, signs, bases, strict=True)
-        with xr.set_options(keep_attrs=True):
-            if attr is not None or len(datas) == 1 and signs[0] == 1 and not parts.relative:  # noqa: E501
-                data = datas[0]
-            elif parts.product:  # get products or ratios
-                data = math.prod(data ** sign / base for data, sign, base in iter_)
-            else:  # get sums or differences
-                data = sum(sign * data - base for data, sign, base in iter_)
-        data = data.copy(deep=False)  # update attributes on derived variable
-        data.name = name
-        data.attrs.update(parts.attrs)
-        for key in ('long_name', 'short_name', 'standard_name'):
-            value = data.attrs.get(key, None)
-            if parts.search and isinstance(value, str):
-                data.attrs[key] = parts.search.sub(parts.replace, value)
-        return data
+    # NOTE: This returns both data arrays and attributes. Should add to climopy by
+    # 1) translating instructions, 2) selecting relevant variables, 3) performing scalar
+    # selections first (e.g. points, maxima), 4) combining variables (e.g. products,
+    # sums), then 5) more complex coordinate operations (e.g. averages, integrals). And
+    # optionally order operations around non-linear variable or coordinate operations.
     if not args or len(args) > 3:
         raise TypeError(f'Expected 1 to 3 positional arguments but got {len(args)}.')  # noqa: E501
     if len(args) == 1 and not isinstance(args[0], tuple):
@@ -358,7 +415,7 @@ def get_result(
     args, attrs = args[:nargs], args[nargs:]
     parts = args[0] if nargs == 1 else get_parts(*args)
     attr = attr or attrs and attrs[0] or None
-    data = _get_array(parts, attr=attr, **kwargs)
+    data = _get_result(parts, combine=attr is None, **kwargs)
     if spatial is not None:  # only apply custom spatial correlation
         val0, val1 = kwargs.get('start', 0), kwargs.get('stop', 150)
         kw0 = {'start': 0, 'stop': 150} if 'version' in data.coords else {}
@@ -380,7 +437,7 @@ def get_result(
 
 
 def process_constraint(
-    data0, data1, constraint=None, observed=None, internal=False, graphical=False, pctile=None, N=None,  # noqa: E501
+    data0, data1, constraint=None, observed=None, internal=False, graphical=False, pctile=None, N=None, **kwargs,  # noqa: E501
 ):
     """
     Return percentile bounds for observational constraint.
@@ -405,8 +462,10 @@ def process_constraint(
         standard error calculated from residuals of regression relationship.
     pctile : float, default: 95
         The emergent constraint percentile bounds to be returned.
-    N : int, default: 100000
+    N : int, default: 1000000
         The number of bootstrapped samples to carry out.
+    **kwargs
+        Passed to `_get_regression`.
 
     Returns
     -------
@@ -426,15 +485,15 @@ def process_constraint(
     # their sample sizes are larger (150 years) and uncertainties are uncorrelated so
     # should roughly cancel out across e.g. 30 members of ensemble.
     from .feedbacks import VARIABLE_ALIASES
+    from .reduce import _get_regression
     constraint = 'cld' if constraint is None or constraint is True else constraint
     observed = observed or 20
     internal = observed if internal is None or internal is True else internal
-    pctile = 95 if pctile is None or pctile is True else pctile
+    kwargs['pctile'] = pctile = 95 if pctile is None or pctile is True else pctile
     pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
-    kwargs = dict(pctile=pctile, correct=False)  # no correlation across ensembles
     name = constraint if isinstance(constraint, str) else None
     name = VARIABLE_ALIASES.get(name, name)
-    N = N or 10000  # samples to draw
+    N = N or 1000000  # samples to draw
     if name is not None:
         constraint = FEEDBACK_CONSTRAINTS[name]
     if not np.iterable(constraint) or len(constraint) != 3:
@@ -452,12 +511,15 @@ def process_constraint(
         xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
         es = stats.norm(loc=0, scale=internal).rvs(N)  # implied variability error
         observations = np.insert(np.percentile(xs + es, pctile), 1, observations)
-    data0 = np.array(data0).squeeze()
-    data1 = np.array(data1).squeeze()
-    idxs = np.argsort(data0, axis=0)
-    data0, data1 = data0[idxs], data1[idxs]  # required for graphical error
-    mean0, mean1 = data0.mean(), data1.mean()
-    bmean, berror, _, fit, fit_lower, fit_upper = var.linefit(data0, data1, **kwargs)
+    idxs = data0.argsort().values  # critical so 'fit' has same coordinates
+    data0 = data0.isel({data0.dims[0]: idxs})
+    data1 = data1.isel({data0.dims[0]: idxs})
+    mean0 = data0.values.mean()
+    mean1 = data1.values.mean()
+    result = _get_regression(data0, data1, **kwargs)
+    bmean, _, _, fit, fit_lower, fit_upper, rscale, rsquare, rdof = result
+    bmean, rdof, fit = bmean.values, rdof.values, fit.values
+    fit_lower, fit_upper = fit_lower.values, fit_upper.values
     if graphical:  # intersection of shaded regions
         fit_lower = fit_lower.squeeze()
         fit_upper = fit_upper.squeeze()
@@ -474,8 +536,7 @@ def process_constraint(
         # as_ = stats.t(loc=amean, scale=aerror, df=data0.size - 2).rvs(N)
         # ys = err + as_ + bs_ * xs  # include both uncertainties
         # ys = mean1 + bs_ * (xs - mean0)  # include slope uncertainty only
-        rscale = np.std(data1 - fit, ddof=1)  # model residual sigma
-        rdof = data0.size - 2  # inter-model regression dof
+        # rscale = np.std(data1 - fit, ddof=1)  # model residual sigma
         xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)  # observations
         rs = stats.t(df=rdof, loc=0, scale=rscale).rvs(N)  # regression
         ys = rs + mean1 + bmean * (xs - mean0)

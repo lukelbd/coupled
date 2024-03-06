@@ -2,35 +2,6 @@
 """
 Helper functions for parsing plot specifications.
 """
-# TODO: Should create climate feedback files before refactoring 'facets' and 'version'
-# coordinates since that is primary benefit, otherwise datasets are mostly empty when
-# combining climate and feedback data on 'parameters'. First move coupled/climate.py
-# functions to cmip_data/climate.py and save time series of core linearly-additive
-# components (e.g. dse and lse instead of mse). Then generate circulation 'feedback'
-# files by regressing against temperature for different time periods. Finally add
-# derivations to get_result as with flux variables (e.g. mse = dse + lse).
-# TODO: Should have 'facets' coordinate with project / institute / model / ensemble
-# and 'parameters' coordinate with source / experiment / period / style / region.
-# For circulation data, will have 'ratio' style for year 120-150 abrupt 4xCO2 changes
-# normalized by temperature while 'monthly' and 'annual' are pre-industrial or abrupt
-# 4xCO2 regressions against temperature (as with feedback calculations). Will rename
-# 'source' on both to e.g. simply 'internal' or 'external' since 'eraint' source is not
-# meaningful for climate data (or can add as distinct feedback-only coordinate) while
-# 'period' and 'region' indicate integration or averaging periods and temperature
-# normalization settings. All changes normalized by temperature will have 'lam' suffix
-# while 'erf' suffix indicates rapid adjustments and unperturbed climatology will be
-# stored without suffix or 'parameters' coordinate.
-# TODO: Auto-construct 'ratio' style changes normalized by global temperature and use
-# get_result() to build e.g. unnormalized 4xCO2 changes over years 120-150 using 'del'
-# suffix, or absolute years 120-150 average using 'abs' suffix (equivalent to 'del'
-# plus climatology). Would skip radiative flux data, since these are saved as special
-# case with 'forcing' subtracted from the numerator (when subequently constructing
-# budgets or breakdowns from radiative flux would simply get net change from 'del' plus
-# 'erf', and note 'erf' will be present under 'ratio' style even though feedbacks.py
-# simply sets this to the 'erf' from one of the regression estimates). The data for
-# unnormalizing would be stored under 'ratio' style 'tstd' variable, since ratio-
-# equivalent of scaling 'tpat' by global temperature standard deviation is to scale
-# the ratio of local-to-global surface temperature change by the global change again.
 import collections
 import inspect
 import itertools
@@ -59,33 +30,6 @@ REGEX_SPLIT = re.compile(  # ignore signs and use '.' instead of '*' for product
     r'(?<=[^+./-])([+./-])(?=[^+./-])'
 )
 
-# MultiIndex coordinate settings and renames
-# NOTE: Previously renamed piControl and abrupt-4xCO2 to 'control' and 'response'
-# but this was confusing as 'response' sounds like a perturbation (also considered
-# 'unperturbed' and 'perturbed'). Now simply use 'picontrol' and 'abrupt4xco2'.
-FACETS_NAME = 'facets settings'
-VERSION_NAME = 'feedback settings'
-FACETS_LEVELS = (
-    'project',
-    'institute',  # auto-constructed institute index
-    'model',
-    'experiment',
-    'ensemble',
-)
-VERSION_LEVELS = (
-    'source',
-    'style',
-    'start',  # initial year of regression or 'forced' climate average
-    'stop',  # final year of regression or 'forced' climate average
-    'region',
-)
-FACETS_RENAME = {
-    'piControl': 'picontrol',
-    'control-1950': 'control1950',
-    'abrupt4xCO2': 'abrupt4xco2',
-    'abrupt-4xCO2': 'abrupt4xco2',
-}
-
 # Reduce labels to exclude from paths and models to exclude from dataset
 # NOTE: Went through trouble of processing these models but cannot compute cloud
 # feedbacks... would be confusing to include them in net feedback analyses but
@@ -101,11 +45,6 @@ PATHS_EXCLUDE = {
     # 'start': 0,  # always include in path name
     # 'stop': 150,  # always include in path name
 }
-MODELS_EXCLUDE = (
-    'MCM-UA-1-0',
-    'FIO-ESM-2-0',
-    'IPSL-CM6A-LR-INCA',
-)
 
 # Argument sorting constants
 # NOTE: Use logical top-down order for file naming and reduction instruction order
@@ -1002,18 +941,21 @@ def parse_spec(dataset, spec, **kwargs):
         name, kw = spec
     kw = {**kwargs, **kw}  # prefer spec arguments
     name = name or kw.pop('name', None)  # see below
+    institute = kw.get('institute', None)
+    kw.update({'weight': True, 'institute': None} if institute == 'wgt' else {})
     signatures = tuple(pplt.Axes._format_signatures.values())
     kw_process = _pop_kwargs(kw, dataset, get_result, reduce_facets)
     kw_attrs = _pop_kwargs(kw, 'short_name', 'long_name', 'standard_name', 'units')
     kw_grid = _pop_kwargs(kw, pplt.GridSpec._update_params)  # overlaps kw_figure
     kw_figure = _pop_kwargs(kw, *keys_tight, *keys_figure, pplt.Figure._format_signature)  # noqa: E501
     kw_axes = _pop_kwargs(kw, *signatures, pplt.Figure._parse_proj)
+    kw_config = _pop_kwargs(kw, tuple(_rc_nodots))
     kw_other = _pop_kwargs(kw, _merge_dists, _init_command, _props_command, _setup_bars, _setup_scatter)  # noqa: E501
     kw_command = _pop_kwargs(kw, 'c', 'lw', 'color', 'linewidth', 'extend')
     kw_guide = _pop_kwargs(kw, pplt.Axes._add_legend, pplt.Axes._add_colorbar)
     kw_legend = {**kw_guide, **_pop_kwargs(kw, 'legend', pplt.Axes._add_legend)}
     kw_colorbar = {**kw_guide, **_pop_kwargs(kw, 'colorbar', pplt.Axes._add_colorbar)}
-    kw_config = _pop_kwargs(kw, tuple(_rc_nodots))
+    kw_axes.update(kw_config)  # configuration settings
     kw_figure.update(kw_config)  # configuration settings
     kw_command.update(kw)  # unknown kwargs passed to command
     if name is not None:

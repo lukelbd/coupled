@@ -8,10 +8,10 @@ import xarray as xr
 from icecream import ic  # noqa: F401
 from climopy import const, ureg, vreg  # noqa: F401
 
-from .specs import _pop_kwargs, FACETS_LEVELS, FACETS_RENAME, MODELS_EXCLUDE
 from cmip_data.facets import Database, glob_files, _item_dates
 from cmip_data.utils import assign_dates, load_file
 from cmip_data.climate import _add_energetics, _add_hydrology, _add_transport  # noqa: E501
+from .specs import _pop_kwargs
 
 
 __all__ = ['climate_datasets']
@@ -141,7 +141,7 @@ def climate_datasets(
     # along with ratio-style climate responses. See notes under VERSION_LEVELS.
     # NOTE: Non-flagship simulations can be added with flagship_translate=True
     # as with other processing functions. Ensembles are added in a MultiIndex
-    from .datasets import _standardize_order
+    from .datasets import FACETS_EXCLUDE, FACETS_LEVELS, FACETS_RENAME
     kw_energetics = _pop_kwargs(constraints, _add_energetics)
     kw_transport = _pop_kwargs(constraints, _add_transport)
     kw_hydrology = _pop_kwargs(constraints, _add_hydrology)
@@ -169,7 +169,7 @@ def climate_datasets(
         # base years (e.g. due to control data availability or response calendar diffs).
         for sub, replace in FACETS_RENAME.items():
             facets = tuple(facet.replace(sub, replace) for facet in facets)
-        if not data or facets[2] in MODELS_EXCLUDE:
+        if not data or facets[2] in FACETS_EXCLUDE:
             continue
         range_ = (120, 150) if facets[3] == 'abrupt4xco2' else (0, 150)
         range_ = years if years is not None else range_
@@ -200,6 +200,7 @@ def climate_datasets(
         # NOTE: Empirical testing revealed limiting integration to troposphere
         # often prevented strong transient heat transport showing up in overturning
         # cells due to aliasing of overemphasized stratospheric geopotential transport.
+        from .datasets import _standardize_order
         if 'ps' not in dataset and 'plev' in dataset.coords:
             print('Warning: Surface pressure is unavailable.', end=' ')
         dataset = dataset.climo.add_cell_measures(surface=('ps' in dataset))

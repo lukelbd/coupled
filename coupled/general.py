@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from icecream import ic  # noqa: F401
+from scipy import stats
 
 import proplot as pplt
 import matplotlib.legend_handler as mhandler
@@ -21,7 +22,7 @@ import matplotlib.lines as mlines
 import seaborn as sns
 from climopy import ureg, vreg  # noqa: F401
 from .process import process_constraint, process_data
-from .reduce import _components_corr, _components_slope, _parse_institute, _parse_project  # noqa: E501
+from .reduce import _get_regression, _get_weights, _parse_institute, _parse_project
 from .specs import _pop_kwargs, _split_label, get_heading, get_label, get_labels, parse_specs  # noqa: E501
 
 __all__ = ['general_plot']
@@ -983,13 +984,15 @@ def _merge_dists(
         refheight = 2.0  # default thickness (compare with above)
         args, boxdata, bardata, annotations = [], [], [], []
         units = [data.climo.units for *_, data in arguments]
+        weight = kw_collection.other.get('weight', False)
         kw_collection.command['width'] = 1.0  # ignore staggered bars
         kw_collection.command['absolute_width'] = True
         for iargs, iunits in zip(arguments, units):  # merge into slope estimators
-            cmd = _components_corr if correlation else _components_slope
+            dim = iargs[0].dims[0]  # currently always 'facets'
             keys = sorted(set(key for arg in iargs for key in arg.coords))
-            result = cmd(*iargs, dim=iargs[0].dims[0], pctile=(50, 95))
-            data, data_lower, data_upper, rsquare, *_ = result
+            kw_regress = dict(dim=dim, weight=weight, pctile=(50, 95), nofit=True)
+            result = _get_regression(*iargs, **kw_regress)
+            data, data_lower, data_upper, *_, rsq, _ = result
             if correlation:
                 data.attrs['units'] = ''
                 data.attrs['short_name'] = 'correlation coefficient'
@@ -1018,12 +1021,9 @@ def _merge_dists(
             data.name = '|'.join((arg.name for arg in iargs))
             data_lower1, data_lower2 = data_lower.values.flat
             data_upper1, data_upper2 = data_upper.values.flat
-            rsquare = ureg.Quantity(rsquare.item(), '').to('percent')
-            annotation = f'${rsquare:~L.0f}$'.replace(r'\ ', '')
-            # annotation = f'${rsquare:~L.0f}$'.replace('%', r'\%').replace(r'\ ', '')
-            # rvalue = np.sign(data.item()) * rsquare.item() ** 0.5
-            # annotation = f'${rvalue:.2f}$'  # latex for long dash minus sign
-            # annotation = '' if correlation else annotation
+            rsq = ureg.Quantity(rsq.item(), '').to('percent')
+            annotation = f'${rsq:~L.0f}$'.replace('%', r'\%').replace(r'\ ', '')
+            # annotation = f'${corr.item():.2f}$'  # latex for long dash minus sign
             args.append(data)
             boxdata.append([data_lower1, data_upper1])
             bardata.append([data_lower2, data_upper2])
@@ -1454,7 +1454,8 @@ def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=
 
 def _setup_scatter(
     ax, data0, data1, handle=None, zeros=False, oneone=False, linefit=False, annotate=False,  # noqa: E501
-    constraint=None, observed=None, internal=None, original=None, alternative=False, graphical=None, pctile=None,  # noqa: E501
+    constraint=None, original=None, distribution=False, alternative=False,
+    weight=False, pctile=None, observed=None, internal=None, graphical=None,
 ):
     """
     Adjust and optionally add content to scatter plots.
@@ -1480,18 +1481,22 @@ def _setup_scatter(
         Whether to add annotations to the scatter markers.
     constraint : bool or float, optional
         Whether to plot emergent constraint results.
+    original : str or bool, optional
+        Whether to include original unconstrained inter-model uncertainty bounds.
+    distribution : bool, optional
+        Whether to compute unconstrained bounds from the native distribution.
+    alternative : bool, optional
+        Whether to include alternative estimate that omits regression uncertainty.
+    weight : bool, optional
+        Whether to weight regressions by institute model count.
+    pctile : float, optional
+        Percentile range used for line fit and constraint bounds.
     observed : int, default: 20
         Passed to `process_constraint`. Number of years for regression uncertainty.
     internal : bool or int, optional
         Passed to `process_constraint`. If ``False`` then only regression spread used.
-    original : str or bool, optional
-        Whether to include original unconstrained inter-model uncertainty bounds.
-    alternative : bool, optional
-        Whether to include alternative estimate that omits regression uncertainty.
     graphical : bool, optional
         Passed to `process_constraint`. Whether to use graphical intersections.
-    pctile : float, optional
-        Percentile range used for line fit and constraint bounds.
     """
     # Add reference one:one line
     # NOTE: This also disables autoscaling so that line always looks like a diagonal
@@ -1540,42 +1545,63 @@ def _setup_scatter(
     # color = 'red' if constraint is None else color  # line fit color
     if linefit or constraint is not None:
         pctile = pctile or 95  # default percentile range
-        ax.use_sticky_edges = False  # show end of line fit shading
-        slope, _, _, rsquare, fit, fit_lower, fit_upper = _components_slope(
-            data0, data1, dim=data0.dims[0], correct=False, pctile=pctile,
-        )
-        value = ureg.Quantity(rsquare.item(), '').to('percent')
+        result = _get_regression(data0, data1, pctile=pctile, weight=weight)
+        slope, _, _, fit, fit_lower, fit_upper, rss, rsq, _ = result
+        value = ureg.Quantity(rsq.item(), '').to('percent')
         label = rf'$r^2={value:~L.0f}$'
         label = re.sub(r'(?<!\\)%', r'\%', label)
         label = label.replace(r'\ ', '')
         datax = np.sort(data0, axis=0)  # linefit returns result for sorted data
         color = 'gray8' if constraint is None or not handle else handle[0].get_color()
+        ax.use_sticky_edges = False  # show end of line fit shading
         ax.plot(datax, fit, ls='-', lw=1.5 * pplt.rc.metawidth, c=color)
         ax.area(datax, fit_lower.squeeze(), fit_upper.squeeze(), lw=0, a=0.3, c=color)
         ax.format(lrtitle=label, lrtitle_kw={'size': 'med'})
 
     # Add constraint indicator
+    # NOTE: Previously got cmip5/cmip6 bounds from t-distributions of their standard
+    # deviations but this was needlessly unfavorable. Now use weighted percentile by
+    # sorting and arranging along a 'CDF': https://stackoverflow.com/a/29677616/4970632
     # NOTE: Here get constrained/unconstrained standard deviation ratio using ratio of
     # percentile intervals. Should be similar since Monte Carlo sampling used to arrive
     # at constraint estimate comprises t-distributions with same degrees of freedom.
-    # NOTE: If bounds is False then this shows single shaded x-region and two y-regions
-    # both with and without regression uncertainty. If bounds is not False then this
-    # shows two x-regions and y-regions with and without observational feedback
-    # uncertainty implied from ensemble-mean bootstrapped pre-industrial results.
-    # param = r'1\,-\;\dfrac{CI_{\mathrm{constrained}}}{CI_{\mathrm{unconstrained}}}'  # noqa: E501
-    # ratio = 1 - (ymaxs2[-1] - ymins2[0]) / (yorigs[1] - yorigs[0])
-    # param = r'CI_{\mathrm{constrained}}\,/\,CI_{\mathrm{unconstrained}}'
-    # label = rf'${param}\,=\,{ratio:.2f}$'
+    # xorigs = np.percentile(data0.values, 100 * xbnds, method='linear')
+    # yorigs = np.percentile(data1.values, 100 * ybnds, method='linear')
     if constraint is not None:
+        # Process input data
+        pctile = pctile or 95  # default percentile range
+        bnds = 0.01 * np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
         original = 'xy' if original is True else '' if original is False else original
         original = ''.join('y' if original is None else original)
-        pctile = pctile or 95  # default percentile range
-        bounds = (50 - 0.5 * pctile, 50 + 0.5 * pctile)
-        xorigs = np.percentile(data0, bounds) if 'x' in original else ()
-        yorigs = np.percentile(data1, bounds) if 'y' in original else ()
+        xbnds = bnds if 'x' in original else ()
+        ybnds = bnds if 'y' in original else ()
+        if weight:
+            wgts = _get_weights(data0, dim='facets')
+        else:
+            wgts = xr.ones_like(data0.facets, dtype=float)
+        if not distribution:
+            dof = wgts.sum() - 1  # standard deviation uncertainty
+            mean0 = (data0 * wgts).sum() / wgts.sum()
+            mean1 = (data1 * wgts).sum() / wgts.sum()
+            scale0 = np.sqrt((wgts * (data0 - mean0) ** 2 / dof).sum())
+            scale1 = np.sqrt((wgts * (data1 - mean1) ** 2 / dof).sum())
+            xorigs = stats.t(df=dof, loc=mean0, scale=scale0).ppf(xbnds)
+            yorigs = stats.t(df=dof, loc=mean1, scale=scale1).ppf(ybnds)
+        else:
+            idx0, idx1 = np.argsort(data0.values), np.argsort(data1.values)
+            idata0, wgts0 = data0.isel(facets=idx0), wgts.isel(facets=idx0)
+            idata1, wgts1 = data1.isel(facets=idx1), wgts.isel(facets=idx1)
+            cdf0 = (wgts0.cumsum() - 0.5 * wgts0) / wgts0.sum()  # CDF function
+            cdf1 = (wgts1.cumsum() - 0.5 * wgts1) / wgts1.sum()  # CDF function
+            cdf0 = (cdf0 - cdf0[0]) / (cdf0[-1] - cdf0[0])  # 0% minimum 100% maximum
+            cdf1 = (cdf1 - cdf1[0]) / (cdf1[-1] - cdf1[0])  # 0% minimum 100% maximum
+            xorigs = np.interp(xbnds, cdf0, idata0)  # weighted percentile
+            yorigs = np.interp(ybnds, cdf1, idata1)
         kwargs = dict(observed=observed, internal=internal, graphical=graphical)
+        kwargs.update(weight=weight, pctile=pctile)  # whether to weight institutes
+        # Process constraint
+        xs, ys1, ys2 = process_constraint(data0, data1, constraint, **kwargs)
         xcolor, ycolor = 'cyan7', 'pink7'
-        xs, ys1, ys2 = process_constraint(data0, data1, constraint, pctile=pctile, **kwargs)  # noqa: E501
         nbounds = len(xs) // 2  # should be one or two
         xmins, xmean, xmaxs = xs[:nbounds], xs[nbounds], xs[-nbounds:]
         ymins1, ymean, ymaxs1 = ys1[:nbounds], ys1[nbounds], ys1[-nbounds:]
@@ -1592,6 +1618,7 @@ def _setup_scatter(
             ymins, ymaxs = (ymins2[0], ymins1[0]), (ymaxs2[-1], ymaxs1[-1])
         else:  # with and without bootstrapped model-impled obs uncertainty
             ymins, ymaxs, alphas = ymins2, ymaxs2[::-1], alphas[-nbounds:]
+        # Add labels and bounds
         args = ([min(xmins) - 100, xmean], [ymean, ymean])
         yobjs = [ax.add_artist(mlines.Line2D(*args, lw=1, color=ycolor, label='constrained'))]  # noqa: E501
         color = ycolor if 'x' in original or not handle else handle[0].get_color()
@@ -1600,8 +1627,8 @@ def _setup_scatter(
         for bound in yorigs:  # unconstrained y bounds using scatter color
             horig = ax.axhline(bound, ls='--', lw=0.7, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
         handle = [tuple(xobjs), tuple(yobjs)] + ([horig] if horig else [])
-        param = r'CI_{\mathrm{constrained}} - CI_{\mathrm{unconstrained}}'
-        param = rf'\dfrac{{{param}}}{{CI_{{\mathrm{{unconstrained}}}}}}'
+        param = r'\sigma_{\mathrm{constrained}} - \sigma_{\mathrm{unconstrained}}'
+        param = rf'\dfrac{{{param}}}{{\sigma_{{\mathrm{{unconstrained}}}}}}'
         ratio = (ymaxs2[-1] - ymins2[0]) / (yorigs[1] - yorigs[0]) - 1
         ratio = ureg.Quantity(ratio, '').to('percent')
         label = rf'${param}\,=\,{ratio:~L.0f}$'
@@ -2396,13 +2423,12 @@ def general_plot(
         path = Path().expanduser().resolve()
         if path.name in ('notebooks', 'meetings', 'manuscripts'):
             path = path.parent  # parent project directory
-        name = 'figures-publication' if isinstance(save, str) else 'figures'
-        path = path / name
+        figures = 'figures-publication' if isinstance(save, str) else 'figures'
+        path = path / figures
         if not path.is_dir():
             raise ValueError(f'Path {str(path)!r} does not exist.')
         name = save
-        methods = '-'.join(methods)
-        commands = '-'.join(commands)
+        methods, commands = '-'.join(methods), '-'.join(commands)
         if not isinstance(save, str):
             name = '_'.join((methods, pathlabel, commands, indicator))
         path = path / name

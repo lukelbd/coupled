@@ -2,6 +2,35 @@
 """
 Load and combine coupled model climate and feedback data.
 """
+# TODO: Should create climate feedback files before refactoring 'facets' and 'version'
+# coordinates since that is primary benefit, otherwise datasets are mostly empty when
+# combining climate and feedback data on 'parameters'. First move coupled/climate.py
+# functions to cmip_data/climate.py and save time series of core linearly-additive
+# components (e.g. dse and lse instead of mse). Then generate circulation 'feedback'
+# files by regressing against temperature for different time periods. Finally add
+# derivations to get_result as with flux variables (e.g. mse = dse + lse).
+# TODO: Should have 'facets' coordinate with project / institute / model / ensemble
+# and 'parameters' coordinate with source / experiment / period / style / region.
+# For circulation data, will have 'ratio' style for year 120-150 abrupt 4xCO2 changes
+# normalized by temperature while 'monthly' and 'annual' are pre-industrial or abrupt
+# 4xCO2 regressions against temperature (as with feedback calculations). Will rename
+# 'source' on both to e.g. simply 'internal' or 'external' since 'eraint' source is not
+# meaningful for climate data (or can add as distinct feedback-only coordinate) while
+# 'period' and 'region' indicate integration or averaging periods and temperature
+# normalization settings. All changes normalized by temperature will have 'lam' suffix
+# while 'erf' suffix indicates rapid adjustments and unperturbed climatology will be
+# stored without suffix or 'parameters' coordinate.
+# TODO: Auto-construct 'ratio' style changes normalized by global temperature and use
+# get_result() to build e.g. unnormalized 4xCO2 changes over years 120-150 using 'del'
+# suffix, or absolute years 120-150 average using 'abs' suffix (equivalent to 'del'
+# plus climatology). Would skip radiative flux data, since these are saved as special
+# case with 'forcing' subtracted from the numerator (when subequently constructing
+# budgets or breakdowns from radiative flux would simply get net change from 'del' plus
+# 'erf', and note 'erf' will be present under 'ratio' style even though feedbacks.py
+# simply sets this to the 'erf' from one of the regression estimates). The data for
+# unnormalizing would be stored under 'ratio' style 'tstd' variable, since ratio-
+# equivalent of scaling 'tpat' by global temperature standard deviation is to scale
+# the ratio of local-to-global surface temperature change by the global change again.
 import itertools
 from pathlib import Path
 
@@ -15,9 +44,42 @@ from cmip_data.climate import HYDRO_COMPONENTS
 from cmip_data.climate import _add_energetics, _add_transport, _add_hydrology
 from .climate import climate_datasets
 from .feedbacks import _update_terms, feedback_datasets, feedback_jsons, feedback_texts
-from .specs import _pop_kwargs, FACETS_NAME, FACETS_LEVELS
+from .specs import _pop_kwargs
 
 __all__ = ['open_dataset']
+
+# Facet settings
+FACETS_NAME = 'facets settings'
+FACETS_LEVELS = (
+    'project',
+    'institute',  # auto-constructed institute index
+    'model',
+    'experiment',
+    'ensemble',
+)
+
+# Version settings
+VERSION_NAME = 'eeedback settings'
+VERSION_LEVELS = (
+    'source',
+    'style',
+    'start',  # initial year of regression or 'forced' climate average
+    'stop',  # final year of regression or 'forced' climate average
+    'region',
+)
+
+# Other options
+FACETS_EXCLUDE = (
+    'MCM-UA-1-0',
+    'FIO-ESM-2-0',
+    'IPSL-CM6A-LR-INCA',
+)
+FACETS_RENAME = {
+    'piControl': 'picontrol',  # or 'control' but too general
+    'control-1950': 'control1950',
+    'abrupt4xCO2': 'abrupt4xco2',  # or 'response' but sounds like perturbation
+    'abrupt-4xCO2': 'abrupt4xco2',
+}
 
 
 def _standardize_order(dataset):

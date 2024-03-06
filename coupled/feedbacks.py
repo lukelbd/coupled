@@ -7,7 +7,6 @@ import warnings
 import json
 import os
 import re
-from collections import namedtuple
 from pathlib import Path
 
 import climopy as climo  # noqa: F401  # add accessor
@@ -18,20 +17,12 @@ from climopy import var, ureg, vreg  # noqa: F401
 from icecream import ic  # noqa: F401
 
 from cmip_data.facets import ENSEMBLES_FLAGSHIP, MODELS_INSTITUTES
-from cmip_data.facets import Database, glob_files, _parse_constraints
+from cmip_data.facets import Database, glob_files, _item_member, _parse_constraints
 from cmip_data.feedbacks import FEEDBACK_DESCRIPTIONS
 from cmip_data.utils import assign_dates, load_file
-from .process import get_parts, get_result
-from .specs import (
-    _pop_kwargs,
-    FACETS_NAME,
-    FACETS_LEVELS,
-    FACETS_RENAME,
-    MODELS_EXCLUDE,
-    TRANSLATE_PATHS,
-    VERSION_NAME,
-    VERSION_LEVELS,
-)
+from .process import get_parts
+from .specs import TRANSLATE_PATHS
+from .specs import _pop_kwargs
 
 __all__ = [
     'feedback_datasets',
@@ -47,6 +38,32 @@ __all__ = [
 REGEX_FLUX = re.compile(
     r'(\A|[^_]*)(_?r)([lsf])([udner])([tsa])(cs|ce|)'
 )
+
+# Period label translations
+# NOTE: Observed feedback utility concatenates along 'version' coordinate with keys and
+# labels constructed from input keyword arguments, but have no concept of 'early' or
+# 'late' response for observed data, so can supply additional translations manually.
+LABELS_YEARS = {
+    ('years', value): ('period', label)
+    for (key, value), label in TRANSLATE_PATHS.items() if key == 'startstop'
+}
+
+# Default feedback settings
+# NOTE: This calculates both full 150-year and early and late perturbed feedback
+# estimates. Also skip 'month' 'anomaly' and 'detrend' options irrelevant for abrupt
+# experiments and 'x' and 'y' detrend options for control runs since stationary.
+PARAMS_ABRUPT = {
+    'years': ((0, 150), (0, 20), (20, 150)),
+    'month': (None,),
+    'anomaly': (False,),
+    'detrend': ('',),
+}
+PARAMS_CONTROL = {
+    'years': (None, 20, 50),
+    'month': ('dec', 'jun'),
+    'anomaly': (True, False),
+    'detrend': ('', 'xy'),
+}
 
 # Feedback aliases
 # NOTE: These are used to both translate tables from external sources into the more
@@ -298,9 +315,9 @@ def _update_terms(
     # NOTE: Previously computed climate sensitivity 'components' based on individual
     # effective forcings and feedbacks but interpretation is not useful. Now store
     # zero sensitivity components and only compute after the fact.
-    numers = [('rfnt_erf',), ('rlnt_erf', 'rsnt_erf'), ()]
     denoms = [('rfnt_lam',), ('rlnt_lam', 'rsnt_lam'), ()]
-    for numer, denom in zip(numers, denoms):
+    numers = [('rfnt_erf',), ('rlnt_erf', 'rsnt_erf'), ()]
+    for denom, numer in zip(denoms, numers):
         if all(name in dataset for name in (*numer, *denom)):  # noqa: E501
             break
     short_name = 'climate sensitivity'
@@ -356,7 +373,7 @@ def feedback_jsons(
     """
     # NOTE: Use non-descriptive long names here but when combining with custom feedbacks
     # in open_dataset() should be overwritten by more descriptive long names.
-    from .datasets import _standardize_order
+    from .datasets import FACETS_EXCLUDE, VERSION_LEVELS
     kw_terms = _pop_kwargs(constraints, _update_terms)
     paths = paths or ('~/data/cmip-tables',)
     paths = tuple(Path(path).expanduser() for path in paths)
@@ -379,32 +396,36 @@ def feedback_jsons(
             source = json.load(f)
         options = source.get(project, {})
         for model, ensembles in options.items():
-            if model in MODELS_EXCLUDE:  # no separate control version
+            institute = MODELS_INSTITUTES.get(model, 'UNKNOWN')
+            if model in FACETS_EXCLUDE:  # no separate control version
                 continue
             if model not in constraints.get('model', (model,)):
                 continue
-            for ensemble, group in ensembles.items():
-                key_flagship = (project, 'abrupt-4xCO2', model)
-                ens_default = ENSEMBLES_FLAGSHIP[project, None, None]
-                ens_flagship = ENSEMBLES_FLAGSHIP.get(key_flagship, ens_default)
-                ensemble = 'flagship' if ensemble == ens_flagship else ensemble
-                if not nonflag and ensemble != 'flagship':
+            if institute not in constraints.get('institute', (institute,)):
+                continue
+            for idx, ensemble in enumerate(sorted(ensembles, key=_item_member)):
+                index = (project, 'abrupt-4xCO2', model)
+                flagship = ENSEMBLES_FLAGSHIP[project, None, None]
+                flagship = ENSEMBLES_FLAGSHIP.get(index, flagship)
+                standard = 'flagship' if ensemble == flagship else f'ensemble{idx:02d}'
+                if not nonflag and standard != 'flagship':
                     continue
-                if ensemble not in constraints.get('ensemble', (ensemble,)):
+                if standard not in constraints.get('ensemble', (ensemble, standard)):
                     continue
-                institute = MODELS_INSTITUTES.get(model, 'UNKNOWN')
-                facets = (project, institute, model, 'abrupt4xco2', ensemble)
-                dataset = xr.Dataset()
-                for key, value in group.items():
+                facets = (project, institute, model, 'abrupt4xco2', standard)
+                arrays = {}
+                for key, value in ensembles[ensemble].items():
                     name, units = VARIABLE_DEFINITIONS[key.lower()]
                     attrs = {'units': units}  # long name assigned below
-                    dataset[name] = xr.DataArray(value, attrs=attrs)
+                    arrays[name] = xr.DataArray(value, attrs=attrs)
+                dataset = xr.Dataset(arrays)
                 dataset = dataset.expand_dims(version=1)
                 dataset = dataset.assign_coords(version=version)
                 if facets in datasets:
                     datasets[facets].update(dataset)
                 else:
                     datasets[facets] = dataset
+    from .datasets import _standardize_order
     for facets in tuple(datasets):
         dataset = datasets[facets]
         dataset = _update_attrs(dataset, boundary=boundary)
@@ -444,7 +465,7 @@ def feedback_texts(
     # NOTE: The Zelinka, Geoffry, and Forster papers and sources only specify a
     # CO2 multiple of '2x' or '4x' in the forcing entry and just say 'ecs' for the
     # climate sensitivity. So detect the multiple by scanning all keys in the table.
-    from .datasets import _standardize_order
+    from .datasets import FACETS_EXCLUDE, VERSION_LEVELS
     kw_terms = _pop_kwargs(constraints, _update_terms)
     paths = paths or ('~/data/cmip-tables',)
     paths = tuple(Path(path).expanduser() for path in paths)
@@ -485,15 +506,17 @@ def feedback_texts(
                 continue
             for model in dataset.model.values:
                 institute = MODELS_INSTITUTES.get(model, 'UNKNOWN')
-                facets = ('CMIP5', institute, model, 'abrupt4xco2', 'flagship')
-                if model in MODELS_EXCLUDE:
+                if any(s in model for s in ('mean', 'deviation', 'uncertainty')):
+                    continue
+                if model in FACETS_EXCLUDE:
                     continue
                 if model not in constraints.get('model', (model,)):
                     continue
+                if institute not in constraints.get('institute', (institute,)):
+                    continue
                 if 'flagship' not in constraints.get('ensemble', ('flagship',)):
                     continue
-                if any(lab in model for lab in ('mean', 'deviation', 'uncertainty')):
-                    continue
+                facets = ('CMIP5', institute, model, 'abrupt4xco2', 'flagship')
                 select = array.sel(model=model, drop=True)
                 if scale != 1 and units in ('K', 'W m^-2'):  # avoid in-place operation
                     select = scale * select
@@ -504,6 +527,7 @@ def feedback_texts(
                     args = (select, datasets[facets])
                     select = xr.combine_by_coords(args, combine_attrs='override')
                 datasets[facets] = select
+    from .datasets import _standardize_order
     for facets in tuple(datasets):
         dataset = datasets[facets]
         dataset = _update_attrs(dataset, boundary=boundary)
@@ -517,7 +541,7 @@ def feedback_texts(
 def feedback_datasets(
     *paths,
     boundary=None, source=None, style=None,
-    early=True, late=True, delayed=False, equaled=False,
+    early=True, late=True, delay=False, fifty=False,
     point=True, latitude=True, hemisphere=False,
     annual=True, seasonal=False, monthly=False,
     average=False, nodrift=False, standardize=True,
@@ -536,7 +560,7 @@ def feedback_datasets(
         The kernel source(s) and feedback style(s) to optionally filter.
     point, latitude, hemisphere : bool, optional
         Whether to include or drop extra regional feedbacks.
-    early, late, delayed, equaled : bool, optional
+    early, late, delay, fifty : bool, optional
         Whether to include or drop extra range feedbacks.
     annual, seasonal, monthly : bool, optional
         Whether to include or drop extra period feedbacks.
@@ -560,7 +584,8 @@ def feedback_datasets(
     # TODO: Support subtracting global anomaly within get_result() by adding suffix
     # to the variable string or allowing user override of 'relative' key? Tricky in
     # context of e.g. regressions of anomalies against something not anomalous.
-    from .datasets import _standardize_order
+    from .datasets import FACETS_EXCLUDE, FACETS_LEVELS, FACETS_RENAME
+    from .datasets import VERSION_LEVELS, VERSION_NAME
     kw_terms = _pop_kwargs(constraints, _update_terms)
     sample = pd.date_range('2000-01-01', '2000-12-01', freq='MS')
     regions = [(point, 'point'), (latitude, 'latitude'), (hemisphere, 'hemisphere')]
@@ -600,7 +625,7 @@ def feedback_datasets(
         # just a denominator region coordinate. Note load_file builds the multi-index.
         for sub, replace in FACETS_RENAME.items():
             facets = tuple(facet.replace(sub, replace) for facet in facets)
-        if facets[2] in MODELS_EXCLUDE:
+        if facets[2] in FACETS_EXCLUDE:
             continue
         paths = [
             path for paths in data.values() for path in paths
@@ -623,9 +648,9 @@ def feedback_datasets(
                 continue
             if not late and (start, stop) == (20, 150):
                 continue
-            if not delayed and start in range(1, 20):
+            if not delay and start in range(1, 20):
                 continue
-            if not equaled and stop - start == 50:
+            if not fifty and stop - start == 50:
                 continue
             if outdated := 'local' in other or 'global' in other:
                 if other.split('-')[0] != 'local':  # ignore global vs. global
@@ -666,6 +691,7 @@ def feedback_datasets(
                     days = dataset.time.dt.days_in_month.astype(np.float32)
                     dataset = dataset.weighted(days).mean('time', skipna=False, keep_attrs=True)  # noqa: E501
             concat[version] = dataset
+        from .datasets import _standardize_order
         dataset = xr.concat(
             concat.values(),
             dim='concat',
@@ -725,7 +751,18 @@ def process_scalar(
     # Initial stuff
     # NOTE: This is used to get mean and internal variability estimates for use with
     # tables and eventual emergent constraints. Includes different estimates.
-    def _find_dependencies(data, args, names=None):
+    from observed.feedbacks import _parse_kwargs, process_scalar
+    _, params, constraints = _parse_kwargs('source', **kwargs)  # skip 'source'
+    constraints['variable'] = 'fluxes'
+    correct = constraints.pop('correct', None)
+    testing = kwargs.get('testing', False)
+    kwargs = {'output': False, 'correct': correct, 'translate': LABELS_YEARS}
+    suffix = ['0000', '0150', 'eraint', 'series']
+    paths = paths or ('~/data/cmip-fluxes', '~/scratch/cmip-fluxes')
+    names = (names,) if isinstance(names, str) else names or VARIABLE_DEFINITIONS.keys()
+    names = tuple(ALIAS_VARIABLES.get(name, name) for name in names)
+    projects = project.split(',') if isinstance(project, str) else ('cmip5', 'cmip6')
+    def _find_dependencies(data, args, names=None):  # noqa: E301
         if isinstance(args, str) or type(args) not in (list, tuple):
             args = (args,)
         for arg in args:
@@ -736,74 +773,64 @@ def process_scalar(
                     arg = get_parts(data, arg)
                 except KeyError:
                     continue
-            for name, part in zip(arg.names, arg.parts):
-                if isinstance(part, (xr.Dataset, xr.DataArray)):
+            for part in arg.parts:
+                if isinstance(part, xr.DataArray):
                     names = names or {}
-                    names.setdefault(arg.__class__.__name__, set()).add(name)
+                    names.setdefault(arg.__class__.__name__, set()).add(part.name)
                 else:  # namedtuple with parent and dependencies
                     part.__class__.__name__ = arg.__class__.__name__
                     names = _find_dependencies(data, part, names)
         return names
-    from observed.feedbacks import _parse_kwargs, process_scalar
-    from .datasets import _standardize_order
-    _, params, constraints = _parse_kwargs('source', **kwargs)  # skip 'source'
-    constraints['variable'] = 'fluxes'
-    translate = {('years', value): label for (key, value), label in TRANSLATE_PATHS.items() if key == 'startstop'}  # noqa: E501
-    testing = kwargs.get('testing', False)
-    correct = constraints.pop('correct', None)
-    kwargs = {'correct': correct, 'translate': translate}
-    suffix = ['0000', '0150', 'eraint', 'series']
-    paths = paths or ('~/data/cmip-fluxes', '~/scratch/cmip-fluxes')
-    names = (names,) if isinstance(names, str) else names or VARIABLE_DEFINITIONS.keys()
-    names = tuple(ALIAS_VARIABLES.get(name, name) for name in names)
-    projects = project.split(',') if isinstance(project, str) else ('cmip5', 'cmip6')
-    results = {}
 
     # Calculate feedback parameters
     # NOTE: Here calculate both 150-year control and 20-year and 50-year
     # internal variability estimates. Also skip 'month' 'anomaly' and 'detrend'
     # options irrelevant for abrupt experiments and skip 'x' and 'y' detrend
     # options for control runs for simplicity / since climate is stationary.
+    results = {}
+    from .datasets import FACETS_LEVELS, FACETS_NAME, FACETS_RENAME
     for project in map(str.upper, projects):
+        constraints['project'] = project
         files, *_ = glob_files(*paths, project=project)
         database = Database(files, FACETS_LEVELS, flagship_translate=True, **constraints)  # noqa: E501
         if database:
             print('Model:', end=' ')
         for facets, data in database.items():
-            kwarg = {**params, **kwargs}
             paths = [
                 path for paths in data.values() for path in paths
                 if path.stem.split('_')[-1].split('-') == suffix
             ]
             if not paths:
                 continue
-            if facets[3] not in ('picontrol', 'abrupt4xco2'):
-                continue
             if len(paths) > 1:
                 warnings.warn('Ambiguous', '_'.join(facets), 'paths:', ', '.join(map(str, paths)))  # noqa: E501
             for sub, replace in FACETS_RENAME.items():
                 facets = tuple(facet.replace(sub, replace) for facet in facets)
-            if facets[3] == 'picontrol':  # use default 'month' 'annual' 'correct'
-                kwarg['years'] = (None, 20, 50)
-                kwarg['month'] = ('dec', 'jun')
-                kwarg['anomaly'] = (True, False)
-                kwarg['detrend'] = ('', 'xy')
-            else:  # use default 'annual' 'correct'
-                kwarg['years'] = ((0, 150), (0, 20), (20, 150))
-                kwarg['month'] = (None,)
-                kwarg['anomaly'] = (False,)
-                kwarg['detrend'] = ('',)
-            if testing:
-                kwarg = {key: values[:1] for key, values in kwarg.items()}
-            series = load_file(paths[0], lazy=True, project=facets[0])  # speed-up
-            start = series.time.dt.strftime('%b').values[0]
+            if facets[3] not in ('picontrol', 'abrupt4xco2'):
+                continue
+            series = load_file(paths[0], lazy=True, project=project)  # speed-up
+            start = series.time.dt.strftime('%b').values[0].lower()
             print(f'{facets[2]}_{facets[3]}_{start}', end=' ')
-            fluxes = _find_dependencies(series, names)  # 'name': [*dependencies]
-            ignore = series.keys() - {key for keys in fluxes.values() for key in keys}
-            series = series.drop_vars(ignore - {'ts'})
+            if facets[3] == 'picontrol':  # use default 'month' 'annual' 'correct'
+                years = (None, 20, 50)
+                month = ('dec', 'jun')
+                anomaly = (True, False)
+                detrend = ('', 'xy')
+            else:  # use default 'annual' 'correct'
+                years = ((0, 150), (0, 20), (20, 150))
+                month = (None,)
+                anomaly = (False,)
+                detrend = ('',)
+            inames = names[:1] if testing else names
+            iparams = params.copy()
+            iparams.update(years=years, month=month, anomaly=anomaly, detrend=detrend)
+            iparams = {key: vals[:1] if testing else vals for key, vals in iparams.items()}  # noqa: E501
+            fluxes = _find_dependencies(series, inames)  # 'name': [*dependencies]
+            retain = {'ts', *(key for keys in fluxes.values() for key in keys)}
+            series = series.drop_vars(series.keys() - retain)
             series = series.climo.add_cell_measures()
             series = xr.Dataset({name: data.climo.average('area') for name, data in series.items()})  # noqa: E501
-            result = process_scalar(series, name=tuple(fluxes), **kwarg)
+            result = process_scalar(series, name=tuple(fluxes), **iparams, **kwargs)
             levels = ('experiment', 'ensemble', *result.indexes['version'].names)
             version = [(*facets[3:], *index) for index in result.version.values]
             version = xr.DataArray(
@@ -812,7 +839,11 @@ def process_scalar(
                 name='version',
                 attrs={'long_name': 'feedback version'},
             )
+            facets = facets[:3]  # project institute model
             result = result.assign_coords(version=version)
+            if facets in results:  # combine new version coordinates
+                args = (result, results[facets])
+                result = xr.concat(args, dim='version')
             results[facets] = result
 
     # Concatenate along facets and save result
@@ -820,10 +851,11 @@ def process_scalar(
     # so pass allstart of the
     # NOTE: Here xarray cannot save multi-index so have to reset index
     # then stack back into multi-index with .stack(version=[...]).
+    from .datasets import _standardize_order
     print()
     print('Concatenating datasets.')
     if not results:
-        raise ValueError('No datasets found.')
+        raise RuntimeError('No datasets found.')
     facets = xr.DataArray(
         pd.MultiIndex.from_tuples(results, names=FACETS_LEVELS[:3]),
         dims='facets',
@@ -841,19 +873,21 @@ def process_scalar(
     if standardize:
         dataset = _standardize_order(dataset)
     base = Path('~/data/global-feedbacks').expanduser()
-    file = 'feedbacks_CMIP_global.nc'
-    if isinstance(output, Path) or '/' in (output or ''):  # copy to general.py
-        base = Path(output).expanduser()
-    elif output is not None:  # copy to general.py
-        file = output
-    if not base.is_dir():
-        os.mkdir(base)
-    if not base.is_dir():
-        raise ValueError(f'Invalid output location {base}.')
-    if (base / file).is_file():
-        os.remove(base / file)
-    print(f'Saving file: {file}')
+    file = 'tmp.nc' if testing else 'feedbacks_CMIP_global.nc'
+    if isinstance(output, str) and '/' not in output:
+        output = base / output
+    elif output:
+        output = Path(output).expanduser()
+    if not output:
+        output = base / file
+    elif not output.suffix:
+        output = output / file
+    if not output.parent.is_dir():
+        os.mkdir(output.parent)
+    if output.is_file():
+        os.remove(output)
+    print(f'Saving file: {output.name}')
     dataset.attrs['facets_levels'] = tuple(dataset.indexes['facets'].names)
     dataset.attrs['version_levels'] = tuple(dataset.indexes['version'].names)
-    dataset.reset_index(('facets', 'version', 'statistic')).to_netcdf(base / file)
+    dataset.reset_index(('facets', 'version')).to_netcdf(output)
     return dataset

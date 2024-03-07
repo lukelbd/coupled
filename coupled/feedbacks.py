@@ -754,12 +754,13 @@ def process_scalar(
     from observed.feedbacks import _parse_kwargs, process_scalar
     _, params, constraints = _parse_kwargs('source', **kwargs)  # skip 'source'
     constraints['variable'] = 'fluxes'
+    defaults = ('net', 'sw', 'lw', 'cre', 'swcre', 'lwcre', 'cs', 'swcs', 'lwcs')
     correct = constraints.pop('correct', None)
     testing = kwargs.get('testing', False)
     kwargs = {'output': False, 'correct': correct, 'translate': LABELS_YEARS}
     suffix = ['0000', '0150', 'eraint', 'series']
     paths = paths or ('~/data/cmip-fluxes', '~/scratch/cmip-fluxes')
-    names = (names,) if isinstance(names, str) else names or VARIABLE_DEFINITIONS.keys()
+    names = (names,) if isinstance(names, str) else names or defaults
     names = tuple(ALIAS_VARIABLES.get(name, name) for name in names)
     projects = project.split(',') if isinstance(project, str) else ('cmip5', 'cmip6')
     def _find_dependencies(data, args, names=None):  # noqa: E301
@@ -808,9 +809,6 @@ def process_scalar(
                 facets = tuple(facet.replace(sub, replace) for facet in facets)
             if facets[3] not in ('picontrol', 'abrupt4xco2'):
                 continue
-            series = load_file(paths[0], lazy=True, project=project)  # speed-up
-            start = series.time.dt.strftime('%b').values[0].lower()
-            print(f'{facets[2]}_{facets[3]}_{start}', end=' ')
             if facets[3] == 'picontrol':  # use default 'month' 'annual' 'correct'
                 years = (None, 20, 50)
                 month = ('dec', 'jun')
@@ -821,12 +819,14 @@ def process_scalar(
                 month = (None,)
                 anomaly = (False,)
                 detrend = ('',)
-            inames = names[:1] if testing else names
-            iparams = params.copy()
+            inames, iparams = names[:1] if testing else names, params.copy()
             iparams.update(years=years, month=month, anomaly=anomaly, detrend=detrend)
             iparams = {key: vals[:1] if testing else vals for key, vals in iparams.items()}  # noqa: E501
+            series = load_file(paths[0], lazy=True, project=project)  # speed-up
+            start = series.time.dt.strftime('%b').values[0].lower()
             fluxes = _find_dependencies(series, inames)  # 'name': [*dependencies]
             retain = {'ts', *(key for keys in fluxes.values() for key in keys)}
+            print(f'{facets[2]}_{facets[3]}_{start} ({len(fluxes)})', end=' ')
             series = series.drop_vars(series.keys() - retain)
             series = series.climo.add_cell_measures()
             series = xr.Dataset({name: data.climo.average('area') for name, data in series.items()})  # noqa: E501

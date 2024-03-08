@@ -262,22 +262,20 @@ def _get_filters(facets, project=None, institute=None):
         if 'model' not in index.names:  # already averaged or selected
             return data
         index = index.droplevel('model')  # preserve institute experiment
-        group = xr.DataArray(index, dims='facets', name='facets')
-        group.attrs.update(data.facets.attrs)
+        group = xr.DataArray(index, name='facets', dims='facets', attrs=data.facets.attrs)  # noqa: E501
         data = data.groupby(group).mean(skipna=False, keep_attrs=True)
         facets = data.indexes['facets']  # WARNING: xarray bug drops level names
-        facets.names = group.indexes['facets'].names
-        data = data.climo.replace_coords(facets=facets)
-        data.facets.attrs.update(group.attrs)
-        return data
-    inst_to_model = {facet[-2]: facet[-1] for facet in facets}  # flagships are last
+        facets.names = index.names
+        facets = xr.DataArray(facets, dims='facets', attrs=group.attrs)
+        return data.climo.replace_coords(facets=facets)
+    inst_to_model = {facet[-2]: facet[-1] for facet in facets if len(facet) >= 2}
     name_to_inst = {label: key for key, label in INSTITUTE_LABELS.items()}
     if not institute:
         inst = lambda key: True  # noqa: U100
     elif institute == 'avg':
         inst = _institute_average
     elif institute == 'flagship':
-        inst = lambda key: key[-1] == inst_to_model.get(key[-2], None)
+        inst = lambda key: len(key) < 2 or key[-1] == inst_to_model.get(key[-2], None)
     elif any(item == institute for pair in name_to_inst.items() for item in pair):  # noqa: E501
         inst = lambda key: key[-2] == name_to_inst.get(institute, institute)
     else:
@@ -739,10 +737,10 @@ def reduce_general(data, attrs=None, **kwargs):
         result = data
         spatials = ('area', 'start', 'stop', 'experiment')
         for dim, value in sorted(ikwargs.items(), key=sorter):
-            options = [*result.sizes, 'area', 'volume', 'spatial', 'month', 'season']
-            levels = [key for idx in result.indexes.values() for key in idx.names]
-            quants = result.coords.keys() - set(levels) - {'time', 'month', 'season'}
-            if value is None or dim not in options and dim not in levels:
+            sizes = [*result.sizes, 'area', 'volume', 'spatial', 'time', 'month', 'season']  # noqa: E501
+            names = [key for idx in result.indexes.values() for key in idx.names]
+            quants = result.coords.keys() - set(names) - {'time', 'month', 'season'}
+            if value is None or dim not in sizes and dim not in names:
                 continue
             if dim in spatials and ikwargs.get('spatial', None) is not None:
                 continue
@@ -761,6 +759,7 @@ def reduce_general(data, attrs=None, **kwargs):
             if dim not in result.coords:
                 result.coords[dim] = xr.DataArray(value).climo.dequantify()
         result.name = data.name
+        result.attrs.update(data.attrs)
         result.attrs.update(attrs or {})
         results.append(result)
 
@@ -773,14 +772,13 @@ def reduce_general(data, attrs=None, **kwargs):
         result = results[0]
     result = inst(result) if inst and inst.name == 'avg' else result
     index = result.indexes.get('facets', pd.Index([]))
-    names = result.sizes.keys() & set(index.names)
-    name = names.pop() if names else 'model'  # remaining level
+    names = set(index.names)  # facet names
     if 'project' in index.names and len(set(result.project.values)) == 1:
-        project = result.project.values[0]
+        proj, names = result.project.values[0], names - {'project'}
         result = result.reset_index('project', drop=True)
-        result.coords['project'] = project
-    if 'facets' not in result.dims and tuple(index):  # restore coordinate
-        coord = result.coords[name if names else dim]  # source coordinate
-        index = pd.MultiIndex.from_arrays((coord.values,), names=(name,))
-        result = result.rename({coord.name: dim}).assign_coords({dim: index})
+        result.coords['project'] = proj
+    if 'facets' in result.dims and len(names) == 1:
+        coord = result.coords['facets']
+        index = pd.MultiIndex.from_arrays((coord.values,), names=(names.pop(),))
+        result = result.assign_coords({'facets': index})
     return result

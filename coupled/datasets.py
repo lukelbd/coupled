@@ -46,7 +46,7 @@ from .climate import climate_datasets
 from .feedbacks import _update_terms, feedback_datasets, feedback_jsons, feedback_texts
 from .specs import _pop_kwargs
 
-__all__ = ['open_dataset']
+__all__ = ['open_scalar', 'open_dataset']
 
 # Facet settings
 FACETS_NAME = 'facets settings'
@@ -130,6 +130,38 @@ def _standardize_order(dataset):
     results = {name: dataset[name] for name in (*names, *unknowns) if name in dataset}
     dataset = xr.Dataset(results)
     return dataset
+
+
+def open_scalar(path=None, ceres=False):
+    """
+    Get the observational constraint estimate.
+
+    Parameters
+    ----------
+    path : path-like, optional
+        The source feedback path.
+    ceres : bool, optional
+        Whether to load global CERES or CMIP feedbacks.
+    """
+    source = 'CERES' if ceres else 'CMIP'
+    base = Path('~/data/global-feedbacks').expanduser()
+    file = f'feedbacks_{source}_global.nc'
+    if isinstance(path, str) and '/' not in path:
+        path = base / path
+    elif path:
+        path = Path(path).expanduser()
+    if not path:
+        path = base / file
+    elif not path.suffix:
+        path = path / file
+    data = xr.open_dataset(path)
+    names = [key for key, coord in data.coords.items() if coord.dims == ('facets',)]
+    if names:  # facet levels
+        data = data.set_index(facets=names)
+    names = [key for key, coord in data.coords.items() if coord.dims == ('version',)]
+    if names:  # version levels
+        data = data.set_index(version=names)
+    return data
 
 
 def open_dataset(

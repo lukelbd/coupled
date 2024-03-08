@@ -579,6 +579,14 @@ def get_heading(label, prefix=None, suffix=None):
     prefix, suffix : optional
         The label prefix and suffix.
     """
+    kwargs = {}
+    if '{prefix}' in label:
+        kwargs['prefix'], prefix = f'{prefix} ', None
+    if '{suffix}' in label:
+        kwargs['suffix'], suffix = f' {suffix}', None
+    label = label.format(**kwargs)
+    if '{suffix}' in label:
+        label, suffix = label.format(suffix), None
     if prefix and not label[:2].isupper():
         label = label[:1].lower() + label[1:]
     if prefix:
@@ -588,8 +596,7 @@ def get_heading(label, prefix=None, suffix=None):
     elif suffix:
         suffix = suffix[:1].upper() + suffix[1:]
     parts = (prefix, label, suffix)
-    label = ' '.join(filter(None, parts))
-    return label
+    return ' '.join(filter(None, parts))
 
 
 def get_path(dataset, *kws_process):
@@ -930,7 +937,7 @@ def parse_spec(dataset, spec, **kwargs):
     # auto apply these coordinates even if not present e.g. for bootstrap datasets. Then
     # have process.py ignore them when version is not present.
     from .general import _merge_dists, _init_command, _props_command, _setup_bars, _setup_scatter  # noqa: E501
-    from .process import get_result
+    from .process import get_result, process_constraint
     from .reduce import reduce_facets
     keys_figure = [k + s for k in ('', 'ax', 'ref', 'fig') for s in ('', 'num', 'width', 'height', 'aspect')]  # noqa: E501
     keys_tight = [k + s for k in ('span', 'share', 'align') for s in ('', 'x', 'y')]
@@ -953,7 +960,7 @@ def parse_spec(dataset, spec, **kwargs):
     kw_figure = _pop_kwargs(kw, *keys_tight, *keys_figure, pplt.Figure._format_signature)  # noqa: E501
     kw_axes = _pop_kwargs(kw, *signatures, pplt.Figure._parse_proj)
     kw_config = _pop_kwargs(kw, tuple(_rc_nodots))
-    kw_other = _pop_kwargs(kw, _merge_dists, _init_command, _props_command, _setup_bars, _setup_scatter)  # noqa: E501
+    kw_other = _pop_kwargs(kw, _merge_dists, _init_command, _props_command, _setup_bars, _setup_scatter, process_constraint)  # noqa: E501
     kw_command = _pop_kwargs(kw, 'c', 'lw', 'color', 'linewidth', 'extend')
     kw_guide = _pop_kwargs(kw, pplt.Axes._add_legend, pplt.Axes._add_colorbar)
     kw_legend = {**kw_guide, **_pop_kwargs(kw, 'legend', pplt.Axes._add_legend)}

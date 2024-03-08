@@ -23,30 +23,6 @@ from .specs import _expand_lists, _expand_parts, _group_parts, _pop_kwargs
 __all__ = ['get_parts', 'get_result', 'process_constraint', 'process_data']
 
 
-# Observational constraint mean and spreads
-# TODO: Auto-generate this dictionary or save and commit then parse a text file. For
-# now copied from jupyterlab observed.ipynb cell.
-# NOTE: These show best estimate, standard errors, and degrees of freedom for feedback
-# regression slopes using either GISTEMP4 or HadCRUT5 and using residual autocorr
-# adjustment (consistent with Dessler et al.). See observed.ipynb notebook.
-FEEDBACK_CONSTRAINTS = {
-    # 'cld': (0.69, (1.04 - 0.31) / 2,  # He et al. with 95% uncertainty
-    # 'cld': (0.68, 0.18, 97),  # He et al. trended estimate (total record is 226)
-    'cld': (0.35, 0.25, 108),  # He et al. detrended estimate (total record is 226)
-    'net': (-0.85, 0.29, 166),  # custom estimates (total record is 274)
-    'sw': (0.86, 0.24, 175),
-    'lw': (-1.71, 0.19, 129),
-    'cre': (0.27, 0.23, 131),
-    'swcre': (0.19, 0.24, 140),
-    'lwcre': (0.08, 0.13, 184),
-    'hadnet': (-0.84, 0.31, 166),
-    'hadsw': (0.89, 0.26, 175),
-    'hadlw': (-1.73, 0.21, 129),
-    'hadcre': (0.30, 0.24, 131),
-    'hadswcre': (0.15, 0.26, 140),
-    'hadlwcre': (0.15, 0.14, 184),
-}
-
 # Model-estimated bootstrapped uncertainty (see _calc_bootstrap)
 # TODO: Record degrees of freedom and autocorrelation across successive bootstrap
 # feedback estimates (e.g. year 0-20 estimate will be related to year 5-25). For now
@@ -437,7 +413,8 @@ def get_result(
 
 
 def process_constraint(
-    data0, data1, constraint=None, observed=None, internal=False, graphical=False, pctile=None, N=None, **kwargs,  # noqa: E501
+    data0, data1, constraint=None, constraint_kw=None, perturb=False,
+    observed=None, internal=False, graphical=False, pctile=None, N=None, **kwargs,
 ):
     """
     Return percentile bounds for observational constraint.
@@ -450,8 +427,12 @@ def process_constraint(
         The predictand data. Must be 1D.
     constraint : str or 2-tuple,
         The 95% bounds on the observational constraint.
+    constraint_kw : dict, optional
+        The keyword arguments passed to the loading function.
     observed : int, optional
         The number of years to use for observational uncertainty.
+    perturb : bool, optional
+        Whether to perturb the model data with its uncertainty.
     internal : bool or int, optional
         Whether to include model-estimated observed uncertainty due to variability. If
         ``True`` then ``20`` is used. If passed the bounds are with and without model
@@ -476,67 +457,97 @@ def process_constraint(
     result2 : 3-tuple
         The emergent constraint accounting for regression uncertainty.
     """
-    # NOTE: Below we reverse engineer the t-distribution associated with observational
-    # estimate, then use those distribution properties for our bootstrapping. Tried
-    # using 'offset uncertainty' but was similar to slope-only regression uncertainty.
+    # Get settings and observational data
+    # TODO: Use estimates from global average model feedbacks
+    from .datasets import open_scalar
+    from .reduce import _get_regression
+    N = N or 1000000  # samples to draw
+    constraint = 'cre' if constraint is None or constraint is True else constraint
+    historical = 23  # historical observation years
+    observed = observed or historical
+    internal = observed if internal is None or internal is True else internal
+    pctile = 95 if pctile is None or pctile is True else pctile
+    pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
+    keys = ('style',)  # TODO: use global dataset
+    process_kw = {key: data0.coords[key].item() for key in keys if key in data0.coords}
+    process_kw.update(constraint_kw or {})
+    if isinstance(constraint, str):  # TODO: use generalized estimates
+        scalar = open_scalar(ceres=True)
+        scalar = get_result(scalar, constraint, **process_kw)
+        scalar = scalar.sel(statistic=['mean', 'sigma', 'dof'])
+        constraint = scalar.values.tolist()
+    if internal is not False:
+        raise NotImplementedError
+        # internal = INTERNAL_UNCERTAINTY[name][internal]
+        # xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
+        # es = stats.norm(loc=0, scale=internal).rvs(N)  # implied variability error
+        # observations = np.insert(np.percentile(xs + es, pctile), 1, observations)
+
+    # Get observational and regression estimates
     # NOTE: Use N - 2 degrees of freedom for both observed feedback and inter-model
     # coefficients since they are both linear regressions. For now ignore uncertainty
     # of individual feedback regressions that comprise inter-model regression because
     # their sample sizes are larger (150 years) and uncertainties are uncorrelated so
     # should roughly cancel out across e.g. 30 members of ensemble.
-    from .feedbacks import VARIABLE_ALIASES
-    from .reduce import _get_regression
-    constraint = 'cld' if constraint is None or constraint is True else constraint
-    observed = observed or 20
-    internal = observed if internal is None or internal is True else internal
-    kwargs['pctile'] = pctile = 95 if pctile is None or pctile is True else pctile
-    pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
-    name = constraint if isinstance(constraint, str) else None
-    name = VARIABLE_ALIASES.get(name, name)
-    N = N or 1000000  # samples to draw
-    if name is not None:
-        constraint = FEEDBACK_CONSTRAINTS[name]
     if not np.iterable(constraint) or len(constraint) != 3:
         raise ValueError(f'Invalid constraint {constraint}. Must be (mean, sigma, dof).')  # noqa: E501
     if data0.ndim != 1 or data1.ndim != 1:
         raise ValueError(f'Invalid data dims {data0.ndim} and {data1.ndim}. Must be 1D.')  # noqa: E501
     xmean, xscale, xdof = constraint  # note dof will have small effect
     nbounds = 1 if internal is None else 2  # number of bounds returned
-    xdof *= observed / 20  # increased degrees of freedom
-    xscale /= np.sqrt(observed / 20)  # reduced regression error
+    xdof *= observed / historical  # increased degrees of freedom
+    xscale /= np.sqrt(observed / historical)  # reduced regression error
     xmin, xmax = stats.t(df=xdof, loc=xmean, scale=xscale).ppf(0.01 * pctile)
     observations = np.array([xmin, xmean, xmax])
-    if internal is not False:
-        internal = INTERNAL_UNCERTAINTY[name][internal]
-        xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
-        es = stats.norm(loc=0, scale=internal).rvs(N)  # implied variability error
-        observations = np.insert(np.percentile(xs + es, pctile), 1, observations)
     idxs = data0.argsort().values  # critical so 'fit' has same coordinates
     data0 = data0.isel({data0.dims[0]: idxs})
     data1 = data1.isel({data0.dims[0]: idxs})
-    mean0 = data0.values.mean()
-    mean1 = data1.values.mean()
-    result = _get_regression(data0, data1, **kwargs)
-    bmean, _, _, fit, fit_lower, fit_upper, rscale, rsquare, rdof = result
-    bmean, rdof, fit = bmean.values, rdof.values, fit.values
-    fit_lower, fit_upper = fit_lower.values, fit_upper.values
+    if not perturb:  # TODO: load values from file
+        bmean = None
+        mean0 = data0.mean().values
+        mean1 = data1.mean().values
+    else:  # include regression error
+        mscale, mdof, M = 0.15, 750, data0.size
+        offset0 = stats.t(df=mdof, loc=0, scale=mscale).rvs((N, M))
+        offset1 = stats.t(df=mdof, loc=0, scale=mscale).rvs((N, M))
+        with xr.set_options(keep_attrs=True):
+            datas0 = data0 + xr.DataArray(offset0, dims=('sample', 'facets'))
+            datas1 = data1 + xr.DataArray(offset1, dims=('sample', 'facets'))
+        bmean, *_ = _get_regression(datas0, datas1, pctile=pctile, nofit=True, **kwargs)
+        mean0 = datas0.mean(dim='facets').values
+        mean1 = datas1.mean(dim='facets').values
+    print(f' constraint: mean {xmean:.2f} sigma {xscale:.2f} dof {xdof:.0f}')
+    result = _get_regression(data0, data1, pctile=pctile, **kwargs)
+    *slopes, fit, fit_lower, fit_upper, rscale, _, rdof = result
+    bmean = (slopes[0] if bmean is None else bmean).values  # possibly include spread
+    rdof, fit, fit_lower, fit_upper = (da.values for da in (rdof, fit, fit_lower, fit_upper))  # noqa: E501
+
+    # Propagate observational uncertainty through regression uncertainty
+    # NOTE: This was adapted from Simpson et al. methdology
+    # NOTE: Below we reverse engineer the t-distribution associated with observational
+    # estimate, then use those distribution properties for our bootstrapping. Tried
+    # using 'offset uncertainty' but was similar to slope-only regression uncertainty.
     if graphical:  # intersection of shaded regions
         fit_lower = fit_lower.squeeze()
         fit_upper = fit_upper.squeeze()
         xs = np.sort(data0, axis=0)  # linefit returns result for sorted data
-        ymean = mean1 + bmean.item() * (xmean - mean0)
+        ymean = mean1 + bmean * (xmean - mean0)
         ymins = np.interp(observations[:nbounds], xs, fit_lower)
         ymaxs = np.interp(observations[-nbounds:], xs, fit_upper)
         constrained = (*ymins, ymean, *ymaxs)
         alternative = mean1 + bmean * (observations - mean0)
+    elif False:  # individual parametric uncertainty
+        amean = mean1 - mean0 * bmean  # see wiki page
+        bscale = slopes[2] - slopes[1]
+        aerror = bscale * np.sqrt(np.sum(data0 ** 2) / data0.size)  # see wiki page
+        bs_ = stats.t(loc=bmean, scale=bscale, df=data0.size - 2).rvs(N)
+        as_ = stats.t(loc=amean, scale=aerror, df=data0.size - 2).rvs(N)
+        ys = as_ + bs_ * xs  # include both uncertainties
+        constrained = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
+        ys = mean1 + bmean * (xs - mean0)  # include slope uncertainty only
+        rscale = np.std(data1 - fit, ddof=1)  # model residual sigma
+        alternative = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
     else:  # bootstrapped residual addition
-        # amean = mean1 - mean0 * bmean  # see wiki page
-        # aerror = berror * np.sqrt(np.sum(data0 ** 2) / data0.size)  # see wiki page
-        # bs_ = stats.t(loc=bmean, scale=berror, df=data0.size - 2).rvs(N)
-        # as_ = stats.t(loc=amean, scale=aerror, df=data0.size - 2).rvs(N)
-        # ys = err + as_ + bs_ * xs  # include both uncertainties
-        # ys = mean1 + bs_ * (xs - mean0)  # include slope uncertainty only
-        # rscale = np.std(data1 - fit, ddof=1)  # model residual sigma
         xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)  # observations
         rs = stats.t(df=rdof, loc=0, scale=rscale).rvs(N)  # regression
         ys = rs + mean1 + bmean * (xs - mean0)

@@ -1453,8 +1453,7 @@ def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=
 
 def _setup_scatter(
     ax, data0, data1, handle=None, zeros=False, oneone=False, linefit=False, annotate=False,  # noqa: E501
-    constraint=None, original=None, distribution=False, alternative=False,
-    weight=False, pctile=None, observed=None, internal=None, graphical=None,
+    constraint=None, original=None, cumulative=False, alternative=False, weight=False, pctile=None, **kwargs,  # noqa: E501
 ):
     """
     Adjust and optionally add content to scatter plots.
@@ -1480,26 +1479,23 @@ def _setup_scatter(
         Whether to add annotations to the scatter markers.
     constraint : bool or float, optional
         Whether to plot emergent constraint results.
+    cumulative : bool, optional
+        Whether to compute unconstrained bounds from the native distribution.
     original : str or bool, optional
         Whether to include original unconstrained inter-model uncertainty bounds.
-    distribution : bool, optional
-        Whether to compute unconstrained bounds from the native distribution.
     alternative : bool, optional
         Whether to include alternative estimate that omits regression uncertainty.
     weight : bool, optional
-        Whether to weight regressions by institute model count.
+        Whether to weight by institute (set to ``True`` if ``institute='wgt'`` passed).
     pctile : float, optional
         Percentile range used for line fit and constraint bounds.
-    observed : int, default: 20
-        Passed to `process_constraint`. Number of years for regression uncertainty.
-    internal : bool or int, optional
-        Passed to `process_constraint`. If ``False`` then only regression spread used.
-    graphical : bool, optional
-        Passed to `process_constraint`. Whether to use graphical intersections.
+    **kwargs
+        Passed to `process_constraint`.
     """
     # Add reference one:one line
     # NOTE: This also disables autoscaling so that line always looks like a diagonal
     # drawn right across the axes. Also requires same units on x and y axis.
+    kw_constraint = _pop_kwargs(kwargs, process_constraint)
     if zeros:  # disabled by default
         style = dict(color='k', lw=1 * pplt.rc.metawidth)
         ax.axhline(0, alpha=0.1, zorder=0, **style)
@@ -1564,28 +1560,28 @@ def _setup_scatter(
     # NOTE: Here get constrained/unconstrained standard deviation ratio using ratio of
     # percentile intervals. Should be similar since Monte Carlo sampling used to arrive
     # at constraint estimate comprises t-distributions with same degrees of freedom.
-    # xorigs = np.percentile(data0.values, 100 * xbnds, method='linear')
-    # yorigs = np.percentile(data1.values, 100 * ybnds, method='linear')
+    # xorigs = np.percentile(data0.values, 100 * xpctile, method='linear')
+    # yorigs = np.percentile(data1.values, 100 * ypctile, method='linear')
     if constraint is not None:
         # Process input data
         pctile = pctile or 95  # default percentile range
-        bnds = 0.01 * np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
+        pctiles = 0.01 * np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
         original = 'xy' if original is True else '' if original is False else original
         original = ''.join('y' if original is None else original)
-        xbnds = bnds if 'x' in original else ()
-        ybnds = bnds if 'y' in original else ()
+        xpctile = (pctiles[0], 0.5, pctiles[-1]) if 'x' in original else ()
+        ypctile = (pctiles[0], 0.5, pctiles[-1]) if 'y' in original else ()
         if weight:
             wgts = _get_weights(data0, dim='facets')
         else:
             wgts = xr.ones_like(data0.facets, dtype=float)
-        if not distribution:
+        if not cumulative:
             dof = wgts.sum() - 1  # standard deviation uncertainty
             mean0 = (data0 * wgts).sum() / wgts.sum()
             mean1 = (data1 * wgts).sum() / wgts.sum()
             scale0 = np.sqrt((wgts * (data0 - mean0) ** 2 / dof).sum())
             scale1 = np.sqrt((wgts * (data1 - mean1) ** 2 / dof).sum())
-            xorigs = stats.t(df=dof, loc=mean0, scale=scale0).ppf(xbnds)
-            yorigs = stats.t(df=dof, loc=mean1, scale=scale1).ppf(ybnds)
+            xorigs = stats.t(df=dof, loc=mean0, scale=scale0).ppf(xpctile)
+            yorigs = stats.t(df=dof, loc=mean1, scale=scale1).ppf(ypctile)
         else:
             idx0, idx1 = np.argsort(data0.values), np.argsort(data1.values)
             idata0, wgts0 = data0.isel(facets=idx0), wgts.isel(facets=idx0)
@@ -1594,12 +1590,11 @@ def _setup_scatter(
             cdf1 = (wgts1.cumsum() - 0.5 * wgts1) / wgts1.sum()  # CDF function
             cdf0 = (cdf0 - cdf0[0]) / (cdf0[-1] - cdf0[0])  # 0% minimum 100% maximum
             cdf1 = (cdf1 - cdf1[0]) / (cdf1[-1] - cdf1[0])  # 0% minimum 100% maximum
-            xorigs = np.interp(xbnds, cdf0, idata0)  # weighted percentile
-            yorigs = np.interp(ybnds, cdf1, idata1)
-        kwargs = dict(observed=observed, internal=internal, graphical=graphical)
-        kwargs.update(weight=weight, pctile=pctile)  # whether to weight institutes
+            xorigs = np.interp(xpctile, cdf0, idata0)  # weighted percentile
+            yorigs = np.interp(ypctile, cdf1, idata1)
         # Process constraint
-        xs, ys1, ys2 = process_constraint(data0, data1, constraint, **kwargs)
+        kw_constraint.update(weight=weight, pctile=pctile)
+        xs, ys1, ys2 = process_constraint(data0, data1, constraint, **kw_constraint)
         xcolor, ycolor = 'cyan7', 'pink7'
         nbounds = len(xs) // 2  # should be one or two
         xmins, xmean, xmaxs = xs[:nbounds], xs[nbounds], xs[-nbounds:]
@@ -1611,8 +1606,9 @@ def _setup_scatter(
         color = xcolor if 'y' in original or not handle else handle[0].get_color()
         for alph, xmin, xmax in zip(alphas[-nbounds:], xmins, xmaxs[::-1]):
             xobjs.append(ax.axvspan(xmin, xmax, lw=0, color=xcolor, alpha=alph))
-        for bound in xorigs:  # unconstrained x bounds
-            horig = ax.axvline(bound, ls='--', lw=0.7, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
+        for idx, bound in enumerate(xorigs):  # unconstrained x bounds
+            ls, lw = (':', 0.9) if idx == 1 else ('--', 0.7)
+            horig = ax.axvline(bound, ls=ls, lw=lw, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
         if alternative:  # with and without regression uncertainty
             ymins, ymaxs = (ymins2[0], ymins1[0]), (ymaxs2[-1], ymaxs1[-1])
         else:  # with and without bootstrapped model-impled obs uncertainty
@@ -1623,17 +1619,20 @@ def _setup_scatter(
         color = ycolor if 'x' in original or not handle else handle[0].get_color()
         for alph, ymin, ymax in zip(alphas, ymins, ymaxs):
             yobjs.append(ax.axhspan(ymin, ymax, lw=0, color=ycolor, alpha=alph))
-        for bound in yorigs:  # unconstrained y bounds using scatter color
-            horig = ax.axhline(bound, ls='--', lw=0.7, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
+        for idx, bound in enumerate(yorigs):  # unconstrained y bounds matching color
+            ls, lw = (':', 0.9) if idx == 1 else ('--', 0.7)
+            horig = ax.axhline(bound, ls=ls, lw=0.7, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
         handle = [tuple(xobjs), tuple(yobjs)] + ([horig] if horig else [])
         param = r'\sigma_{\mathrm{constrained}} - \sigma_{\mathrm{unconstrained}}'
         param = rf'\dfrac{{{param}}}{{\sigma_{{\mathrm{{unconstrained}}}}}}'
-        ratio = (ymaxs2[-1] - ymins2[0]) / (yorigs[1] - yorigs[0]) - 1
+        ratio = (ymaxs2[-1] - ymins2[0]) / (yorigs[-1] - yorigs[0]) - 1
         ratio = ureg.Quantity(ratio, '').to('percent')
-        label = rf'${param}\,=\,{ratio:~L.0f}$'
+        label = rf'${param}\,=\,{ratio:~L+.0f}$'
         label = re.sub(r'(?<!\\)%', r'\%', label)
         label = re.sub(r'(?<!\s)-', '{-}', label)
-        ax.format(ultitle=label, ultitle_kw={'size': 'med'})
+        color = 'red7' if ratio > 0 else 'black'
+        title_kw = {'size': 'med', 'color': color}
+        ax.format(ultitle=label, ultitle_kw=title_kw)
     return handle
 
 
@@ -2232,7 +2231,7 @@ def general_plot(
                 errdata = kw_command.get('bardata', None)
                 handle = _setup_bars(ax, args, errdata, handle, **kwarg)
             if 'scatter' in command:
-                kwarg = _pop_kwargs(kw_other.copy(), _setup_scatter)
+                kwarg = _pop_kwargs(kw_other.copy(), _setup_scatter, process_constraint)
                 oneone = oneone or kw_other.get('oneone', False)
                 handle = _setup_scatter(ax, *args, handle, **kwarg)  # noqa: E501
             if 'violin' in command:

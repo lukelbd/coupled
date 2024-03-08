@@ -776,7 +776,6 @@ def scalar_plot(data, forward=True, **kwargs):
                 ispecs.append(spec)
             rspecs.append(ispecs or [rspec])
         for cspecs, kwargs in divide_specs('col', colspecs, **kwargs):
-            # ic(rspecs, cspecs)
             result = general_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results

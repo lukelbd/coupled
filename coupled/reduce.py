@@ -722,8 +722,8 @@ def reduce_general(data, attrs=None, **kwargs):
                 ikwargs.setdefault(dim, value)
         if version.size > 1:
             experiment, region, period = ikwargs['experiment'], ikwargs['region'], ikwargs['period']  # noqa: E501
-        if experiment == 'picontrol':  # others undefined so overwrite
-            ikwargs['start'], ikwargs['stop'] = 0, 150
+        if period and 'yr' not in period and experiment == 'picontrol':
+            ikwargs['start'], ikwargs['stop'] = 0, 150  # overwrite defaults
         if period and period[0] == 'a' and period != 'ann':
             ikwargs['period'] = period[1:] if experiment == 'abrupt4xco2' else 'ann'
         if region and region[0] == 'a':  # abrupt-only region

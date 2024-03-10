@@ -31,10 +31,8 @@ REGEX_SPLIT = re.compile(  # ignore signs and use '.' instead of '*' for product
 )
 
 # Reduce labels to exclude from paths and models to exclude from dataset
-# NOTE: Went through trouble of processing these models but cannot compute cloud
-# feedbacks... would be confusing to include them in net feedback analyses but
-# exclude them from cloud feedback so skip for now. Also skip IPSL variant only
-# available from Zelinka et al. that does not have distinct control simulation.
+# NOTE: New format will prefer either 'monthly' or 'annual'. To prevent overwriting
+# old results keep 'slope' as the default (i.e. omitted) value when generating paths.
 PATHS_EXCLUDE = {
     'project': 'cmip',  # excluded from path name if explicitly passed
     'ensemble': 'flagship',
@@ -581,12 +579,10 @@ def get_heading(label, prefix=None, suffix=None):
     """
     kwargs = {}
     if '{prefix}' in label:
-        kwargs['prefix'], prefix = f'{prefix} ', None
+        kwargs['prefix'], prefix = prefix and f'{prefix} ' or '', None
     if '{suffix}' in label:
-        kwargs['suffix'], suffix = f' {suffix}', None
+        kwargs['suffix'], suffix = suffix and f' {suffix}' or '', None
     label = label.format(**kwargs)
-    if '{suffix}' in label:
-        label, suffix = label.format(suffix), None
     if prefix and not label[:2].isupper():
         label = label[:1].lower() + label[1:]
     if prefix:

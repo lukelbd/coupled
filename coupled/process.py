@@ -96,7 +96,8 @@ def equator_pole_diffusivity(self, name):  # noqa: E302
 
 
 def _get_parts(
-    name=None, parts=None, signs=None, product=None, relative=None, search=None, replace=None, absolute=None, **attrs,  # noqa: E501
+    name=None, parts=None, signs=None, product=None, relative=None,
+    search=None, replace=None, absolute=None, scaled=True, **attrs,
 ):
     """
     Get the options associated with the input name.
@@ -117,6 +118,8 @@ def _get_parts(
         The regular expressions to use to replace components.
     absolute : bool, optional
         Whether to build atmospheric feedbacks from absolute components.
+    scaled : bool, optional
+        Whether to consider sensitivity and forcing components already scaled.
     **attrs
         The attributes to optionally add to the result.
 
@@ -166,7 +169,7 @@ def _get_parts(
         parts, signs, product = (value, slope), (1, -1), (True,)
         search, replace = 'flux', 'temperature'
         attrs.update(units='K', long_name='temperature difference')
-    elif re.search(temp := r'(ecs|erf)(?:([0-9.-]+)x)?', name):
+    elif not scaled and re.search(temp := r'(ecs|erf)(?:([0-9.-]+)x)?', name):
         parts = trans(temp, r'\1')
         scale = re.search(temp, name).group(2)
         signs = (np.log2(float(scale or 4)),)  # default to 4xCO2 scale
@@ -323,7 +326,7 @@ def get_parts(dataset, name, scaled=False, **kwargs):
     if scaled and name in dataset or name in dataset.climo:
         parts, options = _get_parts(parts=[name], **kwargs)  # manual parts
     else:  # automatic parts
-        parts, options = _get_parts(name, absolute=absolute, **kwargs)
+        parts, options = _get_parts(name, scaled=scaled, absolute=absolute, **kwargs)
     if name not in dataset and name in dataset.climo:
         attrs = ('short_name', 'long_name', 'standard_units')
         attrs = {attr: getattr(vreg[name], attr) for attr in attrs}
@@ -333,13 +336,12 @@ def get_parts(dataset, name, scaled=False, **kwargs):
     results = []
     for part in parts:
         deps = VARIABLE_DEPENDENCIES.get(name, ())
-        scaled = name != 'tabs'  # whether input is scaled
-        if scaled and part in dataset:
+        if part in dataset:  # note 'tabs' not saved
             part = dataset[part]
-        elif part in dataset.climo:
+        elif part in dataset.climo:  # climopy derivation
             part = dataset.drop_vars(dataset.data_vars.keys() - set(deps))
-        elif not scaled or part != name:  # valid derivation
-            part = get_parts(dataset, part, scaled=scaled)
+        elif part != name or not scaled:  # valid derivation
+            part = get_parts(dataset, part, scaled=name != 'tabs')
         else:  # print available
             raise KeyError(f'Required variable {name} not found. Options are: {fluxes}.')  # noqa: E501
         results.append(part)

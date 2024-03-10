@@ -954,11 +954,11 @@ def parse_spec(dataset, spec, **kwargs):
     kw_process = _pop_kwargs(kw, dataset, get_result, reduce_facets)
     kw_attrs = _pop_kwargs(kw, 'short_name', 'long_name', 'standard_name', 'units')
     kw_grid = _pop_kwargs(kw, pplt.GridSpec._update_params)  # overlaps kw_figure
-    kw_command = _pop_kwargs(kw, 'cmap', 'cycle', 'extend', *settings)
     kw_figure = _pop_kwargs(kw, *keys_tight, *keys_figure, pplt.Figure._format_signature)  # noqa: E501
     kw_axes = _pop_kwargs(kw, *signatures, pplt.Figure._parse_proj)
-    kw_config = _pop_kwargs(kw, tuple(_rc_nodots))  # overlaps kw_command (see above)
     kw_other = _pop_kwargs(kw, _merge_dists, _init_command, _props_command, _setup_bars, _setup_scatter, process_constraint)  # noqa: E501
+    kw_command = _pop_kwargs(kw, 'cmap', 'cycle', 'extend', *settings)
+    kw_config = _pop_kwargs(kw, tuple(_rc_nodots))  # overlaps kw_command (see above)
     kw_guide = _pop_kwargs(kw, pplt.Axes._add_legend, pplt.Axes._add_colorbar)
     kw_legend = {**kw_guide, **_pop_kwargs(kw, 'legend', pplt.Axes._add_legend)}
     kw_colorbar = {**kw_guide, **_pop_kwargs(kw, 'colorbar', pplt.Axes._add_colorbar)}

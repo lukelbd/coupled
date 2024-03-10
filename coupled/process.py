@@ -461,7 +461,7 @@ def process_constraint(
     # TODO: Use estimates from global average model feedbacks
     from .datasets import open_scalar
     from .reduce import _get_regression
-    N = N or 1000000  # samples to draw
+    N = N or 100000  # samples to draw
     constraint = 'cre' if constraint is None or constraint is True else constraint
     historical = 23  # historical observation years
     observed = observed or historical
@@ -507,7 +507,7 @@ def process_constraint(
         mean0 = data0.mean().values
         mean1 = data1.mean().values
     else:  # include regression error
-        mscale, mdof, M = 0.15, 750, data0.size
+        mscale, mdof, M = 0.11, 1000, data0.size
         offset0 = stats.t(df=mdof, loc=0, scale=mscale).rvs((N, M))
         offset1 = stats.t(df=mdof, loc=0, scale=mscale).rvs((N, M))
         with xr.set_options(keep_attrs=True):

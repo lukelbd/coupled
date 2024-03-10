@@ -31,10 +31,8 @@ REGEX_SPLIT = re.compile(  # ignore signs and use '.' instead of '*' for product
 )
 
 # Reduce labels to exclude from paths and models to exclude from dataset
-# NOTE: Went through trouble of processing these models but cannot compute cloud
-# feedbacks... would be confusing to include them in net feedback analyses but
-# exclude them from cloud feedback so skip for now. Also skip IPSL variant only
-# available from Zelinka et al. that does not have distinct control simulation.
+# NOTE: New format will prefer either 'monthly' or 'annual'. To prevent overwriting
+# old results keep 'slope' as the default (i.e. omitted) value when generating paths.
 PATHS_EXCLUDE = {
     'project': 'cmip',  # excluded from path name if explicitly passed
     'ensemble': 'flagship',
@@ -581,12 +579,10 @@ def get_heading(label, prefix=None, suffix=None):
     """
     kwargs = {}
     if '{prefix}' in label:
-        kwargs['prefix'], prefix = f'{prefix} ', None
+        kwargs['prefix'], prefix = prefix and f'{prefix} ' or '', None
     if '{suffix}' in label:
-        kwargs['suffix'], suffix = f' {suffix}', None
+        kwargs['suffix'], suffix = suffix and f' {suffix}' or '', None
     label = label.format(**kwargs)
-    if '{suffix}' in label:
-        label, suffix = label.format(suffix), None
     if prefix and not label[:2].isupper():
         label = label[:1].lower() + label[1:]
     if prefix:
@@ -951,17 +947,18 @@ def parse_spec(dataset, spec, **kwargs):
         name, kw = spec
     kw = {**kwargs, **kw}  # prefer spec arguments
     name = name or kw.pop('name', None)  # see below
+    settings = ('c', 'lw', 'color', 'linewidth', 'color', 'facecolor', 'edgecolor')
     institute = kw.get('institute', None)
     kw.update({'weight': True, 'institute': None} if institute == 'wgt' else {})
     signatures = tuple(pplt.Axes._format_signatures.values())
     kw_process = _pop_kwargs(kw, dataset, get_result, reduce_facets)
     kw_attrs = _pop_kwargs(kw, 'short_name', 'long_name', 'standard_name', 'units')
     kw_grid = _pop_kwargs(kw, pplt.GridSpec._update_params)  # overlaps kw_figure
+    kw_command = _pop_kwargs(kw, 'cmap', 'cycle', 'extend', *settings)
     kw_figure = _pop_kwargs(kw, *keys_tight, *keys_figure, pplt.Figure._format_signature)  # noqa: E501
     kw_axes = _pop_kwargs(kw, *signatures, pplt.Figure._parse_proj)
-    kw_config = _pop_kwargs(kw, tuple(_rc_nodots))
+    kw_config = _pop_kwargs(kw, tuple(_rc_nodots))  # overlaps kw_command (see above)
     kw_other = _pop_kwargs(kw, _merge_dists, _init_command, _props_command, _setup_bars, _setup_scatter, process_constraint)  # noqa: E501
-    kw_command = _pop_kwargs(kw, 'c', 'lw', 'color', 'linewidth', 'extend')
     kw_guide = _pop_kwargs(kw, pplt.Axes._add_legend, pplt.Axes._add_colorbar)
     kw_legend = {**kw_guide, **_pop_kwargs(kw, 'legend', pplt.Axes._add_legend)}
     kw_colorbar = {**kw_guide, **_pop_kwargs(kw, 'colorbar', pplt.Axes._add_colorbar)}

@@ -809,7 +809,7 @@ def process_scalar(
                 facets = tuple(facet.replace(sub, replace) for facet in facets)
             if facets[3] not in ('picontrol', 'abrupt4xco2'):
                 continue
-            if facets[3] == 'picontrol':  # use default 'month' 'annual' 'correct'
+            if facets[3] == 'picontrol':  # use default 'annual' 'correct'
                 years = (None, 20, 50)
                 month = ('dec', 'jun')
                 anomaly = (True, False)

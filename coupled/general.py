@@ -2384,7 +2384,7 @@ def general_plot(
         for i, (unit, axs) in enumerate(groups1.items()):
             pairs = [(axis1, ax) for ax in axs]
             if oneone:  # additionally scale by other axis
-                pairs.extend((axis2, ax) for ax in groups2.get(unit, ()))
+                pairs.extend((axis2, ax) for ax in groups2.pop(unit, ()))
             lims = [getattr(ax, f'get_{axis}lim')() for axis, ax in pairs]
             span = max((lim[1] - lim[0] for lim in lims), key=abs)  # preserve sign
             mins, maxs = [], []  # min max for every axes
@@ -2400,7 +2400,7 @@ def general_plot(
                 if not identical:
                     getattr(ax, f'set_{axis}lim')((min_, max_))
             if identical and mins and maxs:
-                for ax in axs:  # identical axis limits
+                for axis, ax in pairs:
                     getattr(ax, f'set_{axis}lim')((min(mins), max(maxs)))
 
     # Optionally save the figure

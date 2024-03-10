@@ -304,9 +304,9 @@ def _get_annotations(data):
     return coords
 
 
-def _get_flagships(data):
+def _get_institutes(data):
     """
-    Get boolean flagship status for input data.
+    Get institute flagship status and model count weights.
 
     Parameters
     ----------
@@ -315,23 +315,28 @@ def _get_flagships(data):
 
     Returns
     -------
-    numpy.ndarray
-        The booleans.
+    flags : numpy.ndarray
+        The boolean flagship status.
+    wgts : numpy.ndarray
+        The model count weights.
     """
-    if 'facets' not in data.coords:
-        raise ValueError('Origin coordinate is missing.')
-    elif 'institute' in data.coords:
-        bools = [data.coords['institute'].item() == 'flagship'] * data.facets.size
-    else:
+    if 'institute' in data.coords:
+        size = data.sizes.get('facets', 1)
+        wgts = size * [1]  # used for e.g. scatter scaling
+        flags = size * [data.coords['institute'].item() == 'flagship']
+    elif 'facets' in data.coords:
+        wgts = _get_weights(data.facets.values, dim='facets')
         _, filt = _get_filters(data.facets.values, institute='flagship')
-        bools, names = [], data.indexes['facets'].names
+        flags, names = [], data.indexes['facets'].names
         if 'project' not in names and 'project' not in data.coords:
             raise ValueError('Project version is missing.')
         for facet in data.facets.values:
             if 'project' not in names:
                 facet = (data.coords['project'].item().upper(), *facet)
-            bools.append(filt(tuple(facet)))
-    return np.array(bools)
+            flags.append(filt(tuple(facet)))
+    else:
+        raise ValueError('Input data must have institute or facets coordinate.')
+    return np.array(flags), np.array(wgts)
 
 
 def _get_projects(data):
@@ -345,12 +350,12 @@ def _get_projects(data):
 
     Returns
     -------
-    numpy.ndarray
+    projects : numpy.ndarray
         The projects.
     """
     if 'project' in data.coords:  # __contains__ excludes index levels
-        project = data.coords['project'].item()
-        projects = [project] * data.sizes.get('facets', 1)
+        size = data.sizes.get('facets', 1)
+        projects = size * [data.coords['project'].item()]
     elif 'facets' in data.coords:  # infer from facets
         filt65, _ = _get_filters(data.facets.values, project='cmip65')
         filt66, _ = _get_filters(data.facets.values, project='cmip66')
@@ -557,18 +562,17 @@ def _props_command(data, cycle=None, autocolor=False):
         values = list(values)  # from arbitrary iterable
         if len(values) == 1:
             values = [values[0] for _ in range(data.size)]
-        result = [options.get(value, default) for value in values]
+        if callable(options):  # function options e.g. scatter weights
+            result = [value if value is None else options(value) for value in values]
+        else:  # dictionary options
+            result = [options.get(value, default) for value in values]
         if len(set(result)) <= 1:
             result = [default] * len(values)
         return result
     linewidth = 0.6 * pplt.rc.metawidth  # default reference bar line width
     markersize = 0.1 * pplt.rc.fontsize ** 2  # default reference scatter marker size
-    if 'facets' in data.sizes:  # others == 'model', do not want unique colors!
-        flagship = _get_flagships(data)
-        project = _get_projects(data)
-    else:
-        flagship = np.atleast_1d(data.coords.get('institute', None))
-        project = np.atleast_1d(data.coords.get('project', None))
+    flagships, weights = _get_institutes(data)  # scalar or float
+    projects = _get_projects(data)  # scalar or float
     experiment = np.atleast_1d(data.coords.get('experiment', None))
     start = np.atleast_1d(data.coords.get('start', None))
     stop = np.atleast_1d(data.coords.get('stop', None))
@@ -587,8 +591,8 @@ def _props_command(data, cycle=None, autocolor=False):
     # of None values in combination with other floats. Also np.isnan raises float
     # casting errors and 'is np.nan' can fail for some reason. So take advantage of
     # the property that np.nan != np.nan evaluates to true unlike all other objects.
-    projs = [int(opt[4] if opt and len(opt) in (5, 6) else 0) for opt in project]
-    groups = [int(opt[4:] if opt and len(opt) in (5, 6) else 0) for opt in project]
+    projs = [int(opt[4] if opt and len(opt) in (5, 6) else 0) for opt in projects]
+    groups = [int(opt[4:] if opt and len(opt) in (5, 6) else 0) for opt in projects]
     compare = any(value and value == 'abrupt4xco2' for value in experiment)
     perturbs = {'picontrol': 0, 'abrupt4xco2': 1, 'abrupt4xco2-picontrol': 1 + compare}
     perturbs = [perturbs.get(opt, 2) for opt in experiment]
@@ -613,7 +617,6 @@ def _props_command(data, cycle=None, autocolor=False):
     early = [(delta, 0, 20), (delta, 0, 50), (delta, 2, 20), (delta, 2, 50)]
     late = [(delta, 20, 150), (delta, 100, 150)]  # label as 'late' but is just control
     full = [(delta, 0, 150), (delta, 2, 150)]
-    sizes = {False: 0.50 * markersize, True: 1.5 * markersize}  # institute
     edge1 = {key: 'gray3' for key in early}  # early groups
     edge2 = {key: 'gray9' for key in (*late, *full)}
     hatch0 = {key: 'xxxxxx' for key in control}  # unperturbed
@@ -623,7 +626,8 @@ def _props_command(data, cycle=None, autocolor=False):
     alpha, alphas = projs, {5: 0.3}  # default alpha
     edge, edges = groups, {66: 'gray3'}  # default edges
     hatch, hatches = groups, {66: 'xxxxxx'}  # default hatches
-    fade, fades = flagship, {False: 0.85, True: 1}  # flagship status
+    fade, fades = flagships, {False: 0.85, True: 1}  # flagship status
+    size, sizes = weights, lambda wgt: 1.5 * (wgt ** 2)
     # hatch0 = {key: 'xxxxxx' for key in control}  # alternative
     # hatch1 = {key: 'xxxxxx' for key in early}
     # hatch2 = {key: 'xxx' for key in (*late, *full)}
@@ -664,7 +668,7 @@ def _props_command(data, cycle=None, autocolor=False):
     colors = _get_lists(color, colors, default=None)
     edges = _get_lists(edge, edges, default='black')
     hatches = _get_lists(hatch, hatches, default=None)
-    sizes = _get_lists(fade, sizes, default=markersize)
+    sizes = _get_lists(size, sizes, default=markersize)
     alphas = _get_lists(alpha, alphas, default=1.0)
     fades = _get_lists(fade, fades, default=1.0)
     alphas = [a - (1 - f) * a ** 0.1 for a, f in zip(alphas, fades)]

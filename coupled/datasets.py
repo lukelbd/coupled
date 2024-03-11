@@ -161,6 +161,8 @@ def open_scalar(path=None, ceres=False):
     names = [key for key, coord in data.coords.items() if coord.dims == ('version',)]
     if names:  # version levels
         data = data.set_index(version=names)
+    if 'statistic' in data.coords:  # prevent statistic='mean' climopy reduce capture
+        data = data.assign_coords(statistic=data.statistic.str.replace('mean', 'slope'))
     return data
 
 

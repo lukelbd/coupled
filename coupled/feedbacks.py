@@ -752,7 +752,7 @@ def process_scalar(
     # NOTE: This is used to get mean and internal variability estimates for use with
     # tables and eventual emergent constraints. Includes different estimates.
     from observed.feedbacks import _parse_kwargs, process_scalar
-    _, params, constraints = _parse_kwargs('source', **kwargs)  # skip 'source'
+    params, _, constraints = _parse_kwargs('source', **kwargs)  # skip 'source'
     constraints['variable'] = 'fluxes'
     defaults = ('net', 'sw', 'lw', 'cre', 'swcre', 'lwcre', 'cs', 'swcs', 'lwcs')
     correct = constraints.pop('correct', None)
@@ -797,6 +797,7 @@ def process_scalar(
         if database:
             print('Model:', end=' ')
         for facets, data in database.items():
+            # Initial stuff
             paths = [
                 path for paths in data.values() for path in paths
                 if path.stem.split('_')[-1].split('-') == suffix
@@ -809,6 +810,7 @@ def process_scalar(
                 facets = tuple(facet.replace(sub, replace) for facet in facets)
             if facets[3] not in ('picontrol', 'abrupt4xco2'):
                 continue
+            # Load flux time series
             if facets[3] == 'picontrol':  # use default 'annual' 'correct'
                 years = (None, 20, 50)
                 month = ('dec', 'jun')
@@ -826,13 +828,16 @@ def process_scalar(
             start = series.time.dt.strftime('%b').values[0].lower()
             fluxes = _find_dependencies(series, inames)  # 'name': [*dependencies]
             retain = {'ts', *(key for keys in fluxes.values() for key in keys)}
-            print(f'{facets[2]}_{facets[3]}_{start} ({len(fluxes)})', end=' ')
             series = series.drop_vars(series.keys() - retain)
+            # Calculate feedback parameters
+            print(f'{facets[2]}_{facets[3]}_{start} ({len(fluxes)})', end=' ')
             series = series.climo.add_cell_measures()
             series = xr.Dataset({name: data.climo.average('area') for name, data in series.items()})  # noqa: E501
-            result = process_scalar(series, name=tuple(fluxes), **iparams, **kwargs)
+            source = paths[0].stem.split('-')[-2]
+            kw_process = {'name': tuple(fluxes), 'source': source, **iparams, **kwargs}
+            result = process_scalar(series, **kw_process)
             levels = ('experiment', 'ensemble', *result.indexes['version'].names)
-            version = [(*facets[3:], *index) for index in result.version.values]
+            version = [(*facets[-2:], *index) for index in result.version.values]
             version = xr.DataArray(
                 pd.MultiIndex.from_tuples(version, names=levels),
                 dims='version',

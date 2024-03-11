@@ -320,22 +320,19 @@ def _get_institutes(data):
     wgts : numpy.ndarray
         The model count weights.
     """
-    if 'institute' in data.coords:
-        size = data.sizes.get('facets', 1)
-        wgts = size * [1]  # used for e.g. scatter scaling
-        flags = size * [data.coords['institute'].item() == 'flagship']
-    elif 'facets' in data.coords:
-        wgts = _get_weights(data.facets.values, dim='facets')
+    if 'facets' in data.coords:
+        wgts = _get_weights(data, dim='facets')
         _, filt = _get_filters(data.facets.values, institute='flagship')
         flags, names = [], data.indexes['facets'].names
-        if 'project' not in names and 'project' not in data.coords:
-            raise ValueError('Project version is missing.')
         for facet in data.facets.values:
             if 'project' not in names:
                 facet = (data.coords['project'].item().upper(), *facet)
             flags.append(filt(tuple(facet)))
-    else:
-        raise ValueError('Input data must have institute or facets coordinate.')
+    else:  # e.g. scalar 'institute' or vector 'components'
+        size = data.sizes.get('facets', 1)
+        coord = data.coords.get('institute', np.array([None]))
+        wgts = size * [1]  # used for e.g. scatter scaling
+        flags = size * [coord.item() == 'flagship'] if coord.size == 1 else coord.values
     return np.array(flags), np.array(wgts)
 
 
@@ -353,18 +350,17 @@ def _get_projects(data):
     projects : numpy.ndarray
         The projects.
     """
-    if 'project' in data.coords:  # __contains__ excludes index levels
-        size = data.sizes.get('facets', 1)
-        projects = size * [data.coords['project'].item()]
-    elif 'facets' in data.coords:  # infer from facets
+    if 'facets' in data.coords:  # infer from facets
         filt65, _ = _get_filters(data.facets.values, project='cmip65')
         filt66, _ = _get_filters(data.facets.values, project='cmip66')
         projects = [
             'cmip66' if filt66(facet) else 'cmip65' if filt65(facet) else 'cmip5'
             for facet in data.facets.values
         ]
-    else:
-        raise TypeError('Input data must have project or facets coordinate.')
+    else:  # e.g. scalar 'project' or vector 'components'
+        size = data.sizes.get('facets', 1)
+        coord = data.coords.get('project', np.array([None]))
+        projects = size * [coord.item()] if coord.size == 1 else coord.values
     return np.array(projects)
 
 
@@ -627,7 +623,7 @@ def _props_command(data, cycle=None, autocolor=False):
     edge, edges = groups, {66: 'gray3'}  # default edges
     hatch, hatches = groups, {66: 'xxxxxx'}  # default hatches
     fade, fades = flagships, {False: 0.85, True: 1}  # flagship status
-    size, sizes = weights, lambda wgt: 1.5 * (wgt ** 2)
+    size, sizes = weights, lambda wgt: 1.2 * markersize * (wgt / np.mean(weights))
     # hatch0 = {key: 'xxxxxx' for key in control}  # alternative
     # hatch1 = {key: 'xxxxxx' for key in early}
     # hatch2 = {key: 'xxx' for key in (*late, *full)}
@@ -1025,7 +1021,7 @@ def _merge_dists(
             data_lower1, data_lower2 = data_lower.values.flat
             data_upper1, data_upper2 = data_upper.values.flat
             rsq = ureg.Quantity(rsq.item(), '').to('percent')
-            annotation = f'${rsq:~L.0f}$'.replace('%', r'\%').replace(r'\ ', '')
+            annotation = f'${rsq:~L.0f}$'.replace(r'\ ', '')
             # annotation = f'${corr.item():.2f}$'  # latex for long dash minus sign
             args.append(data)
             boxdata.append([data_lower1, data_upper1])

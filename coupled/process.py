@@ -23,26 +23,6 @@ from .specs import _expand_lists, _expand_parts, _group_parts, _pop_kwargs
 __all__ = ['get_parts', 'get_result', 'process_constraint', 'process_data']
 
 
-# Model-estimated bootstrapped uncertainty (see _calc_bootstrap)
-# TODO: Record degrees of freedom and autocorrelation across successive bootstrap
-# feedback estimates (e.g. year 0-20 estimate will be related to year 5-25). For now
-# just assume implied distribution is Gaussian in process_constraint() below.
-# NOTE: Include bootstraps longer than observational record so that we can
-# test what uncertainty *would be* if input observed feedback was calculated
-# from longer record. Will also adjust dof on regression estimate uncertainty.
-INTERNAL_UNCERTAINTY = {
-    'cld': {20: np.nan, 40: np.nan, 60: np.nan},
-    'net': {20: 0.38, 40: 0.22, 50: 0.19, 60: 0.13},
-    'cs': {20: 0.24, 40: 0.15, 50: 0.13, 60: 0.10},
-    'cre': {20: 0.31, 40: 0.20, 50: 0.18, 60: 0.12},
-    'lw': {20: 0.24, 40: 0.15, 50: 0.15, 60: 0.10},
-    'lwcs': {20: 0.13, 40: 0.07, 50: 0.07, 60: 0.05},
-    'lwcre': {20: 0.15, 40: 0.10, 50: 0.09, 60: 0.07},
-    'sw': {20: 0.32, 40: 0.19, 50: 0.17, 60: 0.13},
-    'swcs': {20: 0.17, 40: 0.11, 50: 0.10, 60: 0.08},
-    'swcre': {20: 0.35, 40: 0.21, 50: 0.18, 60: 0.14},
-}
-
 # Variable dependencies
 # TODO: Instead improve climopy algorithm to only return derivations or
 # transformations if dependent variables exist in the dataset.
@@ -65,8 +45,8 @@ VARIABLE_DEPENDENCIES = {
 }
 
 # Variable derivations
-# NOTE: See timescales definitions.py (eventually will be copied to climopy)
-# TODO: Use this approach for flux addition terms and other stuff
+# TODO: See timescales definitions.py (eventually will be copied to climopy). Should
+# also use this approach for flux addition terms and other stuff.
 def equator_pole_delta(self, name):  # noqa: E302
     temp, _ = name.split('_')
     temp = self[temp]  # also quantifies
@@ -470,20 +450,19 @@ def process_constraint(
     internal = observed if internal is None or internal is True else internal
     pctile = 95 if pctile is None or pctile is True else pctile
     pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
-    keys = ('style',)  # TODO: use global dataset
-    process_kw = {key: data0.coords[key].item() for key in keys if key in data0.coords}
-    process_kw.update(constraint_kw or {})
+    keys = ('style', 'start', 'detrend', 'remove', 'correct')
+    observed_kw = {key: data0.coords[key].item() for key in keys if key in data0.coords}
+    observed_kw.update(constraint_kw or {})
+    observed_kw.update(statistic=['slope', 'sigma', 'dof'])
     if isinstance(constraint, str):  # TODO: use generalized estimates
         scalar = open_scalar(ceres=True)
-        scalar = get_result(scalar, constraint, **process_kw)
-        scalar = scalar.sel(statistic=['mean', 'sigma', 'dof'])
+        ic(scalar, observed_kw)
+        scalar = get_result(scalar, constraint, **observed_kw)
         constraint = scalar.values.tolist()
-    if internal is not False:
-        raise NotImplementedError
-        # internal = INTERNAL_UNCERTAINTY[name][internal]
-        # xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
-        # es = stats.norm(loc=0, scale=internal).rvs(N)  # implied variability error
-        # observations = np.insert(np.percentile(xs + es, pctile), 1, observations)
+    if not np.iterable(constraint) or len(constraint) != 3:
+        raise ValueError(f'Invalid constraint {constraint}. Must be (slope, sigma, dof).')  # noqa: E501
+    if data0.ndim != 1 or data1.ndim != 1:
+        raise ValueError(f'Invalid data dims {data0.ndim} and {data1.ndim}. Must be 1D.')  # noqa: E501
 
     # Get observational and regression estimates
     # NOTE: Use N - 2 degrees of freedom for both observed feedback and inter-model
@@ -491,12 +470,7 @@ def process_constraint(
     # of individual feedback regressions that comprise inter-model regression because
     # their sample sizes are larger (150 years) and uncertainties are uncorrelated so
     # should roughly cancel out across e.g. 30 members of ensemble.
-    if not np.iterable(constraint) or len(constraint) != 3:
-        raise ValueError(f'Invalid constraint {constraint}. Must be (mean, sigma, dof).')  # noqa: E501
-    if data0.ndim != 1 or data1.ndim != 1:
-        raise ValueError(f'Invalid data dims {data0.ndim} and {data1.ndim}. Must be 1D.')  # noqa: E501
     xmean, xscale, xdof = constraint  # note dof will have small effect
-    nbounds = 1 if internal is None else 2  # number of bounds returned
     xdof *= observed / historical  # increased degrees of freedom
     xscale /= np.sqrt(observed / historical)  # reduced regression error
     xmin, xmax = stats.t(df=xdof, loc=xmean, scale=xscale).ppf(0.01 * pctile)
@@ -504,6 +478,16 @@ def process_constraint(
     idxs = data0.argsort().values  # critical so 'fit' has same coordinates
     data0 = data0.isel({data0.dims[0]: idxs})
     data1 = data1.isel({data0.dims[0]: idxs})
+    nbounds = 1 if internal is None else 2  # number of bounds returned
+    internal_kw = observed_kw.copy()
+    internal_kw.update(statistic='sigma')
+    if internal is not False:
+        scalar = open_scalar(ceres=False)
+        scalar = get_result(scalar, constraint, **internal_kw)
+        internal = scalar.values.item()
+        xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
+        es = stats.norm(loc=0, scale=internal).rvs(N)  # implied variability error
+        observations = np.insert(np.percentile(xs + es, pctile), 1, observations)
     if not perturb:  # TODO: load values from file
         bmean = None
         mean0 = data0.mean().values

@@ -4,6 +4,7 @@ Utilities for reducing coupled model data coordinates.
 """
 import functools
 import re
+import warnings
 
 import cftime
 import climopy as climo  # noqa: F401
@@ -22,6 +23,7 @@ __all__ = ['reduce_facets', 'reduce_general']
 # NOTE: Default 'style' depends on styles present and may be overwritten, and default
 # 'time' can be overwritten by None (see below). See also PATHS_IGNORE in specs.py.
 REDUCE_DEFAULTS = {
+    'statistic': 'slope',
     'experiment': 'picontrol',  # possibly overwritten
     'ensemble': 'flagship',
     'period': 'ann',
@@ -87,7 +89,10 @@ def _get_weights(data, dim=None):
     ignore = list({'model', 'ensemble'} & set(index.names))
     groups = coord.reset_index(ignore, drop=True)
     groups = groups.coords[dim]  # values on data array unchanged
-    wgts = wgts.groupby(groups) / wgts.groupby(groups).sum()
+    groups = groups.assign_coords(facets=coord)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        wgts = wgts.groupby(groups) / wgts.groupby(groups).sum()
     return wgts
 
 
@@ -704,12 +709,14 @@ def reduce_general(data, attrs=None, **kwargs):
         # except for time=None used as placeholder to prevent time averaging.
         ikwargs, defaults = kwargs.copy(), REDUCE_DEFAULTS.copy()
         version = data.indexes.get('version', pd.Index([]))
+        facets = data.indexes.get('facets', pd.Index([]))
         abrupt = (ikwargs.get('experiment', None) or 'abrupt4xco2') == 'abrupt4xco2'
         external = ikwargs.get('source', None) in ('zelinka', 'geoffroy', 'forster')
         experiment = region = period = None  # see below
+        ic(facets, version)
         if version.size > 1:
             defaults['experiment'] = 'abrupt4xco2'
-        if 'period' in version.names:
+        if 'start' in version.names or 'period' in version.names:
             defaults['start'], defaults['period'] = 'mar', '23yr'
         elif abrupt or external:
             defaults['style'] = 'annual'

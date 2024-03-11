@@ -713,11 +713,10 @@ def reduce_general(data, attrs=None, **kwargs):
         abrupt = (ikwargs.get('experiment', None) or 'abrupt4xco2') == 'abrupt4xco2'
         external = ikwargs.get('source', None) in ('zelinka', 'geoffroy', 'forster')
         experiment = region = period = None  # see below
-        ic(facets, version)
         if version.size > 1:
             defaults['experiment'] = 'abrupt4xco2'
-        if 'start' in version.names or 'period' in version.names:
-            defaults['start'], defaults['period'] = 'mar', '23yr'
+        if 'initial' in version.names or 'period' in version.names:
+            defaults['initial'], defaults['period'] = 'mar', '23yr'
         elif abrupt or external:
             defaults['style'] = 'annual'
         if 'startstop' in ikwargs:

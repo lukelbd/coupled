@@ -63,6 +63,11 @@ ORDER_LOGICAL = (
     'stop',
     'region',  # special coordinates
     'period',
+    'initial',
+    'remove',
+    'detrend',
+    'error',
+    'correct',
     'season',
     'month',
     'time',  # space and time
@@ -74,6 +79,8 @@ ORDER_LOGICAL = (
     'spatial',  # always at the end
 )
 ORDER_READABLE = (
+    'error',  # scalar coordinates
+    'correct',
     'facets',  # model facets information
     'project',
     'institute',
@@ -85,6 +92,9 @@ ORDER_READABLE = (
     'plev',
     'time',
     'period',  # NOTE: this is outdated
+    'initial',
+    'remove',
+    'detrend',
     'season',
     'month',
     'startstop',
@@ -148,6 +158,23 @@ GENERAL_LABELS = {
     ('spatial', 'corr'): 'spatial correlation',
     ('spatial', 'cov'): 'spatial covariance',
     ('spatial', 'rsq'): 'spatial variance explained',
+    ('initial', 'init'): None,
+    ('initial', 'jan'): None,
+    ('period', 'full'): None,
+    ('period', '20yr'): None,
+    ('period', '50yr'): None,
+    ('remove', 'climate'): None,
+    ('remove', 'average'): None,
+    ('detrend', ''): None,
+    ('detrend', 'x'): '$T$-detrended',
+    ('detrend', 'y'): '$R$-detrended',
+    ('detrend', 'xy'): 'detrended',
+    ('error', 'regression'): None,
+    ('error', 'internal'): 'internal',
+    ('correct', ''): None,
+    ('correct', 'x'): None,
+    ('correct', 'y'): None,
+    ('correct', 'r'): None,
     ('plev', 'int'): None,
     ('plev', 'avg'): 'column',
     ('area', None): 'local',  # only used with identical=False
@@ -204,6 +231,19 @@ GENERAL_PATHS = {
     ('region', 'alatitude'): 'alat',
     ('region', 'ahemisphere'): 'ahemi',
     ('region', 'aglobe'): 'aglobe',
+    ('initial', 'init'): None,
+    ('remove', 'climate'): 'clim',
+    ('remove', 'average'): None,
+    ('detrend', ''): 'raw',
+    ('detrend', 'x'): 'rawy',
+    ('detrend', 'y'): 'rawx',
+    ('detrend', 'xy'): None,
+    ('error', 'regression'): None,
+    ('error', 'internal'): 'int',
+    ('correct', ''): None,
+    ('correct', 'x'): 'adjx',
+    ('correct', 'y'): 'adjy',
+    ('correct', 'r'): 'adj',
     ('plev', 'avg'): 'avg',  # always report
     ('volume', 'avg'): 'avg',  # always report
     ('area', 'avg'): 'avg',  # always report
@@ -258,12 +298,12 @@ PERIOD_SHORTS = {
 }
 PERIOD_LONGS = {
     (key, value): label
-    for key in ('period', 'season')
+    for key in ('initial', 'period', 'season', 'month')
     for value, label in PERIOD_LONGS.items()
 }
 PERIOD_SHORTS = {
     (key, value): label
-    for key in ('period', 'season')
+    for key in ('initial', 'period', 'season', 'month')
     for value, label in PERIOD_SHORTS.items()
 }
 
@@ -316,19 +356,20 @@ INSTITUTE_LONGS = {
 }
 
 # Combine translation dictionaries
+# NOTE: Put period first so e.g. (initial, jan): None can override month name.
 TRANSLATE_PATHS = {
     **GENERAL_PATHS,
     **INSTITUTE_PATHS,
 }
 TRANSLATE_SHORTS = {
+    **PERIOD_SHORTS,
     **GENERAL_LABELS,
     **INSTITUTE_SHORTS,
-    **PERIOD_SHORTS,
 }
 TRANSLATE_LONGS = {
+    **PERIOD_LONGS,
     **GENERAL_LABELS,
     **INSTITUTE_LONGS,
-    **PERIOD_LONGS,
 }
 
 
@@ -377,7 +418,7 @@ def _expand_lists(*args):
     args = list(args)  # modifable
     if len(length) > 1:
         values = '\n'.join(f'{len(arg)}: {arg!r}' for arg in args)
-        raise ValueError(f'Incompatible mixed lengths {lengths} for values\n{values}.')
+        raise ValueError(f'Mixed lengths {lengths} for values\n{values}.')
     length = length.pop() if length else None
     for i, items in enumerate(args):
         if length and len(items) == 1:
@@ -769,10 +810,11 @@ def get_labels(
     # NOTE: For grid labels use intersection of identifiers with same number of
     # arguments. Common to have e.g. x vs. y and then just plot x or y as a
     # reference but the former is the relevant information for labels.
-    from .reduce import reduce_facets
+    from .reduce import reduce_facets, _reduce_data, _reduce_datas
     from .process import get_result
-    kws_infer = []
+    reduces = (get_result, reduce_facets, _reduce_data, _reduce_datas)
     spatial = invert = False
+    kws_infer = []
     for ikws_process in kws_process:
         if not isinstance(ikws_process, list):
             ikws_process = [ikws_process]
@@ -811,7 +853,7 @@ def get_labels(
             for kw_infer in nkws_infer:  # iterate over arguments inside subplot
                 kw_label, kw_infer = {}, _group_parts(kw_infer)
                 for key, value in kw_infer.items():  # get individual label
-                    if _pop_kwargs({key: value}, reduce_facets, get_result):
+                    if _pop_kwargs({key: value}, *reduces):
                         continue
                     if skip_name and key in ('name', 'spatial'):
                         continue
@@ -934,7 +976,7 @@ def parse_spec(dataset, spec, **kwargs):
     # have process.py ignore them when version is not present.
     from .general import _merge_dists, _init_command, _props_command, _setup_bars, _setup_scatter  # noqa: E501
     from .process import get_result, process_constraint
-    from .reduce import reduce_facets
+    from .reduce import reduce_facets, _reduce_data, _reduce_datas
     keys_figure = [k + s for k in ('', 'ax', 'ref', 'fig') for s in ('', 'num', 'width', 'height', 'aspect')]  # noqa: E501
     keys_tight = [k + s for k in ('span', 'share', 'align') for s in ('', 'x', 'y')]
     if spec is None:
@@ -947,11 +989,11 @@ def parse_spec(dataset, spec, **kwargs):
         name, kw = spec
     kw = {**kwargs, **kw}  # prefer spec arguments
     name = name or kw.pop('name', None)  # see below
-    settings = ('c', 'lw', 'color', 'linewidth', 'color', 'facecolor', 'edgecolor')
+    settings = ('c', 'lw', 'color', 'linewidth', 'color', 'facecolor', 'edgecolor', 'a', 'alpha')  # noqa: E501
     institute = kw.get('institute', None)
-    kw.update({'weight': True, 'institute': None} if institute == 'wgt' else {})
+    kw.update({'institute': None} if institute == 'wgt' else {})
     signatures = tuple(pplt.Axes._format_signatures.values())
-    kw_process = _pop_kwargs(kw, dataset, get_result, reduce_facets)
+    kw_process = _pop_kwargs(kw, dataset, get_result, reduce_facets, _reduce_data, _reduce_datas)  # noqa: E501
     kw_attrs = _pop_kwargs(kw, 'short_name', 'long_name', 'standard_name', 'units')
     kw_grid = _pop_kwargs(kw, pplt.GridSpec._update_params)  # overlaps kw_figure
     kw_figure = _pop_kwargs(kw, *keys_tight, *keys_figure, pplt.Figure._format_signature)  # noqa: E501
@@ -965,8 +1007,12 @@ def parse_spec(dataset, spec, **kwargs):
     kw_axes.update(kw_config)  # configuration settings
     kw_figure.update(kw_config)  # configuration settings
     kw_command.update(kw)  # unknown kwargs passed to command
+    if institute == 'wgt':
+        kw_other['weight'] = kw_process['weight'] = True
     if name is not None:
         kw_process['name'] = name
+    if 'width' in kw_figure:  # bar widths
+        kw_command['width'] = kw_figure.pop('width')
     if 'colorbar' in kw_colorbar:  # colorbar location, or use 'loc' for both
         kw_colorbar['loc'] = kw_colorbar.pop('colorbar')
     if 'legend' in kw_legend:  # legend location, or use 'loc' for both

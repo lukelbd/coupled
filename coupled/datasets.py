@@ -143,18 +143,27 @@ def open_scalar(path=None, ceres=False):
     ceres : bool, optional
         Whether to load global CERES or CMIP feedbacks.
     """
+    from .feedbacks import _update_attrs
     source = 'CERES' if ceres else 'CMIP'
     base = Path('~/data/global-feedbacks').expanduser()
-    file = f'feedbacks_{source}_global.nc'
+    file = f'feedbacks_{source}*_global.nc'
     if isinstance(path, str) and '/' not in path:
         path = base / path
     elif path:
         path = Path(path).expanduser()
     if not path:
-        path = base / file
+        paths = tuple(base.glob(file))
     elif not path.suffix:
-        path = path / file
-    data = xr.open_dataset(path)
+        paths = tuple(path.glob(file))
+    else:  # output
+        paths = (path,)
+    datas = tuple(xr.open_dataset(path) for path in paths)
+    if len(datas) == 1:  # e.g. ceres dataset
+        data = datas[0]
+    else:  # e.g. cmip5 and cmip6 datasets (list needed)
+        data = xr.combine_nested(list(datas), 'facets')
+    if 'period' in data.coords:
+        data = data.assign_coords(period=data.period.str.replace('150yr', 'full'))
     names = [key for key, coord in data.coords.items() if coord.dims == ('facets',)]
     if names:  # facet levels
         data = data.set_index(facets=names)
@@ -163,6 +172,7 @@ def open_scalar(path=None, ceres=False):
         data = data.set_index(version=names)
     if 'statistic' in data.coords:  # prevent statistic='mean' climopy reduce capture
         data = data.assign_coords(statistic=data.statistic.str.replace('mean', 'slope'))
+    data = _update_attrs(data)
     return data
 
 

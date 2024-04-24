@@ -17,22 +17,42 @@ from icecream import ic  # noqa: F401
 
 from .specs import ORDER_LOGICAL, INSTITUTE_LABELS
 
-__all__ = ['reduce_facets', 'reduce_general']
+__all__ = ['reduce_time', 'reduce_facets', 'reduce_general']
 
-# Reduction defaults
+# Coordinate reduction defaults
 # NOTE: Default 'style' depends on styles present and may be overwritten, and default
 # 'time' can be overwritten by None (see below). See also PATHS_IGNORE in specs.py.
-REDUCE_DEFAULTS = {
+GENERAL_DEFAULTS = {
     'statistic': 'slope',
     'experiment': 'picontrol',  # possibly overwritten
     'ensemble': 'flagship',
-    'period': 'ann',
     'time': 'avg',
     'source': 'eraint',
     'style': 'monthly',  # possibly overwritten
     'start': 0,
     'stop': 150,
     'region': 'globe',
+}
+RESPONSE_DEFAULTS = {
+    'period': 'full',
+    'initial': 'jan',
+    'style': 'annual',
+    'remove': 'climate',
+    'detrend': '',
+    'correct': 'r',
+}
+SCALAR_DEFAULTS = {
+    'period': 'full',  # includes 150-year control
+    'initial': 'jan',  # should be 'jan' in future
+    'remove': 'average',
+    'detrend': 'xy',
+    'error': 'regression',
+    'correct': 'r',
+}
+OBSERVED_DEFAULTS = {
+    'source': 'hadcrut',
+    'period': '2000-2024',
+    'initial': 'jan',
     'remove': 'average',
     'detrend': 'xy',
     'correct': 'r',
@@ -176,48 +196,6 @@ def _get_composite(data0, data1, pctile=None, dim='facets'):
     return data_lo, data_hi
 
 
-def _get_datetime(data, time=None, season=None, month=None):
-    """
-    Reduce the time coordinate of the data using variety of operators.
-
-    Parameters
-    ----------
-    data : xarray.DataArray or xarray.Dataset
-        The input data.
-    time, season, month : optional
-        The time coordinate or ``'avg'`` instruction.
-
-    Returns
-    -------
-    data : xarray.Dataset or xarray.DataArray
-        The reduced data.
-    """
-    if 'time' not in data.dims:
-        return data
-    if season is not None:
-        seasons = data.time.dt.season.str.lower()
-        data = data.isel(time=(seasons == season.lower()))
-    elif isinstance(month, str):
-        months = data.time.dt.strftime('%b').str.lower()
-        data = data.isel(time=(months == month.lower()))
-    elif month is not None:
-        months = data.time.dt.month
-        data = data.isel(time=(months == month))
-    elif not isinstance(time, str) and time is not None and time is not False:
-        time = time  # NOTE: above respects user-input 'None'
-        data = data.sel(time=time, method='nearest')
-    elif isinstance(time, str) and time != 'avg':
-        time = cftime.datetime.strptime(time, '%Y-%m-%d')  # cftime 1.6.2
-        data = data.sel(time=time, method='nearest')
-    elif isinstance(time, str) and time == 'avg':
-        days = data.time.dt.days_in_month.astype(data.dtype)
-        with xr.set_options(keep_attrs=True):  # average over entire record
-            data = (data * days).sum('time', skipna=False) / days.sum()
-    elif time is not None:
-        raise ValueError(f'Unknown time reduction method {time!r}.')
-    return data
-
-
 def _get_filters(facets, project=None, institute=None):
     """
     Return plot labels and facet filter for the project indicator.
@@ -306,7 +284,74 @@ def _get_filters(facets, project=None, institute=None):
     return proj, inst
 
 
-def _reduce_data(data, method, dim=None, pctile=None, std=None, preserve=True):
+def _fill_kwargs(data, **kwargs):
+    """
+    Return default keyword arguments given the input data.
+
+    Parameters
+    ----------
+    dataset : xarray.Dataset or xarray.DataArray
+        The input dataset.
+    **kwargs : optional
+        The reduction instructions.
+
+    Returns
+    -------
+    kwargs : dict
+        The keyword arguments with defaults applied.
+    """
+    # Apply default reduce instructions
+    # NOTE: None is automatically replaced with default values (e.g. period=None)
+    # except for time=None used as placeholder to prevent time averaging.
+    version = data.indexes.get('version', pd.Index([]))
+    facets = data.indexes.get('facets', pd.Index([]))
+    feedbacks = version.size > 1  # feedback datasets
+    coupled = facets.size > 1  # coupled model dataset
+    coupled1 = 'experiment' in facets.names  # general coupled model data
+    coupled2 = 'experiment' in version.names  # scalar feedback model data
+    external = kwargs.get('source', None) in ('zelinka', 'geoffroy', 'forster')
+    response = kwargs.get('experiment', None) in (None, 'abrupt4xco2')
+    experiment = region = period = None  # see below
+    defaults = GENERAL_DEFAULTS.copy()
+    if 'initial' in version.names:  # scalar models or observations
+        defaults.update(SCALAR_DEFAULTS)
+    if (coupled1 or coupled2) and (response or external):  # abrupt response
+        defaults.update(RESPONSE_DEFAULTS)
+    if not coupled1 and not coupled2:  # scalar observations
+        defaults.update(OBSERVED_DEFAULTS)
+    if coupled1 and not coupled2 and 'period' in version.names:  # outdated format
+        defaults.update(period='ann')  # select coord made by average_periods()
+    if coupled and feedbacks and response:
+        defaults.update(initial='init', experiment='abrupt4xco2')
+    if 'startstop' in kwargs:
+        kwargs['start'], kwargs['stop'] = kwargs.pop('startstop')
+    for dim, value in defaults.items():
+        if dim in kwargs and kwargs[dim] is None and dim != 'time':
+            kwargs[dim] = value  # typically use 'None' as default placeholder
+        else:  # for 'time' use 'None' to bypass operation
+            kwargs.setdefault(dim, value)
+    if coupled and feedbacks:
+        experiment, region, period = map(kwargs.get, ('experiment', 'region', 'period'))
+    if coupled and feedbacks:
+        start, stop, period = map(kwargs.get, ('start', 'stop', 'period'))
+    if coupled and (coupled1 or coupled2) and 'control' in experiment:
+        kwargs['start'], kwargs['stop'] = 0, 150  # overwrite defaults
+    if response and coupled2 and (start, stop) == (0, 20):
+        kwargs['period'] = 'early'
+    if response and coupled2 and (start, stop) == (20, 150):
+        kwargs['period'] = 'late'
+    if coupled1 and not coupled2 and period and period[0] == 'a' and period != 'ann':
+        kwargs['period'] = period[1:] if response else 'ann'  # abrupt-only period
+    if data.name in ('tpat', 'tstd', 'tdev', 'tabs'):
+        kwargs['region'] = 'globe'  # others undeined
+    if coupled and region and region[0] == 'a':
+        kwargs['region'] = region[1:] if response else 'globe'  # abrupt-only region
+    return kwargs
+
+
+def _reduce_data(
+    data, method, dim=None, weight=None, pctile=None, std=None, preserve=True,
+):
     """
     Reduce individual data array using arbitrary method.
 
@@ -318,6 +363,8 @@ def _reduce_data(data, method, dim=None, pctile=None, std=None, preserve=True):
         The reduction method (see `reduce_facets`).
     dim : str, optional
         The reduction dimension. Default is the first dimension.
+    weight : bool, optional
+        Whether to weight by institute counts.
 
     Other Parameters
     ----------------
@@ -350,10 +397,11 @@ def _reduce_data(data, method, dim=None, pctile=None, std=None, preserve=True):
     # and 'fadedata' arrays from the input arguments. Note resulting percentiles will
     # only be an approximation to some actual Monte Carlo sampled difference of
     # t-distributions. See: https://en.wikipedia.org/wiki/Variance#Propertieswill
-    pctile = None if pctile is False else pctile
-    pctile = True if method == 'pctile' and pctile is None else pctile
-    pctile = (80, 80)[method == 'pctile'] if pctile is True else pctile
+    pctile = None if pctile is False else pctile  # see below
+    pctile = 80 if pctile is True else pctile  # same for both
     pctile = np.atleast_1d(pctile) if pctile is not None else pctile
+    bnds = 80 if pctile is None or pctile.size != 1 else pctile.item()
+    bnds = 0.01 * np.array([50 - 0.5 * bnds, 50 + 0.5 * bnds])
     std = None if std is False else std
     std = True if method == 'std' and std is None else std
     std = (1, 1)[method == 'std'] if std is True else std
@@ -363,6 +411,12 @@ def _reduce_data(data, method, dim=None, pctile=None, std=None, preserve=True):
     name = data.name
     dim = dim or data.dims[0]
     kwargs = {'dim': dim, 'skipna': False}
+    if not weight:
+        wgts = xr.ones_like(data.coords[dim], dtype=float)
+    elif dim == 'facets':
+        wgts = _get_weights(data, dim=dim)
+    else:
+        raise TypeError(f'Invalid option {weight=} for regression dimension {dim!r}.')
     if method == 'dist':  # bars or boxes
         if data.ndim > 1:
             raise ValueError(f'Invalid dimensionality {data.ndim!r} for distribution.')
@@ -370,38 +424,36 @@ def _reduce_data(data, method, dim=None, pctile=None, std=None, preserve=True):
         name = None
     elif method == 'std':
         with xr.set_options(keep_attrs=True):  # note name is already kept
-            std = std.item()
-            result = std * data.std(**kwargs)
+            result = std.item() * data.weighted(wgts).std(**kwargs)
         short = f'{data.short_name} spread'
         long = f'{data.long_name} standard deviation'
     elif method == 'var':
         with xr.set_options(keep_attrs=True):  # note name is already kept
-            result = data.var(**kwargs)
+            result = data.weighted(wgts).var(**kwargs)
         data.attrs['units'] = f'({data.units})^2'
         short = f'{data.short_name} variance'
         long = f'{data.long_name} variance'
     elif method == 'skew':  # see: https://stackoverflow.com/a/71149901/4970632
         with xr.set_options(keep_attrs=True):
-            result = data.reduce(func=stats.skew, **kwargs)
+            result = data.weighted(wgts).reduce(func=stats.skew, **kwargs)
         data.attrs['units'] = ''
         short = f'{data.short_name} skewness'
         long = f'{data.long_name} skewness'
     elif method == 'kurt':  # see: https://stackoverflow.com/a/71149901/4970632
         with xr.set_options(keep_attrs=True):
-            result = data.reduce(func=stats.kurtosis, **kwargs)
+            result = data.weighted(wgts).reduce(func=stats.kurtosis, **kwargs)
         data.attrs['units'] = ''
         short = f'{data.short_name} kurtosis'
         long = f'{data.long_name} kurtosis'
     elif method == 'pctile':
         with xr.set_options(keep_attrs=True):  # note name is already kept
-            nums = (0.5 - 0.005 * pctile.item(), 0.5 + 0.005 * pctile.item())
-            result = data.quantile(nums[1], **kwargs) - data.quantile(nums[0], **kwargs)
+            result = data.quantile(bnds[1], **kwargs) - data.quantile(bnds[0], **kwargs)
         short = f'{data.short_name} spread'
         long = f'{data.long_name} percentile range'
     elif method == 'avg' or method == 'med':
         key = 'mean' if method == 'avg' else 'median'
-        cmd = getattr(data, key)
-        result = cmd(**kwargs, keep_attrs=True)
+        with xr.set_options(keep_attrs=True):
+            result = getattr(data.weighted(wgts), key)(**kwargs)
         descrip = 'mean' if method == 'avg' else 'median'
         short = f'{descrip} {data.short_name}'  # only if no range included
         long = f'{descrip} {data.long_name}'
@@ -423,7 +475,9 @@ def _reduce_data(data, method, dim=None, pctile=None, std=None, preserve=True):
     return result, defaults
 
 
-def _reduce_datas(data0, data1, method, dim=None, pctile=None, std=None, invert=None):
+def _reduce_datas(
+    data0, data1, method, dim=None, weight=None, pctile=None, std=None, invert=None,
+):
     """
     Reduce pair of data arrays using arbitrary method.
 
@@ -435,6 +489,8 @@ def _reduce_datas(data0, data1, method, dim=None, pctile=None, std=None, invert=
         The reduction method (see `reduce_facets`).
     dim : str, optional
         The reduction dimension. Default is the first shared dimension.
+    weight : bool, optional
+        Whether to weight by institute counts.
 
     Other Parameters
     ----------------
@@ -455,8 +511,8 @@ def _reduce_datas(data0, data1, method, dim=None, pctile=None, std=None, invert=
     defaults : dict
         The default attributes and command keyword args.
     """
-    # NOTE: Normalization and anomalies with respect to global average as in climopy
-    # accessor.get() are supported in `reduce_facets`.
+    # NOTE: Normalization and anomalies with respect to global average
+    # as in climopy accessor.get() are supported in `reduce_facets`.
     # NOTE: Here we put 'variance' on additional DataArray dimension since variance
     # of gaussian random variables is linearly additive, so can allow process_data()
     # to carry out any operations (e.g. project=cmip6-cmip5) and generate 'shadedata'
@@ -480,6 +536,12 @@ def _reduce_datas(data0, data1, method, dim=None, pctile=None, std=None, invert=
         short_prefix, long_prefix = 'spatial ', f'{data1.short_name} spatial '
     else:  # TODO: revisit this and permit customization
         short_prefix, long_prefix = '', f'{data1.short_name} '
+    if not weight:
+        wgts = xr.ones_like(data0.coords[dim], dtype=float)
+    elif dim == 'facets':
+        wgts = _get_weights(data0, dim=dim)
+    else:
+        raise TypeError(f'Invalid option {weight=} for regression dimension {dim!r}.')
     if method == 'dist':  # scatter or bars
         if max(data0.ndim, data1.ndim) > 1:
             raise ValueError(f'Invalid dimensionality {data0.ndim} x {data1.ndim} for distribution.')  # noqa: E501
@@ -496,7 +558,7 @@ def _reduce_datas(data0, data1, method, dim=None, pctile=None, std=None, invert=
         long = f'{data0.long_name}-composite {data1.long_name} difference'
     elif method in ('corr', 'rsq'):
         manual = dim == 'facets'
-        kw_regress = dict(stat='corr', nobnds=True, manual=manual)
+        kw_regress = dict(stat='corr', nobnds=True, manual=manual, weights=wgts)
         result = regress_dims(data0, data1, dim, **kw_regress)
         if method == 'corr':  # correlation coefficient
             result = result.climo.to_units('dimensionless').climo.dequantify()
@@ -512,7 +574,8 @@ def _reduce_datas(data0, data1, method, dim=None, pctile=None, std=None, invert=
         nobnds = all(nums is None for nums in (pctile, std))
         manual = dim == 'facets'
         kw_regress = dict(stat=method, nobnds=nobnds, manual=manual)
-        result, *bnds = regress_dims(data0, data1, dim, **kw_regress)
+        results = regress_dims(data0, data1, dim, weights=wgts, **kw_regress)
+        result, *bnds = (results,) if isinstance(results, xr.DataArray) else results
         if method == 'cov':
             result.attrs['units'] = f'{data1.units} {data0.units}'
             short = f'{short_prefix}covariance'
@@ -540,8 +603,54 @@ def _reduce_datas(data0, data1, method, dim=None, pctile=None, std=None, invert=
     return result, defaults
 
 
+def reduce_time(data, time=None, season=None, month=None):
+    """
+    Reduce the time coordinate of the data using variety of operators.
+
+    Parameters
+    ----------
+    data : xarray.DataArray or xarray.Dataset
+        The input data.
+    time, season, month : optional
+        The time coordinate or ``'avg'`` instruction.
+
+    Returns
+    -------
+    data : xarray.Dataset or xarray.DataArray
+        The reduced data.
+    """
+    # TODO: Replace this with 'observed/tables' reduce_time(), combining with
+    # 'cmip_data.utils' average_periods() in-place utility. See tables.py for details
+    # TODO: Replace 'average_periods' with this and normalize by annual temperature.
+    # Also should add generalized no-op instruction for leaving coordinates alone.
+    if 'time' not in data.dims:
+        return data
+    if season is not None:
+        seasons = data.time.dt.season.str.lower()
+        data = data.isel(time=(seasons == season.lower()))
+    elif isinstance(month, str):
+        months = data.time.dt.strftime('%b').str.lower()
+        data = data.isel(time=(months == month.lower()))
+    elif month is not None:
+        months = data.time.dt.month
+        data = data.isel(time=(months == month))
+    elif not isinstance(time, str) and time is not None and time is not False:
+        time = time  # NOTE: above respects user-input 'None'
+        data = data.sel(time=time, method='nearest')
+    elif isinstance(time, str) and time != 'avg':
+        time = cftime.datetime.strptime(time, '%Y-%m-%d')  # cftime 1.6.2
+        data = data.sel(time=time, method='nearest')
+    elif isinstance(time, str) and time == 'avg':
+        days = data.time.dt.days_in_month.astype(data.dtype)
+        with xr.set_options(keep_attrs=True):  # average over entire record
+            data = (data * days).sum('time', skipna=False) / days.sum()
+    elif time is not None:
+        raise ValueError(f'Unknown time reduction method {time!r}.')
+    return data
+
+
 def reduce_facets(
-    *datas, method=None, pctile=None, std=None, preserve=None, invert=None, verbose=False,  # noqa: E501
+    *datas, method=None, preserve=None, invert=None, verbose=False, **kwargs,
 ):
     """
     Reduce along the model facets coordinate using an arbitrary method.
@@ -556,12 +665,14 @@ def reduce_facets(
         facets dimension for a single input argument, and ``corr|diff|proj|slope``
         reduce the facets dimension for two input arguments. Can also end string
         with ``_anom`` or ``_norm`` to take global anomaly or use normalization.
-    pctile, std, preserve : optional
-        Passed to `_reduce_data`.
-    pctile, std, invert : optional
-        Passed to `_reduce_datas`.
     verbose : bool, optional
         Whether to print extra information.
+    preserve : optional
+        Passed to `_reduce_data`.
+    invert : optional
+        Passed to `_reduce_datas`.
+    **kwargs
+        Passed to `_reduce_data` and `_reduce_datas`.
 
     Returns
     -------
@@ -579,13 +690,13 @@ def reduce_facets(
     datas = tuple(data.copy() for data in datas)  # e.g. for distribution updates
     default = 'dist' if ndim == 1 else 'avg' if len(datas) == 1 else 'slope'
     method, *options = (method or default).split('_')
+    kwargs = dict(dim='facets', method=method, **kwargs)
     anomaly = 'anom' in options
     normalize = 'norm' in options
-    kwargs = dict(dim='facets', std=std, pctile=pctile)
     if len(datas) == 1:
-        data, defaults = _reduce_data(*datas, method, preserve=preserve, **kwargs)
+        data, defaults = _reduce_data(*datas, preserve=preserve, **kwargs)
     elif len(datas) == 2:
-        data, defaults = _reduce_datas(*datas, method, invert=invert, **kwargs)
+        data, defaults = _reduce_datas(*datas, invert=invert, **kwargs)
     else:
         raise ValueError(f'Unexpected argument count {len(datas)}.')
     if anomaly:
@@ -648,9 +759,8 @@ def reduce_general(data, attrs=None, **kwargs):
         The data array.
     """
     # Apply facet reductions and grouped averages
-    # TODO: Replace _get_filters and _parse_institute with single function that
-    # does generalized project and institute selections (e.g. 'cmip65' is already
-    # an institute-based selection so makes sense to put in institute function).
+    # NOTE: Delay application of defaults until here so that we only include default
+    # selections in automatically-generated labels if user explicitly passed them.
     institute = kwargs.pop('institute', None)  # apply after end
     project = kwargs.pop('project', None)  # apply after end
     index = data.indexes.get('facets', pd.Index([]))
@@ -666,34 +776,7 @@ def reduce_general(data, attrs=None, **kwargs):
             facets = list(filter(inst, facets))
             data = data.sel(facets=facets)
 
-    # Apply time reductions and grouped averages
-    # TODO: Replace 'average_periods' with this and normalize by annual temperature.
-    # Also should add generalized no-op instruction for leaving coordinates alone.
-    # NOTE: The new climopy cell duration calculation will auto-detect monthly and
-    # yearly data, but not yet done, so use explicit days-per-month weights for now.
-    season = kwargs.pop('season', None)
-    month = kwargs.pop('month', None)
-    time = kwargs.get('time', 'avg')  # then get average later on
-    if 'time' in data.dims:
-        if season is not None:
-            seasons = data.time.dt.season.str.lower()
-            data = data.isel(time=(seasons == season.lower()))
-        elif isinstance(month, str):
-            months = data.time.dt.strftime('%b').str.lower()
-            data = data.isel(time=(months == month.lower()))
-        elif month is not None:
-            months = data.time.dt.month
-            data = data.isel(time=(months == month))
-        elif isinstance(time, str) and time != 'avg':
-            time = cftime.datetime.strptime(time, '%Y-%m-%d')  # cftime 1.6.2
-            data = data.sel(time=time, method='nearest')
-        elif not isinstance(time, str) and time is not None and time is not False:
-            time = time  # should already be datetime
-            data = data.sel(time=time, method='nearest')
-
     # Iterate over data arrays
-    # NOTE: Delay application of defaults until here so that we only include default
-    # selections in automatically-generated labels if user explicitly passed them.
     # WARNING: Sometimes multi-index reductions can eliminate previously valid
     # coords, so critical to iterate one-by-one and validate selections each time.
     order = list(ORDER_LOGICAL)
@@ -704,44 +787,12 @@ def reduce_general(data, attrs=None, **kwargs):
     else:  # iterate over arrays
         datas = (data,)
     for data in datas:
-        # Apply default reduce instructions
-        # NOTE: None is automatically replaced with default values (e.g. period=None)
-        # except for time=None used as placeholder to prevent time averaging.
-        ikwargs, defaults = kwargs.copy(), REDUCE_DEFAULTS.copy()
-        version = data.indexes.get('version', pd.Index([]))
-        facets = data.indexes.get('facets', pd.Index([]))
-        abrupt = (ikwargs.get('experiment', None) or 'abrupt4xco2') == 'abrupt4xco2'
-        external = ikwargs.get('source', None) in ('zelinka', 'geoffroy', 'forster')
-        experiment = region = period = None  # see below
-        if version.size > 1:
-            defaults['experiment'] = 'abrupt4xco2'
-        if 'initial' in version.names or 'period' in version.names:
-            defaults['initial'], defaults['period'] = 'mar', '23yr'
-        elif abrupt or external:
-            defaults['style'] = 'annual'
-        if 'startstop' in ikwargs:
-            ikwargs['start'], ikwargs['stop'] = ikwargs.pop('startstop')
-        for dim, value in defaults.items():
-            if dim in ikwargs and ikwargs[dim] is None and dim != 'time':
-                ikwargs[dim] = value  # typically use 'None' as default placeholder
-            else:  # for 'time' use 'None' to bypass operation
-                ikwargs.setdefault(dim, value)
-        if version.size > 1:
-            experiment, region, period = ikwargs['experiment'], ikwargs['region'], ikwargs['period']  # noqa: E501
-        if period and 'yr' not in period and experiment == 'picontrol':
-            ikwargs['start'], ikwargs['stop'] = 0, 150  # overwrite defaults
-        if period and period[0] == 'a' and period != 'ann':
-            ikwargs['period'] = period[1:] if experiment == 'abrupt4xco2' else 'ann'
-        if region and region[0] == 'a':  # abrupt-only region
-            ikwargs['region'] = region[1:] if experiment == 'picontrol' else 'globe'
-        if data.name in ('tpat', 'tstd', 'tdev', 'tabs'):  # others undefined
-            ikwargs['region'] = 'globe'
-
         # Iterate over reductions
         # NOTE: This silently skips dummy selections (e.g. area=None) that may be needed
         # to prevent _parse_specs from merging e.g. average and non-average selections.
         result = data
-        spatials = ('area', 'start', 'stop', 'experiment')
+        ikwargs = _fill_kwargs(data, **kwargs)
+        spatials = ('area', 'start', 'stop', 'period', 'experiment')
         for dim, value in sorted(ikwargs.items(), key=sorter):
             sizes = [*result.sizes, 'area', 'volume', 'spatial', 'time', 'month', 'season']  # noqa: E501
             names = [key for idx in result.indexes.values() for key in idx.names]
@@ -759,7 +810,7 @@ def reduce_general(data, attrs=None, **kwargs):
             if dim in quants and not isinstance(value, (str, tuple)):
                 value = ureg.Quantity(value, result.coords[dim].climo.units)
             if dim in ('time', 'month', 'season'):  # time selections
-                result = _get_datetime(result, **{dim: value})
+                result = reduce_time(result, **{dim: value})
             else:  # non-time selections
                 result = result.climo.reduce({dim: value}, method='interp').squeeze()
             if dim not in result.coords:

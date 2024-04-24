@@ -11,6 +11,7 @@ from icecream import ic  # noqa: F401
 
 from .general import CYCLE_DEFAULT
 from .general import general_plot
+from .specs import _expand_lists
 
 __all__ = [
     'build_specs',
@@ -45,10 +46,11 @@ KEYS_SPECS = (
     'breakdown', 'component', 'feedbacks', 'adjusts', 'forcing', 'sensitivity', 'transport'  # noqa: E501
 )
 KEYS_ITER = (
-    'method', 'name', 'period', 'spatial', 'volume', 'area', 'plev', 'lat', 'lon',
+    'name', 'method', 'time', 'season', 'month', 'spatial', 'observed',
+    'period', 'initial', 'volume', 'area', 'plev', 'lat', 'lon',
     'project', 'institute', 'experiment', 'ensemble', 'model', 'base',  # TODO: remove
-    'source', 'style', 'start', 'stop', 'region', 'dist', 'count',  # NOTE: bootstrap
-    'alpha', 'edgecolor', 'linewidth', 'linestyle', 'color', 'facecolor',
+    'source', 'style', 'start', 'stop', 'remove', 'detrend', 'error', 'correct',
+    'region', 'alpha', 'edgecolor', 'linewidth', 'linestyle', 'color', 'facecolor',
     'xmin', 'xmax', 'ymin', 'ymax', 'xlabel', 'ylabel', 'xlocator', 'ylocator',
     'loc', 'label', 'align', 'colorbar', 'legend', 'length', 'shrink',
     'extend', 'extendsize', *KEYS_SHADING, *KEYS_CONTOUR
@@ -84,6 +86,8 @@ SPECS_FEEDBACK = {
     'wav_atm': ('net', 'swcld', 'lwcld', 'atm'),
     'wav_ncl': ('net', 'swcld', 'lwcld', 'ncl'),
     'wav_cs': ('net', 'swcre', 'lwcre', 'cs'),
+    'ncl_wav': ('net', 'ncl', 'swcld', 'lwcld'),  # clear-sky first
+    'cs_wav': ('net', 'cs', 'swcre', 'lwcre'),
     'tstd_net': ('tstd', 'net', 'cld', 'ncl'),
     'tpat_net': ('tpat', 'net', 'cld', 'ncl'),
     'ecs_net': ('ecs', 'net', 'cld', 'ncl'),
@@ -92,6 +96,8 @@ SPECS_FEEDBACK = {
     'cld_atm': ('net', 'cld', 'swcld', 'lwcld', 'atm'),
     'cld_ncl': ('net', 'cld', 'swcld', 'lwcld', 'ncl'),
     'cre_cs': ('net', 'cre', 'swcre', 'lwcre', 'cs'),
+    'ncl_cld': ('net', 'ncl', 'cld', 'swcld', 'lwcld'),  # clear-sky first
+    'cs_cre': ('net', 'cs', 'cre', 'swcre', 'lwcre'),
     'wav_resid': ('net', 'swcld', 'lwcld', 'resid', 'atm'),
     'wav_alb': ('net', 'swcld', 'lwcld', 'alb', 'atm'),
     'atm_pl': ('atm', 'pl*', 'lr*', 'rh', 'alb'),
@@ -114,8 +120,8 @@ SPECS_FEEDBACK = {
     'all': ('net', 'cld', 'swcld', 'lwcld', 'atm', 'alb', 'resid', 'wv', 'rh', 'lr', 'lr*', 'pl', 'pl*'),  # noqa: E501
     'cld_alb': ('net', 'cld', 'swcld', 'lwcld', 'atm', 'alb'),
     'cld_resid': ('net', 'cld', 'swcld', 'lwcld', 'atm', 'resid'),
-    'ncl_cld': ('swcld', 'lwcld', 'lr*', 'rh', 'alb', 'resid'),
-    'ncl_resid': ('ncl', 'pl*', 'lr*', 'rh', 'alb', 'resid'),
+    'ncl_hur': ('ncl', 'pl*', 'lr*', 'rh', 'alb', 'resid'),
+    'wav_hur': ('swcld', 'lwcld', 'lr*', 'rh', 'alb', 'resid'),
 }
 
 
@@ -149,7 +155,7 @@ def _get_props(method=None):
     return stipple, hatches, levels
 
 
-def _get_dicts(*kws, expand=True, check=True):
+def _get_dicts(*kws, scalar=True, splat=True, check=True):
     """
     Helper function to get dictionaries from lists of dictionaries.
 
@@ -157,34 +163,45 @@ def _get_dicts(*kws, expand=True, check=True):
     ----------
     *kws : dict
         The input dictionaries.
-    expand : bool, optional
-        Whether to expand lists into separate dictionaries.
+    splat : bool, optional
+        Whether to splat lists into separate dictionaries.
     check : bool, optional
         Whether to check lists have equivalent lengths.
     """
     # NOTE: This allows e.g. list applied to one side of correlation pair
     # for multiple items in a single subplot. See notebooks for details.
-    lengths = {
-        f'{key}{i + 1}': len(value)
-        for i, kw in enumerate(kws)
-        for key, value in kw.items()  # e.g. pair of names
-        if 'color' not in key and 'cycle' not in key  # e.g. 'color1'
-    }
-    length = set(lengths.values()) - {1}
-    if check and len(length) > 1:  # or e.g. allow e.g. ('name', 'cycle') truncation
-        lengths = ', '.join(f'{key}={length}' for key, length in lengths.items())
-        raise ValueError(f'Unexpected mixed lengths: {lengths}.')
-    length = length.pop() if length else 1
-    results = []
-    for kw in kws:
-        result = {
-            key: value * length if len(value) == 1 else value
-            for key, value in kw.items()
-        }
-        if expand:
-            result = [dict(zip(result, vals)) for vals in zip(*result.values())]
-            result = result or [{}]
+    lengths, results = [], []
+    for i, kw in enumerate(kws):
+        length = {}
+        for key, val in tuple(kw.items()):
+            vals = tuple(val) if isinstance(val, (tuple, list)) else (val,)
+            if 'color' in key or 'cycle' in key:
+                continue
+            kw[key] = vals
+            length[key] = len(vals)
+        ilength = set(length.values()) - {1}
+        if check and len(ilength) > 1:
+            msg = ', '.join(f'{key}={val}' for key, val in length.items())
+            raise ValueError(f'Unexpected inner keyword mixed lengths: {msg}.')
+        ilen = ilength and ilength.pop() or 1
+        ires = {key: ilen * val if len(val) == 1 else val for key, val in kw.items()}
+        if not splat:
+            result = {
+                key: vals[0] if scalar and len(vals) == 1 else vals
+                for key, vals in ires.items()
+            }
+        else:
+            result = [
+                _get_dicts(dict(zip(ires, vals)), splat=False)
+                for vals in zip(*ires.values())
+            ]
         results.append(result)
+        lengths.append({f'{key}{i + 1}': val for key, val in length.items()})
+    length = {key: val for length in lengths for key, val in length.items()}
+    ilength = set(length.values()) - {1}
+    if check and len(ilength) > 1:
+        msg = ', '.join(f'{key}={val}' for key, val in length.items())
+        raise ValueError(f'Unexpected inner keyword mixed lengths: {msg}.')
     return results[0] if len(results) == 1 else results
 
 
@@ -313,18 +330,29 @@ def build_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **kwa
                 kws_outer[1].update({key: value})
             else:
                 kws_inner[1].update({key: value})
-    for dict_ in (*kws_outer, *kws_inner):
-        kws = []
-        for keys in product:  # then skip if absent
-            if any(key in dict_ for key in keys):
-                kw = {key: dict_.pop(key) for key in keys if key in dict_}
-                kws.append(_get_dicts(kw, expand=False))
-        keys = [key for kw in kws for key in kw]
-        values = itertools.product(*(zip(*kw.values()) for kw in kws))
-        values = [[v for val in vals for v in val] for vals in values]
-        dict_.update({key: vals for key, vals in zip(keys, zip(*values))})
+    for idx, groups in enumerate((kws_outer, kws_inner)):
+        for group in groups:
+            kws, inners = [], []
+            check = tuple(key for keys in product for key in keys)
+            for key in check:
+                value = group.get(key, None)
+                if idx or not isinstance(value, (tuple, list)):
+                    continue
+                if any(isinstance(val, (tuple, list)) for val in value):
+                    inners.append(key)
+            for keys in product:  # then skip if absent
+                keys = set(keys) - set(inners)
+                if not any(key in group for key in keys):
+                    continue
+                kw = {key: group.pop(key) for key in keys if key in group}
+                res = _get_dicts(kw, scalar=False, splat=False)
+                kws.append(res)
+            keys = [key for kw in kws for key in kw]
+            values = itertools.product(*(zip(*kw.values()) for kw in kws))
+            values = [[v for val in vals for v in val] for vals in values]
+            group.update({key: vals for key, vals in zip(keys, zip(*values))})
     kws_outer = tuple(map(_get_dicts, kws_outer))
-    kws_inner = _get_dicts(*kws_inner)  # expand and enforce identical lengths
+    kws_inner = _get_dicts(*kws_inner)  # splat into list
     return *kws_outer, *kws_inner, kwargs
 
 
@@ -668,10 +696,10 @@ def feedback_specs(
     idxs = np.where(names == None)  # noqa: E711
     gridskip = np.ravel_multi_index(idxs, names.shape)
     names = [name for name in names.ravel().tolist() if name is not None]
-    if maxcols == 1:  # e.g. single row
+    if maxcols == 1 or len(names) == 1:  # e.g. single row
         kwargs = {}
     elif len(names) <= inputcols:  # simpler default
-        kwargs = {'gridskip': None, 'ncols': len(names)}
+        kwargs = {'ncols': len(names)}
     else:  # custom arrangement
         kwargs = {'gridskip': gridskip, 'ncols': maxcols}
     return names, kwargs
@@ -767,14 +795,16 @@ def scalar_plot(data, forward=True, **kwargs):
                 spec1, spec2 = spec1.copy(), spec2.copy()
                 if spec1 == spec2:
                     spec = {'name': name, **rspec, **spec1}
+                    spec = _get_dicts(spec)
                 else:
                     ispec, jspec = (spec1, spec2) if forward else (spec2, spec1)
                     if name is not None:  # e.g. 'ts' or 'tpat'
                         ispec['name'] = name
                         jspec.setdefault('name', None)  # e.g. no 'breakdown'
                     spec = ({**rspec, **spec1}, {**rspec, **spec2})
-                ispecs.append(spec)
-            rspecs.append(ispecs or [rspec])
+                    spec = tuple(zip(*map(_get_dicts, spec)))
+                ispecs.extend(spec)
+            rspecs.append(ispecs)
         for cspecs, kwargs in divide_specs('col', colspecs, **kwargs):
             result = general_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)

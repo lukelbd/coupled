@@ -6,7 +6,6 @@ import itertools
 import math
 import re
 from collections import namedtuple
-from pathlib import Path
 
 import climopy as climo  # noqa: F401
 import numpy as np
@@ -15,9 +14,8 @@ from climopy import var, ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
-from cmip_data.facets import ENSEMBLES_FLAGSHIP
 from cmip_data.feedbacks import FEEDBACK_DEPENDENCIES
-from .reduce import _reduce_datas, reduce_facets, reduce_general
+from .reduce import _reduce_data, _reduce_datas, reduce_facets, reduce_general
 from .specs import _expand_lists, _expand_parts, _group_parts, _pop_kwargs
 
 __all__ = ['get_parts', 'get_result', 'process_constraint', 'process_data']
@@ -395,8 +393,8 @@ def get_result(
 
 
 def process_constraint(
-    data0, data1, constraint=None, constraint_kw=None, perturb=False,
-    observed=None, internal=False, graphical=False, pctile=None, N=None, **kwargs,
+    data0, data1, constraint=None, constraint_kw=None, observed=None, perturb=False,
+    noresid=False, noerror=False, internal=False, graphical=False, pctile=None, N=None, **kwargs,  # noqa: E501
 ):
     """
     Return percentile bounds for observational constraint.
@@ -414,7 +412,11 @@ def process_constraint(
     observed : int, optional
         The number of years to use for observational uncertainty.
     perturb : bool, optional
-        Whether to perturb the model data with its uncertainty.
+        Whether to perturb the model data with its own uncertainty.
+    noresid : bool, optional
+        Whether to ignore the regression residuals.
+    noerror : bool, optional
+        Whether to ignore the regression standard error.
     internal : bool or int, optional
         Whether to include model-estimated observed uncertainty due to variability. If
         ``True`` then ``20`` is used. If passed the bounds are with and without model
@@ -444,19 +446,19 @@ def process_constraint(
     from .datasets import open_scalar
     from .reduce import _get_regression
     N = N or 100000  # samples to draw
+    historical = 24  # historical observation years
     constraint = 'cre' if constraint is None or constraint is True else constraint
-    historical = 23  # historical observation years
     observed = observed or historical
     internal = observed if internal is None or internal is True else internal
     pctile = 95 if pctile is None or pctile is True else pctile
     pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
-    keys = ('style', 'start', 'detrend', 'remove', 'correct')
+    keys = ('initial', 'detrend', 'remove', 'correct')
+    name = constraint if isinstance(constraint, str) else 'cre'
     observed_kw = {key: data0.coords[key].item() for key in keys if key in data0.coords}
     observed_kw.update(constraint_kw or {})
     observed_kw.update(statistic=['slope', 'sigma', 'dof'])
     if isinstance(constraint, str):  # TODO: use generalized estimates
         scalar = open_scalar(ceres=True)
-        ic(scalar, observed_kw)
         scalar = get_result(scalar, constraint, **observed_kw)
         constraint = scalar.values.tolist()
     if not np.iterable(constraint) or len(constraint) != 3:
@@ -478,22 +480,25 @@ def process_constraint(
     idxs = data0.argsort().values  # critical so 'fit' has same coordinates
     data0 = data0.isel({data0.dims[0]: idxs})
     data1 = data1.isel({data0.dims[0]: idxs})
-    nbounds = 1 if internal is None else 2  # number of bounds returned
-    internal_kw = observed_kw.copy()
-    internal_kw.update(statistic='sigma')
-    if internal is not False:
-        scalar = open_scalar(ceres=False)
-        scalar = get_result(scalar, constraint, **internal_kw)
-        internal = scalar.values.item()
+    iscale = None  # internal variability scale
+    internal = 20 if internal is True else None
+    internal_kw = dict(**observed_kw, experiment='picontrol')
+    internal_kw.update(period=f'{internal}yr', error='internal', statistic='sigma')
+    if internal:
+        dataset = open_scalar(ceres=True)
+        iscales = get_result(dataset, name, **internal_kw)
+        iscale = iscales.mean().item()
         xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
-        es = stats.norm(loc=0, scale=internal).rvs(N)  # implied variability error
+        es = stats.norm(loc=0, scale=iscale).rvs(N)
         observations = np.insert(np.percentile(xs + es, pctile), 1, observations)
-    if not perturb:  # TODO: load values from file
+    if not perturb:
         bmean = None
         mean0 = data0.mean().values
         mean1 = data1.mean().values
     else:  # include regression error
-        mscale, mdof, M = 0.11, 1000, data0.size
+        # scalar = open_scalar(ceres=False)
+        # scalar = get_result(scalar, name, **internal_kw)
+        mscale, mdof, M = 0.11, 1000, data0.size  # TODO: use errors from file
         offset0 = stats.t(df=mdof, loc=0, scale=mscale).rvs((N, M))
         offset1 = stats.t(df=mdof, loc=0, scale=mscale).rvs((N, M))
         with xr.set_options(keep_attrs=True):
@@ -503,17 +508,26 @@ def process_constraint(
         mean0 = datas0.mean(dim='facets').values
         mean1 = datas1.mean(dim='facets').values
     print(f' constraint: mean {xmean:.2f} sigma {xscale:.2f} dof {xdof:.0f}')
-    result = _get_regression(data0, data1, pctile=pctile, **kwargs)
+    result = _get_regression(data0, data1, pctile=False, **kwargs)
     *slopes, fit, fit_lower, fit_upper, rscale, _, rdof = result
     bmean = (slopes[0] if bmean is None else bmean).values  # possibly include spread
     rdof, fit, fit_lower, fit_upper = (da.values for da in (rdof, fit, fit_lower, fit_upper))  # noqa: E501
 
     # Propagate observational uncertainty through regression uncertainty
-    # NOTE: This was adapted from Simpson et al. methdology
-    # NOTE: Below we reverse engineer the t-distribution associated with observational
-    # estimate, then use those distribution properties for our bootstrapping. Tried
-    # using 'offset uncertainty' but was similar to slope-only regression uncertainty.
+    # NOTE: This was adapted from Simpson et al. methdology. Reverse engineer the
+    # t-distribution associated with observational estimate, then use distribution
+    # properties for our bootstrapping. Tried only a/b uncertainty but too small.
+    # NOTE: Offset error 'oe' = be * sqrt(sum(x ** 2) / n) = be * sqrt(mean(x ** 2))
+    # and since mean(x ** 2) = mean((xm + xe) ** 2) = mean(xm) ** 2 + mean(xe) ** 2
+    # this is -> be * xm + be * sqrt(mean(xe ** 2)). First part yields higher
+    # offset uncerainty when farther from zero which makes sense, but second part
+    # when combined with slope error formula 'be' yields simply the standard error
+    # of residuals, i.e. the Simpson et al. approach! So never combine 'offset
+    # uncertainty' with 'residual uncertainty' as they are identical, but should add
+    # the slope uncertainty, otherwise constraint could be 'effective' when it has
+    # slope near zero i.e. small residuals with large x-coordinate error.
     if graphical:  # intersection of shaded regions
+        nbounds = 2 if internal else 1  # bounds returned
         fit_lower = fit_lower.squeeze()
         fit_upper = fit_upper.squeeze()
         xs = np.sort(data0, axis=0)  # linefit returns result for sorted data
@@ -522,31 +536,29 @@ def process_constraint(
         ymaxs = np.interp(observations[-nbounds:], xs, fit_upper)
         constrained = (*ymins, ymean, *ymaxs)
         alternative = mean1 + bmean * (observations - mean0)
-    elif False:  # individual parametric uncertainty
-        amean = mean1 - mean0 * bmean  # see wiki page
-        bscale = slopes[2] - slopes[1]
-        aerror = bscale * np.sqrt(np.sum(data0 ** 2) / data0.size)  # see wiki page
-        bs_ = stats.t(loc=bmean, scale=bscale, df=data0.size - 2).rvs(N)
-        as_ = stats.t(loc=amean, scale=aerror, df=data0.size - 2).rvs(N)
-        ys = as_ + bs_ * xs  # include both uncertainties
-        constrained = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
-        ys = mean1 + bmean * (xs - mean0)  # include slope uncertainty only
-        rscale = np.std(data1 - fit, ddof=1)  # model residual sigma
-        alternative = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
-    else:  # bootstrapped residual addition
+    else:
+        if internal:  # implied variability error from 150-year
+            es = stats.norm(loc=0, scale=iscale).rvs(N)
+        else:  # ignore variability error
+            es = 0
+        if not noresid:  # regerssion residual error
+            rscale = np.std(data1 - fit, ddof=1)  # model residual sigma
+            rs = stats.t(df=rdof, loc=0, scale=rscale).rvs(N)
+        else:  # ignore residual error
+            rs = 0
+        if not noerror:
+            bscale = abs(slopes[2] - slopes[1])
+            bs = stats.t(loc=bmean, scale=bscale, df=rdof).rvs(N)
+        else:
+            bs = bmean
         xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)  # observations
-        rs = stats.t(df=rdof, loc=0, scale=rscale).rvs(N)  # regression
-        ys = rs + mean1 + bmean * (xs - mean0)
-        constrained = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
-        ys = mean1 + bmean * (xs - mean0)  # no regression uncertainty
-        alternative = np.insert(np.percentile(ys, pctile), 1, np.mean(ys))
-        if internal is not False:
-            xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
-            es = stats.norm(loc=0, scale=internal).rvs(N)  # implied variability error
-            ys = rs + mean1 + bmean * (xs + es - mean0)
-            constrained = np.insert(np.percentile(ys, pctile), 1, constrained)
-            ys = mean1 + bmean * (xs + es - mean0)
-            alternative = np.insert(np.percentile(ys, pctile), 1, alternative)
+        ys1 = rs + mean1 + bs * (xs + es - mean0)  # include both uncertainties
+        if internal:  # no internal error
+            ys2 = rs + mean1 + bs * (xs - mean0)
+        else:  # no regression error
+            ys2 = rs + mean1 + bmean * (xs - mean0)
+        constrained = np.insert(np.percentile(ys1, pctile), 1, np.mean(ys1))
+        alternative = np.insert(np.percentile(ys2, pctile), 1, np.mean(ys2))
     return observations, alternative, constrained
 
 
@@ -584,7 +596,7 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
         raise ValueError(f'Expected two process dictionaries. Got {len(specs)}.')
     for i, spec in enumerate(specs):  # iterate method reduce arguments
         kw_data, kw_count, kw_group = spec.copy(), {}, {}
-        kw_facets = _pop_kwargs(kw_data, reduce_facets)
+        kw_facets = _pop_kwargs(kw_data, reduce_facets, _reduce_data, _reduce_datas)
         kw_input = {key: val for key, val in kw_data.items() if key != 'name' and val is not None}  # noqa: E501
         kw_data = _group_parts(kw_data, keep_operators=True)
         for key, value in kw_data.items():
@@ -592,8 +604,8 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
             for part in _expand_parts(value):
                 if part is None:
                     sel = None
-                elif np.iterable(part) and part[0] in ('+', '-', '*', '/'):
-                    sel = part[0]
+                elif np.iterable(part) and part[:1] in ('+', '-', '*', '/'):
+                    sel = part[:1]
                 elif isinstance(part, (str, tuple)):  # already mapped integers
                     sel = part
                 else:  # retrieve unit
@@ -674,7 +686,8 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
             name = kw_data.pop('name')  # NOTE: always present
             area = kw_data.get('area')
             experiment = kw_data.get('experiment')
-            for key, value in _pop_kwargs(kw_data, reduce_facets).items():
+            kw_reduce = _pop_kwargs(kw_data, reduce_facets, _reduce_data, _reduce_datas)
+            for key, value in kw_reduce.items():
                 kw_facets.setdefault(key, value)
             if name == 'tabs' and experiment == 'picontrol':
                 name = 'tstd'  # use rfnt_ecs for e.g. abrupt minus pre-industrial
@@ -750,8 +763,6 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
     # to vector coordinate matching utilities) so try to restore them below.
     # NOTE: Global average regressions of local pre-industrial feedbacks onto global
     # pre-industrial feedbacks equal one despite regions with much larger magnitudes.
-    # if args[0].sizes.keys() & {'lon', 'lat'}:  # ensure average is one
-    #     ic(specs, args[0].climo.average('area').item())
     args = xr.align(*args)  # re-align after summation
     if len(args) == len(kws_input):  # one or two (e.g. scatter)
         for arg, kw_input in zip(args, kws_input):

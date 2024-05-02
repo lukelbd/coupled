@@ -209,7 +209,7 @@ KWARGS_REFERENCE = {  # reference zero or one line
 # triangle shaped then maximum density sample in units 1 / (W m-2 K-1)-1 is 2. Idea
 # should be to make the maximum around 1 hence scaling violin widths by 0.5.
 KWARGS_BAR = {
-    'color': 'gray8',
+    'color': 'gray7',
     'edgecolor': 'black',
     'width': 1.0,
     'absolute_width': False,
@@ -409,7 +409,7 @@ def _get_scalars(*args, units=True, tuples=False):
     return result
 
 
-def _props_guide(*axs, loc=None, figurespan=False, cbarlength=None, cbarwrap=None):
+def _props_guide(*axs, loc=None, figurespan=None, cbarlength=None, cbarwrap=None):
     """
     Return properties for the guide based on input arguments.
 
@@ -453,11 +453,13 @@ def _props_guide(*axs, loc=None, figurespan=False, cbarlength=None, cbarwrap=Non
     cols = (min(cols[0]), max(cols[1]))
     row = (rows[0] + rows[1] + 1) // 2  # prefer bottom i.e. higher index
     col = (cols[0] + cols[1]) // 2  # prefer left i.e. lower index
-    if loc is None:
+    if loc is None or figurespan is False:
         pass
     elif not isinstance(loc, str) or loc[0] not in 'lrtb':
         raise ValueError(f'Invalid location {loc!r}.')
-    if figurespan:
+    if figurespan is False or figurespan is None and len(axs) == 1:
+        src = axs[0]
+    elif figurespan:
         src = fig
         if loc is not None:
             pass
@@ -599,7 +601,7 @@ def _props_command(data, cycle=None, autocolor=False):
     others = []  # other coordinates for color cycle
     exclude = ('project', 'experiment', 'start', 'stop')
     exclude += () if len(set(perturbs)) == 1 else ('style',)
-    index = data.indexes[data.dims[0]]  # 'facets' or 'components' form _merge_dists()
+    index = data.indexes.get(data.dims and data.dims[0], pd.Index([]))
     for key in index:  # iterate over multi-index values
         other = tuple(key for name, key in zip(index.names, key) if name not in exclude)
         others.append(other[-1])  # maximum of single value
@@ -619,7 +621,7 @@ def _props_command(data, cycle=None, autocolor=False):
     hatch1 = {key: 'ooo' for key in early}
     hatch1 = {} if ('20-0', '150-20') in periods else hatch1
     hatch2 = {key: '...' for key in (*late, *full)}
-    alpha, alphas = projs, {5: 0.3}  # default alpha
+    alpha, alphas = projs, {5: 0.4}  # default alpha
     edge, edges = groups, {66: 'gray3'}  # default edges
     hatch, hatches = groups, {66: 'xxxxxx'}  # default hatches
     fade, fades = flagships, {False: 0.85, True: 1}  # flagship status
@@ -645,7 +647,8 @@ def _props_command(data, cycle=None, autocolor=False):
             base, cold, warm = control, early, (*late, *full)
         else:  # alternative allowing full comparison
             base, cold, warm = full, early, late
-        colors = dict(zip(('gray6', 'cyan7', 'pink7'), (base, cold, warm)))
+        # colors = dict(zip(('gray6', 'cyan7', 'pink7'), (base, cold, warm)))
+        colors = dict(zip(('gray7', 'cyan7', 'pink7'), (base, cold, warm)))
         colors = {key: color for color, keys in colors.items() for key in keys}
     else:  # automatic colors based on inner variables
         seen = set()  # record auto-generated color names
@@ -924,6 +927,8 @@ def _merge_dists(
         The plotting keyword arguments.
     horizontal : bool, optional
         Whether to plot horizontally.
+    defaults : bool, optional
+        Whether to apply default props.
     labels : list of str, optional
         Optional overrides for outer labels.
     offset : float, optional
@@ -984,7 +989,7 @@ def _merge_dists(
         args, boxdata, bardata, annotations = [], [], [], []
         units = [data.climo.units for *_, data in arguments]
         weight = kw_collection.other.get('weight', False)
-        kw_collection.command['width'] = 1.0  # ignore staggered bars
+        kw_collection.command.setdefault('width', 1.0)  # ignore staggered bars
         kw_collection.command['absolute_width'] = True
         for iargs, iunits in zip(arguments, units):  # merge into slope estimators
             dim = iargs[0].dims[0]  # currently always 'facets'
@@ -1057,12 +1062,13 @@ def _merge_dists(
     # Infer object and tick locations
     # WARNING: For some reason naked len(itertools.groupby()) fails. Note this finds
     # consecutive groups in a list of hashables and we want the fewest groups.
+    step = kw_collection.command.get('width', 1.0)
     offset = 0.8 if offset is None else float(offset)  # additional offset coordinate
     groups = list(itertools.groupby(kws_outer))
     for group, items in itertools.groupby(kws_outer):
         items = list(items)
         count = len(list(items))  # convert itertools._group object
-        ilocs = np.arange(base, base + count - 0.5)
+        ilocs = step * np.arange(base, base + count - 0.5)
         ikws = kws_inner[num:num + count]
         keys = [('name',), ('project',), ('experiment', 'start', 'stop')]
         for key in keys:  # TODO: generalize the above 'keys' groups
@@ -1070,9 +1076,9 @@ def _merge_dists(
             lengths = [len(list(items)) for _, items in itertools.groupby(values)]
             if 1 < len(lengths) < len(values):  # i.e. additional groups are present
                 for idx in np.cumsum(lengths[:-1]):
-                    ilocs[idx:] += 0.5 * offset  # TODO: make this configurable?
+                    ilocs[idx:] += 0.5 * step * offset  # TODO: make this configurable?
         tick = 0.5 * (ilocs[0] + ilocs[-1])
-        base += offset + 1 + (ilocs[-1] - ilocs[0])  # float coordinate
+        base += step * (1 + offset) + (ilocs[-1] - ilocs[0])  # float coordinate
         num += count  # integer index
         locs.extend(ilocs)
         ticks.append(tick)
@@ -1272,7 +1278,7 @@ def _setup_axes(ax, *args, command=None):
     # for some rcason share=True seems to have no effect but not sure why.
     top = ax._get_topmost_axes()
     fig = top.figure
-    cmds = ('scatter', 'contour', 'contourf', 'pcolor', 'pcolormesh')
+    cmds = ('scatter', 'line', 'linex', 'contour', 'contourf', 'pcolor', 'pcolormesh')
     base, data = args[0], args[-1]  # variables
     if command is None:
         raise ValueError('Input command is required.')
@@ -1320,7 +1326,7 @@ def _setup_axes(ax, *args, command=None):
             cmd = ax.linex if s == 'x' else ax.line
             kw_ref = {**KWARGS_REFERENCE, 'transform': transform}
             coords = []
-            if unit is None or unit != ureg.degrees_north:
+            if unit is None or unit != ureg.deg and unit != ureg.degrees_north:
                 if command:  # add for bar, violin, and line plots
                     coords.append(0)
             if unit is not None and unit == ureg.dimensionless:
@@ -1598,6 +1604,7 @@ def _setup_scatter(
         xcolor, ycolor = 'cyan7', 'pink7'
         nbounds = len(xs) // 2  # should be one or two
         xmins, xmean, xmaxs = xs[:nbounds], xs[nbounds], xs[-nbounds:]
+        nbounds = len(ys1) // 2  # should be one or two
         ymins1, ymean, ymaxs1 = ys1[:nbounds], ys1[nbounds], ys1[-nbounds:]
         ymins2, ymean, ymaxs2 = ys2[:nbounds], ys2[nbounds], ys2[-nbounds:]
         horig, alphas = None, (0.1, 0.2)  # opacities of spanning shading
@@ -1623,8 +1630,9 @@ def _setup_scatter(
             ls, lw = (':', 0.9) if idx == 1 else ('--', 0.7)
             horig = ax.axhline(bound, ls=ls, lw=0.7, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
         handle = [tuple(xobjs), tuple(yobjs)] + ([horig] if horig else [])
-        param = r'\sigma_{\mathrm{constrained}} - \sigma_{\mathrm{unconstrained}}'
-        param = rf'\dfrac{{{param}}}{{\sigma_{{\mathrm{{unconstrained}}}}}}'
+        # param = r'\sigma_{\mathrm{constrained}} - \sigma_{\mathrm{unconstrained}}'
+        # param = rf'\dfrac{{{param}}}{{\sigma_{{\mathrm{{unconstrained}}}}}}'
+        param = r'\Delta \mathrm{CI}'
         ratio = (ymaxs2[-1] - ymins2[0]) / (yorigs[-1] - yorigs[0]) - 1
         ratio = ureg.Quantity(ratio, '').to('percent')
         label = rf'${param}\,=\,{ratio:~L+.0f}$'
@@ -1843,7 +1851,7 @@ def general_plot(
     reflect=False,
     rxlim=None,
     rylim=None,
-    figurespan=False,
+    figurespan=None,
     cbarlength=None,
     cbarwrap=None,
     cbarpad=None,
@@ -1913,7 +1921,7 @@ def general_plot(
     rxlim, rylim : float or 2-tuple, optional
         Relative x and y axis limits to apply to groups of shared or standardized axes.
     figurespan : bool, optional
-        Whether to make colorbars and legends span the entire figure.
+        If ``False`` or ``True`` guides are always supblot-wide or figure-wide.
     cbarlength : float, optional
         Length of colorbar.
     cbarwrap : float, optional
@@ -2029,7 +2037,8 @@ def general_plot(
             transpose = transpose or kw_collection.other.get('transpose')
             attrs = kw_collection.attrs.copy()
             args, method, default = process_data(dataset, *kw_process, attrs=attrs)
-            for key, value in _pop_kwargs(kw_collection.other.copy(), _merge_dists).items():  # noqa: E501
+            kw_dists = _pop_kwargs(kw_collection.other.copy(), _merge_dists)
+            for key, value in kw_dists.items():  # noqa: E501
                 kw_merge.setdefault(key, value)
             for key, value in default.items():  # also adds 'method' key
                 kw_collection.command.setdefault(key, value)
@@ -2264,8 +2273,10 @@ def general_plot(
             # differentiate between sensitivity, forcing, and feedbacks.
             hashable = tuple(settings)
             label = kw_guide.pop('label', None)
-            if 'label' in data.coords:
-                label = None  # TODO: optionally disable
+            if 'label' in data.coords:  # TODO: optionally disable
+                label = None
+            if figurespan is False:  # default is none
+                label = object()
             if 'scatter' in command and not kw_other.get('constraint'):
                 handle = label = None  # TODO: optionally disable
             if command in ('contourf', 'pcolormesh') and (norm := handle.norm):

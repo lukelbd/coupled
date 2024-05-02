@@ -60,7 +60,7 @@ PARAMS_ABRUPT = {
 }
 PARAMS_CONTROL = {
     'years': (None, 20, 50),
-    'month': ('dec', 'jun'),
+    'month': ('jan', 'jul'),
     'anomaly': (True, False),
     'detrend': ('', 'xy'),
 }
@@ -138,10 +138,10 @@ def _update_attrs(dataset, boundary=None):
     wavelengths = ('full', 'longwave', 'shortwave')
     iter_ = itertools.product(boundaries, wavelengths, FEEDBACK_DESCRIPTIONS.items())
     for boundary, wavelength, (component, descrip) in iter_:
-        for suffix, outdated, short in (
-            ('lam', 'lambda', 'feedback'),
-            ('erf', 'erf2x', 'forcing'),
-            ('ecs', 'ecs2x', 'climate sensitivity'),
+        for suffix, outdated, short, units in (
+            ('lam', 'lambda', 'feedback', 'W m^-2 K^-1'),
+            ('erf', 'erf2x', 'forcing', 'W m^-2'),
+            ('ecs', 'ecs2x', 'climate sensitivity', 'K'),
         ):
             if wavelength != 'full':  # WARNING: do not overwrite itertools 'descrip'
                 tail = f'{wavelength} {descrip}' if descrip else wavelength
@@ -150,7 +150,7 @@ def _update_attrs(dataset, boundary=None):
             else:
                 tail = descrip if descrip else 'net'
             flux = f'r{wavelength[0].lower()}n{boundary[0].lower()}'
-            if component in ('', 'cs'):
+            if component in ('', 'cs', 'ce'):
                 prefix = f'{flux}{component}'
             else:
                 prefix = f'{component}_{flux}'
@@ -166,6 +166,7 @@ def _update_attrs(dataset, boundary=None):
             long = re.sub('  +', ' ', long).strip()
             data.attrs['long_name'] = long
             data.attrs['short_name'] = short
+            data.attrs.setdefault('units', units)
             if suffix == 'ecs' and 'lon' in dataset[name].dims:
                 dataset = dataset.drop_vars(name)
 
@@ -754,12 +755,13 @@ def process_scalar(
     from observed.feedbacks import _parse_kwargs, process_scalar
     params, _, constraints = _parse_kwargs('source', **kwargs)  # skip 'source'
     constraints['variable'] = 'fluxes'
-    defaults = ('net', 'sw', 'lw', 'cre', 'swcre', 'lwcre', 'cs', 'swcs', 'lwcs')
     correct = constraints.pop('correct', None)
+    translate = {('years', None): ('period', 'full'), **LABELS_YEARS}
     testing = kwargs.get('testing', False)
-    kwargs = {'output': False, 'correct': correct, 'translate': LABELS_YEARS}
-    suffix = ['0000', '0150', 'eraint', 'series']
+    kwargs = {'output': False, 'correct': correct, 'translate': translate}
     paths = paths or ('~/data/cmip-fluxes', '~/scratch/cmip-fluxes')
+    suffix = ['0000', '0150', 'eraint', 'series']
+    defaults = ('net', 'sw', 'lw', 'cre', 'swcre', 'lwcre', 'cs', 'swcs', 'lwcs')
     names = (names,) if isinstance(names, str) else names or defaults
     names = tuple(ALIAS_VARIABLES.get(name, name) for name in names)
     projects = project.split(',') if isinstance(project, str) else ('cmip5', 'cmip6')
@@ -808,19 +810,19 @@ def process_scalar(
                 warnings.warn('Ambiguous', '_'.join(facets), 'paths:', ', '.join(map(str, paths)))  # noqa: E501
             for sub, replace in FACETS_RENAME.items():
                 facets = tuple(facet.replace(sub, replace) for facet in facets)
-            if facets[3] not in ('picontrol', 'abrupt4xco2'):
-                continue
-            # Load flux time series
             if facets[3] == 'picontrol':  # use default 'annual' 'correct'
                 years = (None, 20, 50)
-                month = ('dec', 'jun')
+                month = ('jan', 'jul')
                 anomaly = (True, False)
                 detrend = ('', 'xy')
-            else:  # use default 'annual' 'correct'
+            elif facets[3] == 'abrupt4xco2':  # use default 'annual' 'correct'
                 years = ((0, 150), (0, 20), (20, 150))
                 month = (None,)
                 anomaly = (False,)
                 detrend = ('',)
+            else:
+                continue
+            # Calculate feedback parameters
             inames, iparams = names[:1] if testing else names, params.copy()
             iparams.update(years=years, month=month, anomaly=anomaly, detrend=detrend)
             iparams = {key: vals[:1] if testing else vals for key, vals in iparams.items()}  # noqa: E501
@@ -829,11 +831,10 @@ def process_scalar(
             fluxes = _find_dependencies(series, inames)  # 'name': [*dependencies]
             retain = {'ts', *(key for keys in fluxes.values() for key in keys)}
             series = series.drop_vars(series.keys() - retain)
-            # Calculate feedback parameters
-            print(f'{facets[2]}_{facets[3]}_{start} ({len(fluxes)})', end=' ')
             series = series.climo.add_cell_measures()
             series = xr.Dataset({name: data.climo.average('area') for name, data in series.items()})  # noqa: E501
-            source = paths[0].stem.split('-')[-2]
+            source = paths[0].stem.split('-')[-2]  # e.g. '0000-0150-eraint-series.nc'
+            print(f'{facets[2]}_{facets[3]}_{start} ({len(fluxes)})', end=' ')
             kw_process = {'name': tuple(fluxes), 'source': source, **iparams, **kwargs}
             result = process_scalar(series, **kw_process)
             levels = ('experiment', 'ensemble', *result.indexes['version'].names)
@@ -857,6 +858,20 @@ def process_scalar(
     # NOTE: Here xarray cannot save multi-index so have to reset index
     # then stack back into multi-index with .stack(version=[...]).
     from .datasets import _standardize_order
+    names = {name: da for ds in results.values() for name, da in ds.data_vars.items()}
+    print('Adding missing variables.')
+    if results:
+        print('Model:', end=' ')
+    for facets, result in tuple(results.items()):  # interpolated datasets
+        print('_'.join(facets[1:4]), end=' ')
+        for name in names.keys() - result.data_vars.keys():
+            array = names[name]  # *sample* from another model or project
+            array = xr.full_like(array, np.nan)  # preserve attributes as well
+            if all('version' in keys for keys in (array.dims, result, result.sizes)):
+                array = array.isel(version=0, drop=True)
+                array = array.expand_dims(version=result.version.size)
+                array = array.assign_coords(version=result.version)
+            result[name] = array
     print()
     print('Concatenating datasets.')
     if not results:
@@ -877,8 +892,9 @@ def process_scalar(
     dataset = dataset.transpose('facets', 'version', 'statistic', ...)
     if standardize:
         dataset = _standardize_order(dataset)
+    proj = projects[0] if len(projects) == 1 else 'cmip'
     base = Path('~/data/global-feedbacks').expanduser()
-    file = 'tmp.nc' if testing else 'feedbacks_CMIP_global.nc'
+    file = 'tmp.nc' if testing else f'feedbacks_{proj.lower()}_global.nc'
     if isinstance(output, str) and '/' not in output:
         output = base / output
     elif output:

@@ -6,7 +6,6 @@ import itertools
 import math
 import re
 from collections import namedtuple
-from pathlib import Path
 
 import climopy as climo  # noqa: F401
 import numpy as np
@@ -15,7 +14,6 @@ from climopy import var, ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
-from cmip_data.facets import ENSEMBLES_FLAGSHIP
 from cmip_data.feedbacks import FEEDBACK_DEPENDENCIES
 from .reduce import _reduce_datas, reduce_facets, reduce_general
 from .specs import _expand_lists, _expand_parts, _group_parts, _pop_kwargs

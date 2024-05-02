@@ -5,8 +5,11 @@ Shared utilities for working with coupled model output.
 # Internal stuff
 from functools import partial
 from warnings import warn
-from icecream import ic, colorize
-ic.configureOutput(outputFunction=lambda *args: print(colorize(*args)))
+from icecream import ic, colorize, pprint
+ic.configureOutput(
+    outputFunction=lambda *args: print(colorize(*args)),
+    argToStringFunction=lambda x: pprint.pformat(x, sort_dicts=False),
+)
 _CoupledWarning = type('CoupledWarning', (UserWarning,), {})
 _warn_coupled = partial(warn, category=_CoupledWarning, stacklevel=2)
 

@@ -187,8 +187,8 @@ def _update_attrs(dataset, boundary=None):
             data = dataset[name]
             boundary = 'surface' if name == 'pbot' else 'tropopause'
             if name == 'tstd':
-                data.attrs['short_name'] = 'warming'
-                data.attrs['long_name'] = 'regional warming'
+                data.attrs['short_name'] = 'temperature change'
+                data.attrs['long_name'] = 'temperature change'
                 data.attrs.setdefault('units', 'K')
             if name == 'tpat':
                 data.attrs['short_name'] = 'relative warming'

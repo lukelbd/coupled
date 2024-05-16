@@ -132,7 +132,7 @@ def _standardize_order(dataset):
     return dataset
 
 
-def open_scalar(path=None, ceres=False):
+def open_scalar(path=None, ceres=False, suffix=None):
     """
     Get the observational constraint estimate.
 
@@ -144,9 +144,10 @@ def open_scalar(path=None, ceres=False):
         Whether to load global CERES or CMIP feedbacks.
     """
     from .feedbacks import _update_attrs
+    suffix = suffix and f'-{suffix}' or ''
     source = 'CERES' if ceres else 'CMIP'
     base = Path('~/data/global-feedbacks').expanduser()
-    file = f'feedbacks_{source}*_global.nc'
+    file = f'feedbacks_{source}*_global{suffix}.nc'
     if isinstance(path, str) and '/' not in path:
         path = base / path
     elif path:

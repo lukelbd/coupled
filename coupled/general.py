@@ -20,9 +20,9 @@ import matplotlib.collections as mcollections
 import matplotlib.container as mcontainer
 import matplotlib.lines as mlines
 import seaborn as sns
-from climopy import ureg, vreg  # noqa: F401
+from climopy import format_units, ureg, vreg  # noqa: F401
 from .process import process_constraint, process_data
-from .reduce import _get_filters, _get_regression, _get_weights
+from .reduce import _get_filters, _get_regression, _get_weights, _reduce_datas
 from .specs import _pop_kwargs, _split_label, get_heading, get_label, get_labels, parse_specs  # noqa: E501
 
 __all__ = ['general_plot']
@@ -209,7 +209,7 @@ KWARGS_REFERENCE = {  # reference zero or one line
 # triangle shaped then maximum density sample in units 1 / (W m-2 K-1)-1 is 2. Idea
 # should be to make the maximum around 1 hence scaling violin widths by 0.5.
 KWARGS_BAR = {
-    'color': 'gray7',
+    'color': 'gray8',
     'edgecolor': 'black',
     'width': 1.0,
     'absolute_width': False,
@@ -271,6 +271,52 @@ KWARGS_VIOLIN = {
     'saturation': 1.0,  # exactly reproduce input colors (not the default! weird!)
     'linewidth': pplt.rc.metawidth,
 }
+
+# Matching He et al. models
+MATCHING_MODELS = [
+    'ACCESS-CM2',
+    'ACCESS-ESM1-5',
+    'AWI-CM-1-1-MR',
+    'BCC-CSM2-MR',
+    'BCC-ESM1',
+    'CAMS-CSM1-0',
+    'CanESM5',
+    'CAS-ESM2-0',
+    'CESM2',
+    'CESM2-FV2',
+    'CESM2-WACCM',
+    'CESM2-WACCM-FV2',
+    'CIESM',
+    'CMCC-CM2-SR5',
+    'CMCC-ESM2',
+    'E3SM-1-0',
+    'EC-Earth3-AerChem',
+    'EC-Earth3-CC',
+    'EC-Earth3-Veg',
+    'FGOALS-f3-L',
+    'FGOALS-g3',
+    'GFDL-CM4',
+    'GFDL-ESM4',
+    'GISS-E2-1-G',
+    'GISS-E2-1-H',
+    'GISS-E2-2-G',
+    'IITM-ESM',
+    'INM-CM4-8',
+    'INM-CM5-0',
+    'IPSL-CM5A2-INCA',
+    'IPSL-CM6A-LR',
+    'KACE-1-0-G',
+    'MIROC6',
+    'MPI-ESM-1-2-HAM',
+    'MPI-ESM1-2-HR',
+    'MPI-ESM1-2-LR',
+    'MRI-ESM2-0',
+    'NESM3',
+    'NorESM2-LM',
+    'NorESM2-MM',
+    'SAM0-UNICON',
+    'TaiESM1',
+]
 
 
 def _get_annotations(data):
@@ -405,7 +451,7 @@ def _get_scalars(*args, units=True, tuples=False):
                 continue
             values.append(value)
         if len(args) == len(values):
-            result[key] = tuple(values)
+            result[key] = values[0] if len(values) == 1 else tuple(values)
     return result
 
 
@@ -529,7 +575,7 @@ def _props_guide(*axs, loc=None, figurespan=None, cbarlength=None, cbarwrap=None
     return src, loc, span, bbox, length, size
 
 
-def _props_command(data, cycle=None, autocolor=False):
+def _props_command(data, cycle=None, autocolor=False, flagships=None, weights=None):
     """
     Return properties for the plot based on input arguments.
 
@@ -569,7 +615,6 @@ def _props_command(data, cycle=None, autocolor=False):
         return result
     linewidth = 0.6 * pplt.rc.metawidth  # default reference bar line width
     markersize = 0.1 * pplt.rc.fontsize ** 2  # default reference scatter marker size
-    flagships, weights = _get_institutes(data)  # scalar or float
     projects = _get_projects(data)  # scalar or float
     experiment = np.atleast_1d(data.coords.get('experiment', None))
     start = np.atleast_1d(data.coords.get('start', None))
@@ -578,6 +623,8 @@ def _props_command(data, cycle=None, autocolor=False):
         stop = np.repeat(stop, start.size)
     if start.size == 1:  # TODO: figure out issue and remove kludge
         start = np.repeat(start, stop.size)
+    if flagships is None or weights is None:
+        flagships, weights = _get_institutes(data)  # scalar or float
     mask = np.array([value is None or value != value for value in experiment])
     mask1 = np.array([value is None or value != value for value in start])
     mask2 = np.array([value is None or value != value for value in stop])
@@ -677,8 +724,8 @@ def _props_command(data, cycle=None, autocolor=False):
 
 
 def _init_command(
-    args, kw_collection, horizontal=False, transpose=False,
-    violin=True, shading=True, pcolor=False, contour=None
+    args, kw_collection, horizontal=False, transpose=False, compare=None,
+    violin=True, shading=True, pcolor=False, contour=None,
 ):
     """
     Generate a plotting command and keyword arguments from the input arguments.
@@ -693,14 +740,16 @@ def _init_command(
         Whether to use vertical or horizontal orientation.
     transpose : bool, optional
         Whether to transpose variables for line plots.
+    compare : array-like, optional
+        The array to optionally use for sorting bar plots.
+    violin : bool, optional
+        Whether to use violins for several 1D array inputs.
     shading : bool or dict, optional
         Whether to use shading or contours for 2D array inputs.
     contour : dict, optional
         Additional contour properties for 2D array inputs.
     pcolor : bool, optional
         Whether to use `pcolormesh` for 2D shaded plot.
-    violin : bool, optional
-        Whether to use violins for several 1D array inputs.
 
     Results
     -------
@@ -742,16 +791,23 @@ def _init_command(
             defaults = {**KWARGS_CONTOUR, **({} if contour is True else contour or {})}
     else:
         # Scalar plots with advanced default properties
+        # WARNING: Critical to get properties before sorting below or else flagship
+        # designation is not detected correctly.
         # NOTE: _violin_data applies custom grouping and spacing of violin plots by
         # inserting nan columns then _setup_violins imposes properties on resluts.
         nargs = sum(isinstance(arg, xr.DataArray) for arg in args)
-        violin = kw_collection.other.get('violin', True)
         ragged = data.ndim == 2 or data.ndim == 1 and data.dtype == 'O'
-        distribution = 'facets' in data.sizes  # auto settings
-        if nargs == 1 and distribution and not ragged:  # sort distribution
-            args = (*args[:-1], data := data.sortby(data, ascending=True))
+        dists = 'facets' in data.sizes  # auto settings
+        violin = kw_collection.other.get('violin', True)
         horizontal = kw_collection.other.get('horizontal', False)
+        flagships, weights = _get_institutes(data)  # WARNING: critical to come first
+        if nargs == 1 and not ragged and dists:  # sort distribution
+            idxs = (data if compare is None else compare).argsort()
+            args = (*args[:-1], data := data[idxs.values])
+            weights = np.take(weights, idxs)
+            flagships = np.take(flagships, idxs)
         kw_props = _pop_kwargs(kw_collection.other.copy(), _props_command)
+        kw_props.update(flagships=flagships, weights=weights)
         colors, kw_patch, kw_scatter = _props_command(data, **kw_props)
         if nargs == 1 and violin and ragged:
             kw_violin = dict(color=colors, horizontal=horizontal, **kw_patch)
@@ -768,10 +824,10 @@ def _init_command(
         else:
             command = 'violinh' if horizontal else 'violin'  # used in filenames only
             defaults = {**KWARGS_VIOLIN}  # ignore patch
-        if distribution and 'bar' in command:
-            if 'color' not in kw_collection.command:  # no manual color/auto autocolor
+        if dists and 'bar' in command:
+            if 'color' in kw_collection.command:  # no manual color/auto autocolor
                 defaults['negpos'] = data.name[-3:] not in ('ecs',)
-        if not distribution and 'violin' not in command and 'scatter' not in command:
+        if not dists and 'violin' not in command and 'scatter' not in command:
             if all(c is not None for c in colors):
                 defaults['color'] = colors
 
@@ -1633,7 +1689,7 @@ def _setup_scatter(
         # param = r'\sigma_{\mathrm{constrained}} - \sigma_{\mathrm{unconstrained}}'
         # param = rf'\dfrac{{{param}}}{{\sigma_{{\mathrm{{unconstrained}}}}}}'
         param = r'\Delta \mathrm{CI}'
-        ratio = (ymaxs2[-1] - ymins2[0]) / (yorigs[-1] - yorigs[0]) - 1
+        ratio = (max(ymaxs2) - min(ymins2)) / (max(yorigs) - min(yorigs)) - 1
         ratio = ureg.Quantity(ratio, '').to('percent')
         label = rf'${param}\,=\,{ratio:~L+.0f}$'
         label = re.sub(r'(?<!\\)%', r'\%', label)
@@ -1831,6 +1887,8 @@ def general_plot(
     dataset,
     rowspecs=None,
     colspecs=None,
+    compare=False,
+    matching=False,
     figtitle=None,
     figprefix=None,
     figsuffix=None,
@@ -1874,6 +1932,12 @@ def general_plot(
     *args : 2-tuple or list of 2-tuple
         Tuples containing the ``(name, kwargs)`` passed to ``ClimoAccessor.get``
         used to generate data in rows and columns. See `parse_specs` for details.
+    compare : bool or str, optional
+        Whether to compare perturbed panels with unperturbed panels using
+        possibly given reduction method (default ``''``).
+    matching : bool, optional
+        Whether to filter to CMIP6 models matching He et al. instead of
+        using all models.
     figtitle, rowlabels, collabels, titles : optional
         The figure settings. The labels are determined automatically from
         the specs but can be overridden in a pinch.
@@ -1962,6 +2026,9 @@ def general_plot(
     kws_process, kws_collection, figlabel, pathlabel, gridlabels = parse_specs(
         dataset, rowspecs, colspecs, **kwargs  # parse input specs
     )
+    if matching:
+        facets = [key for key in dataset.facets.values if key[2] in MATCHING_MODELS or key[0] != 'CMIP6']  # noqa: E501
+        dataset = dataset.sel(facets=facets)
     if isinstance(gridlabels, tuple):  # both row and column specs non singleton
         grows, gcols = map(len, gridlabels)
         labels_default = (*gridlabels, [None] * grows * gcols)
@@ -2017,7 +2084,7 @@ def general_plot(
     # variables with different declared level-restricting arguments.
     fig = gs = None  # delay instantiation
     leggroup = groupnames is not True if leggroup is None else leggroup
-    methods, commands, groups_commands = [], [], {}
+    methods, commands, groups_compare, groups_commands = [], [], {}, {}
     count, count_items = 0, list(zip(kws_process, kws_collection, titles))
     print('Getting data:', end=' ')
     for num in range(grows * gcols):
@@ -2031,8 +2098,8 @@ def general_plot(
         print(f'{num + 1}/{grows * gcols}', end=' ')
         count += 1  # position accounting for gridskip
         ikws_process, ikws_collection, title = count_items[count - 1]
-        transpose, icycles, imethods, kw_merge = False, [], [], {}
-        arguments, kws_collection = [], []
+        transpose, icycles, imethods = False, [], []
+        arguments, kws_collection, kw_merge = [], [], {}
         for kw_process, kw_collection in zip(ikws_process, ikws_collection):
             transpose = transpose or kw_collection.other.get('transpose')
             attrs = kw_collection.attrs.copy()
@@ -2042,6 +2109,14 @@ def general_plot(
                 kw_merge.setdefault(key, value)
             for key, value in default.items():  # also adds 'method' key
                 kw_collection.command.setdefault(key, value)
+            if compare and len(args) == 1:  # TODO: new function?
+                keys = ('experiment', 'start', 'stop', 'period', 'initial', 'season', 'month', 'style')  # noqa: E501
+                coords = _get_scalars(*args, units=True, tuples=False)
+                control = coords.get('experiment', None) == 'picontrol'
+                igroup = tuple((key, val) for key, val in coords.items() if key not in keys)  # noqa: E501
+                jgroup = tuple((key, val) for key, val in coords.items() if key in keys)  # noqa: E501
+                groups_compare.update({igroup: args[0]} if control else {})
+                kw_collection.other.update({} if control else {'compare': igroup, 'group': jgroup})  # noqa: E501
             cycle = kw_collection.other.get('cycle')
             icycles.append(cycle)
             imethods.append(method)
@@ -2077,10 +2152,14 @@ def general_plot(
             if len(dims) < 2 and len(arguments) > 1 and idx > 0 and units not in iunits:
                 parent.format(**{f'{iaxis}color': icolors and icolors[-1] or 'k'})
                 child = getattr(parent, f'alt{iaxis}')(**{f'{iaxis}color': icolor})
-            kw_cmd = _pop_kwargs(kw_collection.other.copy(), _init_command)
-            kw_cmd.setdefault('shading', not idx)
-            kw_cmd.setdefault('contour', contour)
-            command, guide, args, kw_collection = _init_command(args, kw_collection, **kw_cmd)  # noqa: E501
+            kw_other = kw_collection.other.copy()
+            kw_init = _pop_kwargs(kw_collection, _init_command)
+            group = kw_other.get('compare')
+            if group and compare and group in groups_compare:  # sort using other bars
+                kw_init['compare'] = groups_compare[group]
+            kw_init.setdefault('shading', not idx)
+            kw_init.setdefault('contour', contour)
+            command, guide, args, kw_collection = _init_command(args, kw_collection, **kw_init)  # noqa: E501
             props = {key: getattr(val, 'name', val) for key, val in kw_collection.command.items()}  # noqa: E501
             coords = _get_scalars(*args, units=True, tuples=True)  # include multi-index
             if groupnames is True:
@@ -2129,6 +2208,7 @@ def general_plot(
         kws_other = [kw_collection.other.copy() for kw_collection in kws_collection]
         if command in ('contour', 'contourf', 'pcolormesh'):
             # Combine command arguments and keywords
+            # TODO: Move to separate function
             # NOTE: Possibly skip arguments based on index in group list.
             args = list(arguments[0][-1].coords[dim] for dim in arguments[0][-1].dims)
             args.extend(arg for i, args in enumerate(arguments) for arg in args if i not in argskip)  # noqa: E501
@@ -2182,6 +2262,7 @@ def general_plot(
             axs, arguments, kws_axes, kws_command, kws_other, kws_guide
         ):
             # Call plotting command and infer handles
+            # TODO: Move to separate function
             # NOTE: Still keep axes visible so super title is centered above empty
             # slots and so row and column labels can exist above empty slots.
             # NOTE: This applies restricted latitude limits so axes.inbounds will omit
@@ -2227,10 +2308,28 @@ def general_plot(
             # NOTE: Must be called for each group so violin widths scale over subplots.
             # WARNING: Critical to call format before _setup_axes so default label
             # and locator corrections can be overridden by user input.
+            # units = format_units(value.attrs.get('units', '')).strip('$')
+            # value = format(value.item(), '.3f' if 'cov' in compare else '.2f')
+            # label = defaults['symbol'] + rf'$\,=\,{value}\,{units}$'
+            # ax.format(uctitle=label, titleweight='bold')
             kw_fmt = {key: val for key, val in kw_axes.items() if 'proj' not in key}
             ax.format(**kw_fmt)  # apply formatting
+            mask = {}  # selection
             axis = 'x' if 'x' in command else 'y'
+            group1, group2 = kw_other.get('compare'), kw_other.get('group')
             autoscale = getattr(ax, f'get_autoscale{axis}_on')()
+            if group1 and group1 in groups_compare and args[-1].ndim > 1:
+                datas = (groups_compare[group1], args[-1])
+                dims = tuple(datas[0].sizes.keys() | datas[1].sizes.keys())
+                mask.update({'lat': slice(-60, 60)} if 'lat' in dims else {})
+                mask.update({'lon': slice(100, 280)} if 'lon' in dims else {})
+                datas = tuple(data.sel(mask) for data in datas)
+                compare = 'corr' if not isinstance(compare, str) else compare
+                value, defaults = _reduce_datas(*datas, compare, dim=dims, ocean=True)
+                keys = ('project', 'start', 'stop', 'period')
+                groups = tuple((key, val) for key, val in (*group1, *group2))
+                head = ', '.join(f'{key}={val}' for key, val in groups if key in keys)
+                print(f'\n{head} {compare}: {value.item():.4f} {value.units}', end='')
             if ax._name == 'cartesian':
                 xunits, yunits = _setup_axes(ax, *args, command=command)
                 groups_xunits.setdefault(xunits, []).append(ax)
@@ -2244,8 +2343,8 @@ def general_plot(
                 oneone = oneone or kw_other.get('oneone', False)
                 handle = _setup_scatter(ax, *args, handle, **kwarg)  # noqa: E501
             if 'violin' in command:
-                props = ('alpha', 'hatch', 'linewidth', 'edgecolor')
-                kwarg = _pop_kwargs(kw_other.copy(), props, _setup_violins)
+                keys = ('alpha', 'hatch', 'linewidth', 'edgecolor')
+                kwarg = _pop_kwargs(kw_other.copy(), keys, _setup_violins)
                 line = [line for line in ax.lines if line not in prevlines]
                 width = kw_command.get('width', None)  # optionally override
                 handle = _setup_violins(ax, data, handle, line, width=width, **kwarg)

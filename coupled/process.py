@@ -133,10 +133,10 @@ def _get_parts(
         search, replace = 'sensible', 'dry'
     elif name == 'tdev':  # TODO: define other 'relative' variables?
         parts, relative = ('tstd',), (True,)
-        attrs.update(units='K', long_name='relative warming')
+        attrs.update(units='K', long_name='temperature anomaly', short_name='anomaly')
     elif name == 'tabs':  # warming pattern for scaled sensitivity
         parts, product = ('tpat', 'ecs'), (True,)
-        attrs.update(units='K', long_name='effective warming')
+        attrs.update(units='K', long_name='temperature response', short_name='response')
     elif param == 'ts' or param == 'ta':  # eqtemp = temp - (temp - eqtemp) (see below)
         delta = name.replace('_' + param, '_dt')  # climate minus implied deviation
         parts, signs = (param, delta), (1, -1)
@@ -146,7 +146,7 @@ def _get_parts(
         slope = name.replace('_dt', '_lam')  # feedback in denominator
         parts, signs, product = (value, slope), (1, -1), (True,)
         search, replace = 'flux', 'temperature'
-        attrs.update(units='K', long_name='temperature difference')
+        attrs.update(units='K', long_name='temperature deviation')
     elif not scaled and re.search(temp := r'(ecs|erf)(?:([0-9.-]+)x)?', name):
         parts = trans(temp, r'\1')
         scale = re.search(temp, name).group(2)
@@ -393,7 +393,7 @@ def get_result(
 
 
 def process_constraint(
-    data0, data1, constraint=None, constraint_kw=None, observed=None, perturb=False,
+    data0, data1, constraint=None, constraint_kw=None, observed=None, extended=None, perturb=False,  # noqa: E501
     noresid=False, noerror=False, internal=False, graphical=False, pctile=None, N=None, **kwargs,  # noqa: E501
 ):
     """
@@ -454,11 +454,14 @@ def process_constraint(
     pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
     keys = ('initial', 'detrend', 'remove', 'correct')
     name = constraint if isinstance(constraint, str) else 'cre'
+    kernels = (data0.name or '')[:2] == 'cl'
     observed_kw = {key: data0.coords[key].item() for key in keys if key in data0.coords}
     observed_kw.update(constraint_kw or {})
-    observed_kw.update(statistic=['slope', 'sigma', 'dof'])
+    observed_kw.update({'statistic': ['slope', 'sigma', 'dof']})
+    observed_kw.update({'source': 'external'} if kernels else {})
     if isinstance(constraint, str):  # TODO: use generalized estimates
-        scalar = open_scalar(ceres=True)
+        suffix = 'he' if kernels else None
+        scalar = open_scalar(ceres=True, suffix=suffix)  # TODO: update this
         scalar = get_result(scalar, constraint, **observed_kw)
         constraint = scalar.values.tolist()
     if not np.iterable(constraint) or len(constraint) != 3:
@@ -475,16 +478,23 @@ def process_constraint(
     xmean, xscale, xdof = constraint  # note dof will have small effect
     xdof *= observed / historical  # increased degrees of freedom
     xscale /= np.sqrt(observed / historical)  # reduced regression error
-    xmin, xmax = stats.t(df=xdof, loc=xmean, scale=xscale).ppf(0.01 * pctile)
-    observations = np.array([xmin, xmean, xmax])
     idxs = data0.argsort().values  # critical so 'fit' has same coordinates
     data0 = data0.isel({data0.dims[0]: idxs})
     data1 = data1.isel({data0.dims[0]: idxs})
-    iscale = None  # internal variability scale
-    internal = 20 if internal is True else None
-    internal_kw = dict(**observed_kw, experiment='picontrol')
-    internal_kw.update(period=f'{internal}yr', error='internal', statistic='sigma')
+    extended = 50 if extended is True else extended or observed
+    escale = extended / observed  # extended version
+    xs1 = stats.t(df=xdof, loc=xmean, scale=xscale)
+    xs2 = stats.t(df=escale * xdof, loc=xmean, scale=xscale / np.sqrt(escale))
+    xmin1, xmax1 = xs1.ppf(0.01 * pctile)
+    xmin2, xmax2 = xs2.ppf(0.01 * pctile)
+    if extended == observed:
+        observations = np.array([xmin1, xmean, xmax1])
+    elif not internal:
+        observations = np.array([xmin1, xmin2, xmean, xmax2, xmax1])
     if internal:
+        internal = 20 if internal is True else internal
+        internal_kw = dict(**observed_kw, experiment='picontrol')
+        internal_kw.update(period=f'{internal}yr', error='internal', statistic='sigma')
         dataset = open_scalar(ceres=True)
         iscales = get_result(dataset, name, **internal_kw)
         iscale = iscales.mean().item()
@@ -496,8 +506,6 @@ def process_constraint(
         mean0 = data0.mean().values
         mean1 = data1.mean().values
     else:  # include regression error
-        # scalar = open_scalar(ceres=False)
-        # scalar = get_result(scalar, name, **internal_kw)
         mscale, mdof, M = 0.11, 1000, data0.size  # TODO: use errors from file
         offset0 = stats.t(df=mdof, loc=0, scale=mscale).rvs((N, M))
         offset1 = stats.t(df=mdof, loc=0, scale=mscale).rvs((N, M))
@@ -551,14 +559,29 @@ def process_constraint(
             bs = stats.t(loc=bmean, scale=bscale, df=rdof).rvs(N)
         else:
             bs = bmean
-        xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)  # observations
-        ys1 = rs + mean1 + bs * (xs + es - mean0)  # include both uncertainties
+        xs1, xs2 = xs1.rvs(N), xs2.rvs(N)
+        ys1 = rs + mean1 + bs * (xs1 + es - mean0)  # include both
+        ys2 = rs + mean1 + bs * (xs2 + es - mean0)
         if internal:  # no internal error
-            ys2 = rs + mean1 + bs * (xs - mean0)
+            as1 = rs + mean1 + bs * (xs1 - mean0)
+            as2 = rs + mean1 + bs * (xs2 - mean0)
         else:  # no regression error
-            ys2 = rs + mean1 + bmean * (xs - mean0)
-        constrained = np.insert(np.percentile(ys1, pctile), 1, np.mean(ys1))
-        alternative = np.insert(np.percentile(ys2, pctile), 1, np.mean(ys2))
+            as1 = rs + mean1 + bmean * (xs1 - mean0)
+            as2 = rs + mean1 + bmean * (xs2 - mean0)
+        ymean = np.mean(np.append(ys1, ys2))
+        amean = np.mean(np.append(as1, as2))
+        (ymin1, ymax1) = np.percentile(ys1, pctile)  # TODO: fix for multi pctiles
+        (ymin2, ymax2) = np.percentile(ys2, pctile)
+        (amin1, amax1) = np.percentile(as1, pctile)
+        (amin2, amax2) = np.percentile(as2, pctile)
+        if extended == observed:
+            ymins, ymean, ymaxs = (ymin1,), ymean, (ymax1,)
+            amins, amean, amaxs = (amin1,), ymean, (amax1,)
+        else:
+            ymins, ymean, ymaxs = (ymin1, ymin2), ymean, (ymax2, ymax1)
+            amins, amean, amaxs = (amin1, amin2), amean, (amax2, amax1)
+        constrained = np.array([*ymins, ymean, *ymaxs])
+        alternative = np.array([*amins, amean, *amaxs])
     return observations, alternative, constrained
 
 

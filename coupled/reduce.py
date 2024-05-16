@@ -226,7 +226,7 @@ def _get_filters(facets, project=None, institute=None):
     """
     # WARNING: Critical to assign name to filter so that _parse_specs can detect
     # differences between row and column specs at given subplot entry.
-    # NOTE: Averages across a given institution are done using the default method='avg'
+    # NOTE: Averages across a given institution are done using the default method 'avg'
     # with e.g. institute='GFDL'. Averages across each institute followed by reductions
     # along result are instead done with institute='avg' (see _institute_average)
     def _institute_other(key, num=None, facets=None):
@@ -251,24 +251,25 @@ def _get_filters(facets, project=None, institute=None):
         facets.names = index.names
         facets = xr.DataArray(facets, dims='facets', attrs=group.attrs)
         return data.climo.replace_coords(facets=facets)
-    inst_to_model = {facet[-2]: facet[-1] for facet in facets if len(facet) >= 2}
+    idx = 1 + any('CMIP' in facet[0] for facet in facets if len(facet) > 0)
+    inst_to_model = {tuple(facet[:idx]): facet[idx] for facet in facets if len(facet) >= 2}  # noqa: E501
     name_to_inst = {label: key for key, label in INSTITUTE_LABELS.items()}
     if not institute:
         inst = lambda key: True  # noqa: U100
     elif institute == 'avg':
         inst = _institute_average
     elif institute == 'flagship':
-        inst = lambda key: len(key) < 2 or key[-1] == inst_to_model.get(key[-2], None)
-    elif any(item == institute for pair in name_to_inst.items() for item in pair):  # noqa: E501
-        inst = lambda key: key[-2] == name_to_inst.get(institute, institute)
+        inst = lambda key: len(key) < 2 or key[idx] == inst_to_model.get(key[:idx], None)  # noqa: E501
+    elif any(item == institute for pair in name_to_inst.items() for item in pair):
+        inst = lambda key: key[idx - 1] == name_to_inst.get(institute, institute)
     else:
         raise ValueError(f'Invalid institute name {institute!r}.')
     project = (project or 'cmip').lower()
     number = re.sub(r'\Acmip', '', project)
     digits = max(1, len(number))
     projs = []  # permit e.g. cmip6556 or inst6556
-    for idx in range(0, digits, 2):
-        num = number[idx:idx + 2]
+    for jdx in range(0, digits, 2):
+        num = number[jdx:jdx + 2]
         if not num:
             proj = lambda key: True  # noqa: U100
         elif num in ('5', '6'):
@@ -455,7 +456,7 @@ def _reduce_data(
         with xr.set_options(keep_attrs=True):
             result = getattr(data.weighted(wgts), key)(**kwargs)
         descrip = 'mean' if method == 'avg' else 'median'
-        short = f'{descrip} {data.short_name}'  # only if no range included
+        short = f'{data.long_name}'  # NOTE: differs from other methods
         long = f'{descrip} {data.long_name}'
         if result.ndim == 1 and any(nums is not None for nums in (pctile, std)):
             nums = pctile if pctile is not None else std
@@ -476,7 +477,7 @@ def _reduce_data(
 
 
 def _reduce_datas(
-    data0, data1, method, dim=None, weight=None, pctile=None, std=None, invert=None,
+    data0, data1, method, dim=None, weight=None, pctile=None, std=None, invert=None, **kwargs,  # noqa: E501
 ):
     """
     Reduce pair of data arrays using arbitrary method.
@@ -536,58 +537,64 @@ def _reduce_datas(
         short_prefix, long_prefix = 'spatial ', f'{data1.short_name} spatial '
     else:  # TODO: revisit this and permit customization
         short_prefix, long_prefix = '', f'{data1.short_name} '
-    if not weight:
-        wgts = xr.ones_like(data0.coords[dim], dtype=float)
-    elif dim == 'facets':
-        wgts = _get_weights(data0, dim=dim)
-    else:
-        raise TypeError(f'Invalid option {weight=} for regression dimension {dim!r}.')
+    if dim == 'facets':
+        wgts, manual = _get_weights(data0, dim=dim) if weight else None, True
+    else:  # possibly auto weights
+        wgts, manual = None, False if weight is None else not weight
     if method == 'dist':  # scatter or bars
         if max(data0.ndim, data1.ndim) > 1:
             raise ValueError(f'Invalid dimensionality {data0.ndim} x {data1.ndim} for distribution.')  # noqa: E501
+        if kwargs:
+            raise TypeError(f'Unexpected keyword arguments {kwargs}.')
         result0, result1 = data0[~data0.isnull()], data1[~data1.isnull()]
         result0, result1 = xr.align(result0, result1)  # intersection-style broadcast
         result = (result0, result1)
         name = None
+        # sym = r'$X$'
     elif method == 'diff':  # composite difference along first arrays
-        result0, result1 = _get_composite(data0, data1, pctile=pctile, dim=dim)
+        kw_composite = dict(dim=dim, pctile=pctile, **kwargs)
+        result0, result1 = _get_composite(data0, data1, **kw_composite)
         result = result1 - result0
         result = result.climo.dequantify()
         result.attrs['units'] = data1.units
         short = f'{data1.short_name} composite difference'
         long = f'{data0.long_name}-composite {data1.long_name} difference'
+        # sym = r'$\Delta X$'
     elif method in ('corr', 'rsq'):
-        manual = dim == 'facets'
         kw_regress = dict(stat='corr', nobnds=True, manual=manual, weights=wgts)
-        result = regress_dims(data0, data1, dim, **kw_regress)
+        result = regress_dims(data0, data1, dim, **kwargs, **kw_regress)
         if method == 'corr':  # correlation coefficient
             result = result.climo.to_units('dimensionless').climo.dequantify()
             result.attrs['units'] = ''
             short = f'{short_prefix}correlation'
             long = f'{long_prefix}correlation coefficient'
+            # sym = '$r$'
         else:  # variance explained
             result = (result ** 2).climo.to_units('percent').climo.dequantify()
             result.attrs['units'] = '%'
             short = f'{short_prefix}variance explained'
             long = f'{long_prefix}variance explained'
+            # sym = '$r^2$'
     elif method in ('cov', 'proj', 'slope'):
         nobnds = all(nums is None for nums in (pctile, std))
-        manual = dim == 'facets'
-        kw_regress = dict(stat=method, nobnds=nobnds, manual=manual)
-        results = regress_dims(data0, data1, dim, weights=wgts, **kw_regress)
+        kw_regress = dict(stat=method, nobnds=nobnds, weights=wgts, manual=manual)
+        results = regress_dims(data0, data1, dim=dim, **kwargs, **kw_regress)
         result, *bnds = (results,) if isinstance(results, xr.DataArray) else results
         if method == 'cov':
             result.attrs['units'] = f'{data1.units} {data0.units}'
             short = f'{short_prefix}covariance'
             long = f'{long_prefix}covariance'
+            # sym = r'$\sigma^2_{12}$'  # slope
         elif method == 'proj':
             result.attrs['units'] = data1.units
             short = f'{short_prefix}projection'
             long = f'{long_prefix}projection'
+            # sym = r'$\sigma_{12}$'  # projection
         else:
             result.attrs['units'] = f'{data1.units} / ({data0.units})'
             short = f'{short_prefix}regression coefficient'
             long = f'{long_prefix}regression coefficient'
+            # sym = r'$\beta_{12}$'  # slope
         if not nobnds and result.ndim == 1:
             key = 'pctile' if pctile is not None else 'std'
             nums = pctile if pctile is not None else std
@@ -599,7 +606,8 @@ def _reduce_datas(
             defaults.update({'shadealpha': 0.25, 'fadealpha': 0.15})
     else:
         raise ValueError(f'Invalid double-variable method {method}')
-    defaults.update({'name': name, 'short_name': short, 'long_name': long})
+    kw = {'name': name, 'short_name': short, 'long_name': long}
+    defaults.update(kw)
     return result, defaults
 
 
@@ -690,13 +698,13 @@ def reduce_facets(
     datas = tuple(data.copy() for data in datas)  # e.g. for distribution updates
     default = 'dist' if ndim == 1 else 'avg' if len(datas) == 1 else 'slope'
     method, *options = (method or default).split('_')
-    kwargs = dict(dim='facets', method=method, **kwargs)
+    kwargs = dict(dim='facets', **kwargs)
     anomaly = 'anom' in options
     normalize = 'norm' in options
     if len(datas) == 1:
-        data, defaults = _reduce_data(*datas, preserve=preserve, **kwargs)
+        data, defaults = _reduce_data(*datas, method, preserve=preserve, **kwargs)
     elif len(datas) == 2:
-        data, defaults = _reduce_datas(*datas, invert=invert, **kwargs)
+        data, defaults = _reduce_datas(*datas, method, invert=invert, **kwargs)
     else:
         raise ValueError(f'Unexpected argument count {len(datas)}.')
     if anomaly:

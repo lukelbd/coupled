@@ -252,14 +252,14 @@ def _get_filters(facets, project=None, institute=None):
         facets = xr.DataArray(facets, dims='facets', attrs=group.attrs)
         return data.climo.replace_coords(facets=facets)
     idx = 1 + any('CMIP' in facet[0] for facet in facets if len(facet) > 0)
-    inst_to_model = {tuple(facet[:idx]): facet[idx] for facet in facets if len(facet) >= 2}  # noqa: E501
+    inst_to_model = {tuple(facet[:idx]): facet[idx] for facet in facets if len(facet) > 2}  # noqa: E501
     name_to_inst = {label: key for key, label in INSTITUTE_LABELS.items()}
     if not institute:
         inst = lambda key: True  # noqa: U100
     elif institute == 'avg':
         inst = _institute_average
     elif institute == 'flagship':
-        inst = lambda key: len(key) < 2 or key[idx] == inst_to_model.get(key[:idx], None)  # noqa: E501
+        inst = lambda key: len(key) <= 2 or key[idx] == inst_to_model.get(key[:idx], None)  # noqa: E501
     elif any(item == institute for pair in name_to_inst.items() for item in pair):
         inst = lambda key: key[idx - 1] == name_to_inst.get(institute, institute)
     else:

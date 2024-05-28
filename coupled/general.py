@@ -341,7 +341,7 @@ def _get_annotations(data):
     if name not in index.names:
         raise TypeError('Unexpected facets levels', ', '.join(map(repr, index.names)))  # noqa: E501
     projs = [{'project': proj} for proj in _get_projects(data)]
-    labels = get_labels(*projs, short=True, heading=False, identical=False)
+    labels = get_labels(*projs, short=True, heading=False, identical=False, refwidth=np.inf)  # noqa: E501
     if all(labels):  # used for legends
         coords['label'] = xr.DataArray(labels, dims='facets')
     labels = [get_label(name, value) for value in data.coords[name].values]
@@ -410,7 +410,7 @@ def _get_projects(data):
     return np.array(projects)
 
 
-def _get_scalars(*args, units=True, tuples=False):
+def _get_scalars(*args, units=False, tuples=False, pairs=False):
     """
     Get the scalar coordinates for labels and groups.
 
@@ -430,6 +430,7 @@ def _get_scalars(*args, units=True, tuples=False):
     """
     # NOTE: This is used in both _merge_dists and in general_plot for assigning
     # groups of shared colormaps and legends based on coordinates.
+    tuples = False if tuples is None else tuples
     attrs = ('name', 'units') if units else ('name',)
     keys = list(attrs)
     keys += sorted(set(key for arg in args for key in getattr(arg, 'coords', ())))
@@ -447,7 +448,10 @@ def _get_scalars(*args, units=True, tuples=False):
                 continue
             if np.issubdtype(value.dtype, float) and np.isnan(value):
                 continue
-            if isinstance(value := value.item(), tuple) and not tuples:
+            value = value.item()
+            if isinstance(value, tuple) and pairs and len(value) == 2:
+                value = value[-1]
+            if isinstance(value, tuple) and not tuples:
                 continue
             values.append(value)
         if len(args) == len(values):
@@ -617,8 +621,11 @@ def _props_command(data, cycle=None, autocolor=False, flagships=None, weights=No
     markersize = 0.1 * pplt.rc.fontsize ** 2  # default reference scatter marker size
     projects = _get_projects(data)  # scalar or float
     experiment = np.atleast_1d(data.coords.get('experiment', None))
+    period = np.atleast_1d(data.coords.get('period', None))
     start = np.atleast_1d(data.coords.get('start', None))
     stop = np.atleast_1d(data.coords.get('stop', None))
+    if period.size == 1:
+        period = np.repeat(period, period.size)
     if stop.size == 1:  # TODO: figure out issue and remove kludge
         stop = np.repeat(stop, start.size)
     if start.size == 1:  # TODO: figure out issue and remove kludge
@@ -628,8 +635,11 @@ def _props_command(data, cycle=None, autocolor=False, flagships=None, weights=No
     mask = np.array([value is None or value != value for value in experiment])
     mask1 = np.array([value is None or value != value for value in start])
     mask2 = np.array([value is None or value != value for value in stop])
+    fill1 = np.where((period == 'late'), 20, 0)  # newer period style datasets
+    fill2 = np.where((period == 'early'), 20, 150)  # newer period style datasets
     experiment = np.where(mask, 'abrupt4xco2', experiment)
-    start, stop = np.where(mask1, 0, start), np.where(mask2, 150, stop)
+    start = np.where(mask1, fill1, start)
+    stop = np.where(mask2, fill2, stop)
 
     # Standardize coordinates for inferring default properties
     # WARNING: Coordinates created by _merge_dists might have NaN in place
@@ -639,15 +649,15 @@ def _props_command(data, cycle=None, autocolor=False, flagships=None, weights=No
     projs = [int(opt[4] if opt and len(opt) in (5, 6) else 0) for opt in projects]
     groups = [int(opt[4:] if opt and len(opt) in (5, 6) else 0) for opt in projects]
     compare = any(value and value == 'abrupt4xco2' for value in experiment)
-    perturbs = {'picontrol': 0, 'abrupt4xco2': 1, 'abrupt4xco2-picontrol': 1 + compare}
-    perturbs = [perturbs.get(opt, 2) for opt in experiment]
+    indices = {'picontrol': 0, 'abrupt4xco2': 1, 'abrupt4xco2-picontrol': 1 + compare}
+    indices = [indices.get(opt, 2) for opt in experiment]
     periods = list(zip(start.tolist(), stop.tolist()))
-    perturbs = perturbs * (len(periods) if len(perturbs) == 1 else 1)
-    periods = periods * (len(perturbs) if len(periods) == 1 else 1)
-    options = list(zip(perturbs, *zip(*periods)))
+    indices = indices * (len(periods) if len(indices) == 1 else 1)
+    periods = periods * (len(indices) if len(periods) == 1 else 1)
+    options = list(zip(indices, *zip(*periods)))
     others = []  # other coordinates for color cycle
     exclude = ('project', 'experiment', 'start', 'stop')
-    exclude += () if len(set(perturbs)) == 1 else ('style',)
+    exclude += () if len(set(indices)) == 1 else ('style',)
     index = data.indexes.get(data.dims and data.dims[0], pd.Index([]))
     for key in index:  # iterate over multi-index values
         other = tuple(key for name, key in zip(index.names, key) if name not in exclude)
@@ -657,14 +667,14 @@ def _props_command(data, cycle=None, autocolor=False, flagships=None, weights=No
     # NOTE: Here 'cycle' used for groups without other settings by default.
     # periods = periods * (len(perturbs) if len(periods) == 1 else 1)
     cycle = CYCLE_DEFAULT if cycle is None else pplt.get_colors(cycle)
-    delta = 0 if perturbs[0] == 0 and len(set(perturbs)) == 1 else 1
+    delta = 0 if indices[0] == 0 and len(set(indices)) == 1 else 1
     control = [(0, 0, 150)]
     early = [(delta, 0, 20), (delta, 0, 50), (delta, 2, 20), (delta, 2, 50)]
     late = [(delta, 20, 150), (delta, 100, 150)]  # label as 'late' but is just control
     full = [(delta, 0, 150), (delta, 2, 150)]
     edge1 = {key: 'gray3' for key in early}  # early groups
     edge2 = {key: 'gray9' for key in (*late, *full)}
-    hatch0 = {key: 'xxxxxx' for key in control}  # unperturbed
+    hatch0 = {key: 'xxxxxx' for key in control}  # internal
     hatch1 = {key: 'ooo' for key in early}
     hatch1 = {} if ('20-0', '150-20') in periods else hatch1
     hatch2 = {key: '...' for key in (*late, *full)}
@@ -724,7 +734,7 @@ def _props_command(data, cycle=None, autocolor=False, flagships=None, weights=No
 
 
 def _init_command(
-    args, kw_collection, horizontal=False, transpose=False, compare=None,
+    args, kw_collection, horizontal=False, transpose=False, sortby=None,
     violin=True, shading=True, pcolor=False, contour=None,
 ):
     """
@@ -740,7 +750,7 @@ def _init_command(
         Whether to use vertical or horizontal orientation.
     transpose : bool, optional
         Whether to transpose variables for line plots.
-    compare : array-like, optional
+    sortby : array-like, optional
         The array to optionally use for sorting bar plots.
     violin : bool, optional
         Whether to use violins for several 1D array inputs.
@@ -802,7 +812,7 @@ def _init_command(
         horizontal = kw_collection.other.get('horizontal', False)
         flagships, weights = _get_institutes(data)  # WARNING: critical to come first
         if nargs == 1 and not ragged and dists:  # sort distribution
-            idxs = (data if compare is None else compare).argsort()
+            idxs = (data if sortby is None else sortby).argsort()
             args = (*args[:-1], data := data[idxs.values])
             weights = np.take(weights, idxs)
             flagships = np.take(flagships, idxs)
@@ -968,7 +978,7 @@ def _init_objects(arguments, kws_collection, geom=None, fig=None, gs=None, title
 
 def _merge_dists(
     dataset, arguments, kws_collection, horizontal=False,
-    labels=None, offset=None, intersect=False, correlation=False,
+    labels=None, scale=None, offset=None, intersect=False, correlation=False,
 ):
     """
     Merge distributions into single array and prepare violin and bar plots.
@@ -987,6 +997,8 @@ def _merge_dists(
         Whether to apply default props.
     labels : list of str, optional
         Optional overrides for outer labels.
+    scale : float, optional
+        Optional scaling used for label splitting.
     offset : float, optional
         Offset between outer labels.
     intersect : bool, optional
@@ -1019,7 +1031,7 @@ def _merge_dists(
     if nargs == 1:
         # Get violin data. To facillitate putting feedbacks and sensitivity in
         # same panel, scale 4xCO2 values into 2xCO2 values. Also detect e.g.
-        # unperturbed sensitivitye stimates and set all values to zero.
+        # internal sensitivitye stimates and set all values to zero.
         refwidth = 1 + 0.25 * len(arguments)  # default width (compare with below)
         refheight = 2.5  # default thickness (compare with below)
         boxdata = bardata = annotations = None
@@ -1096,7 +1108,7 @@ def _merge_dists(
     # labels on the legend and only denote "outer-most" coordinates with outer labels.
     kws_outer, kws_inner = {}, {}  # for label inference
     kw_scalar, kw_vector, kw_outer, kw_inner = {}, {}, {}, {},
-    kw_coords = _get_scalars(*args, units=False, tuples=False)  # drop multi-index
+    kw_coords = _get_scalars(*args, pairs=True)  # select second pair
     kw_counts = {key: len(list(itertools.groupby(value))) for key, value in kw_coords.items()}  # noqa: E501
     for key, values, count in zip(kw_coords, kw_coords.values(), kw_counts.values()):
         if key == 'units':  # used for queue identifiers
@@ -1112,7 +1124,7 @@ def _merge_dists(
     num, base, locs, ticks, kw_groups = 0, 0, [], [], []
     kws_inner = [dict(zip(kw_inner, vals)) for vals in zip(*kw_inner.values())]
     kws_outer = [dict(zip(kw_outer, vals)) for vals in zip(*kw_outer.values())]
-    for kw_inner in kws_inner:  # use e.g. 'perturbed' and 'unperturbed'
+    for kw_inner in kws_inner:
         kw_inner.setdefault('name', 'net')
 
     # Infer object and tick locations
@@ -1126,7 +1138,7 @@ def _merge_dists(
         count = len(list(items))  # convert itertools._group object
         ilocs = step * np.arange(base, base + count - 0.5)
         ikws = kws_inner[num:num + count]
-        keys = [('name',), ('project',), ('experiment', 'start', 'stop')]
+        keys = [('name',), ('project',), ('experiment', 'start', 'stop', 'period')]
         for key in keys:  # TODO: generalize the above 'keys' groups
             values = [tuple(kw.get(_) for _ in key) for kw in ikws]
             lengths = [len(list(items)) for _, items in itertools.groupby(values)]
@@ -1143,7 +1155,7 @@ def _merge_dists(
     # Get inner and outer labels
     # NOTE: This also tries to set up appropriate automatic line breaks.
     # NOTE: Use 'skip_name' for inner labels to prevent unnecessary repetitions.
-    kw_labels = dict(short=False, heading=False, identical=False, dataset=dataset)
+    kw_labels = dict(force=True, short=False, heading=False, identical=False, scale=scale, dataset=dataset)  # noqa: E501
     key, other = ('refheight', 'refwidth') if horizontal else ('refwidth', 'refheight')
     refwidth = kw_collection.figure.setdefault(key, refwidth)
     refheight = kw_collection.figure.setdefault(other, refheight)
@@ -1889,18 +1901,18 @@ def general_plot(
     colspecs=None,
     compare=False,
     matching=False,
-    figtitle=None,
-    figprefix=None,
-    figsuffix=None,
-    rowlabels=None,
-    collabels=None,
-    titles=None,
     labelbottom=False,
     labelright=False,
     labelparams=False,
     standardize=False,
     identical=False,
     groupnames=True,
+    figtitle=None,
+    figprefix=None,
+    figsuffix=None,
+    rowlabels=None,
+    collabels=None,
+    titles=None,
     ncols=None,
     nrows=None,
     gridskip=None,
@@ -1933,17 +1945,11 @@ def general_plot(
         Tuples containing the ``(name, kwargs)`` passed to ``ClimoAccessor.get``
         used to generate data in rows and columns. See `parse_specs` for details.
     compare : bool or str, optional
-        Whether to compare perturbed panels with unperturbed panels using
+        Whether to compare forced panels with internal panels using
         possibly given reduction method (default ``''``).
     matching : bool, optional
-        Whether to filter to CMIP6 models matching He et al. instead of
-        using all models.
-    figtitle, rowlabels, collabels, titles : optional
-        The figure settings. The labels are determined automatically from
-        the specs but can be overridden in a pinch.
-    figprefix, figsuffix : str, optional
-        Optional modifications to the default figure title determined
-        from shared reduction instructions.
+        Whether to filter to the CMIP6 models matching He et al. models instead
+        of using all available models.
     labelbottom, labelright : bool, optional
         Whether to label column labels on the bottom and row labels
         on the right. Otherwise they are on the left and top.
@@ -1972,6 +1978,10 @@ def general_plot(
 
     Other Parameters
     ----------------
+    figtitle, rowlabels, collabels, titles : optional
+        Optional figure and label overrides.
+    figprefix, figsuffix : str, optional
+        Optional modifications to the default figure title.
     nrows, ncols : float, optional
         Number of rows or columns when either of the plot specs are singleton.
     gridskip : int or sequence, optional
@@ -2110,13 +2120,14 @@ def general_plot(
             for key, value in default.items():  # also adds 'method' key
                 kw_collection.command.setdefault(key, value)
             if compare and len(args) == 1:  # TODO: new function?
-                keys = ('experiment', 'start', 'stop', 'period', 'initial', 'season', 'month', 'style')  # noqa: E501
-                coords = _get_scalars(*args, units=True, tuples=False)
+                keys = ('experiment', 'start', 'stop', 'season', 'month', 'time')
+                keys += ('style', 'period', 'initial', 'correct', 'detrend', 'remove')
+                coords = _get_scalars(*args, units=True)
                 control = coords.get('experiment', None) == 'picontrol'
                 igroup = tuple((key, val) for key, val in coords.items() if key not in keys)  # noqa: E501
                 jgroup = tuple((key, val) for key, val in coords.items() if key in keys)  # noqa: E501
                 groups_compare.update({igroup: args[0]} if control else {})
-                kw_collection.other.update({} if control else {'compare': igroup, 'group': jgroup})  # noqa: E501
+                kw_collection.other.update({} if control else {'other': igroup, 'group': jgroup})  # noqa: E501
             cycle = kw_collection.other.get('cycle')
             icycles.append(cycle)
             imethods.append(method)
@@ -2154,14 +2165,14 @@ def general_plot(
                 child = getattr(parent, f'alt{iaxis}')(**{f'{iaxis}color': icolor})
             kw_other = kw_collection.other.copy()
             kw_init = _pop_kwargs(kw_collection, _init_command)
-            group = kw_other.get('compare')
-            if group and compare and group in groups_compare:  # sort using other bars
-                kw_init['compare'] = groups_compare[group]
+            other = kw_other.get('other')  # sort using other bars
+            if other and compare and other in groups_compare:
+                kw_init['sortby'] = groups_compare[other]
             kw_init.setdefault('shading', not idx)
             kw_init.setdefault('contour', contour)
             command, guide, args, kw_collection = _init_command(args, kw_collection, **kw_init)  # noqa: E501
             props = {key: getattr(val, 'name', val) for key, val in kw_collection.command.items()}  # noqa: E501
-            coords = _get_scalars(*args, units=True, tuples=True)  # include multi-index
+            coords = _get_scalars(*args, units=True, tuples=True)
             if groupnames is True:
                 keys = ('name',)
             elif groupnames is False:
@@ -2316,10 +2327,10 @@ def general_plot(
             ax.format(**kw_fmt)  # apply formatting
             mask = {}  # selection
             axis = 'x' if 'x' in command else 'y'
-            group1, group2 = kw_other.get('compare'), kw_other.get('group')
+            other, group = kw_other.get('other'), kw_other.get('group')
             autoscale = getattr(ax, f'get_autoscale{axis}_on')()
-            if group1 and group1 in groups_compare and args[-1].ndim > 1:
-                datas = (groups_compare[group1], args[-1])
+            if other and other in groups_compare and args[-1].ndim > 1:
+                datas = (groups_compare[other], args[-1])
                 dims = tuple(datas[0].sizes.keys() | datas[1].sizes.keys())
                 mask.update({'lat': slice(-60, 60)} if 'lat' in dims else {})
                 mask.update({'lon': slice(100, 280)} if 'lon' in dims else {})
@@ -2327,7 +2338,7 @@ def general_plot(
                 compare = 'corr' if not isinstance(compare, str) else compare
                 value, defaults = _reduce_datas(*datas, compare, dim=dims, ocean=True)
                 keys = ('project', 'start', 'stop', 'period')
-                groups = tuple((key, val) for key, val in (*group1, *group2))
+                groups = tuple((key, val) for key, val in (*other, *group))
                 head = ', '.join(f'{key}={val}' for key, val in groups if key in keys)
                 print(f'\n{head} {compare}: {value.item():.4f} {value.units}', end='')
             if ax._name == 'cartesian':

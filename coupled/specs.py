@@ -166,13 +166,13 @@ GENERAL_LABELS = {
     ('remove', 'climate'): None,
     ('remove', 'average'): None,
     ('detrend', ''): None,
-    ('detrend', 'x'): '$T$-detrended',
-    ('detrend', 'y'): '$R$-detrended',
-    ('detrend', 'xy'): 'detrended',
+    ('detrend', 'x'): None,  # avoid adding labels to merged distributions
+    ('detrend', 'y'): None,
+    ('detrend', 'xy'): None,
     ('error', 'regression'): None,
     ('error', 'internal'): 'internal',
     ('correct', ''): None,
-    ('correct', 'x'): None,
+    ('correct', 'x'): None,  # avoid adding labels to merged distributions
     ('correct', 'y'): None,
     ('correct', 'r'): None,
     ('plev', 'int'): None,
@@ -385,9 +385,11 @@ def _pop_kwargs(kwargs, *args):
         The options or functions.
     """
     from .datasets import FACETS_LEVELS, VERSION_LEVELS
+    from observed.feedbacks import TRANSLATE_PARAMS
     keys = []
-    keys_levels = (*FACETS_LEVELS, *VERSION_LEVELS, 'statistic')
-    keys_levels += ('area', 'volume', 'remove', 'detrend', 'correct')
+    keys_levels = sorted(set(name for name, _ in TRANSLATE_PARAMS.values()))
+    keys_levels.extend((*FACETS_LEVELS, *VERSION_LEVELS, 'statistic'))
+    keys_levels.extend(('area', 'volume', 'remove', 'detrend', 'correct'))
     for arg in args:
         if callable(arg):
             arg = inspect.signature(arg)
@@ -467,8 +469,8 @@ def _group_parts(kwargs, keep_operators=False):
     """
     # WARNING: Need process_data() to accomodate situations where e.g. generating
     # several 'scatter plots' that get concatenated into a bar plot of 'late minus
-    # early vs. unperturbed' regression coefficients, in which case reduce_general()
-    # will translate denominator to 'full unperturbed minus full unperturbed' i.e.
+    # early vs. internal' regression coefficients, in which case reduce_general()
+    # will translate denominator to 'full internal minus full internal' i.e.
     # zero, and case where we are doing e.g. spatial version of this regression,
     # where reduce_general() gets regression coefficients before the subtraction
     # operation so there is no need to worry about denominator. Solution is to
@@ -533,7 +535,9 @@ def _merge_labels(*labels, identical=False):
     return labels
 
 
-def _split_label(label, refwidth=None, fontsize=None, offset=None, nmax=None):
+def _split_label(
+    label, refwidth=None, fontsize=None, shift=None, scale=None, nmax=None,
+):
     """
     Helper function to split the label into separate lines.
 
@@ -545,8 +549,10 @@ def _split_label(label, refwidth=None, fontsize=None, offset=None, nmax=None):
         The reference maximum width.
     fontsize : unit-spec, optional
         The font size used for scaling.
-    offset : bool, optional
-        Whether to offset the final line.
+    shift : bool, optional
+        Whether to shift the width to account for a-b-c labels.
+    scale : float, optional
+        Additional scaling applied to the label width calculation.
     nmax : int, optional
         The maximum number of breaks to use.
     """
@@ -585,11 +591,12 @@ def _split_label(label, refwidth=None, fontsize=None, offset=None, nmax=None):
         icheck[mask1] = np.nan  # no breaks here
         icheck[mask2] -= adjust
     size_ = fontsize or pplt.rc['font.size']
-    scale = pplt.utils._fontsize_to_pt(size_) / pplt.rc['font.size']
+    size_ = pplt.utils._fontsize_to_pt(size_) / pplt.rc['font.size']
     width = refwidth or pplt.rc['subplots.refwidth']
     width = pplt.units(width, 'in', 'em')
-    width -= EM_PER_ABC * scale if offset else 0
-    splits = CHAR_PER_EM * width * np.arange(1, 20) / scale
+    width -= EM_PER_ABC * size_ if shift else 0
+    width *= CHAR_PER_EM * (scale or 1)
+    splits = width * np.arange(1, 20) / size_
     seen, chars, count = set(), list(label), 0  # convert string to list
     for split in splits:
         idxs, = np.where(icheck <= split)
@@ -672,28 +679,28 @@ def get_path(dataset, *kws_process):
                 continue
             if label not in parts:  # e.g. 'avg' to be ignored
                 parts.append(label)
-        if parts:
+        if parts and parts not in labels:
             labels.append(parts)  # sort these so newer orders overwrite
     result = '_'.join('-'.join(sorted(parts)) for parts in labels)
     return result
 
 
-def get_label(key, value, mode=None, dataset=None, perturbed=True):
+def get_label(key, value, mode=None, force=False, dataset=None, experiment=True):
     """
     Return an arbitrary label type based on the dataset.
 
     Parameters
     ----------
-    key : str
-        The reduce coordinate.
-    value : str or float
-        The reduce selection.
+    key, value : str
+        The reduce coordinate and selection.
+    force : bool
+        Whether to avoid translations to None.
     mode : {'long', 'short', 'path'}, optional
         The label mode used to translate selections.
     dataset : xarray.Dataset, optional
         The source dataset. Required for `name` labels.
-    perturbed : bool, optional : str, optional
-        Whether to use ``'unperturbed'`` and ``'perturbed'`` labels.
+    experiment : bool, optional : str, optional
+        Whether to use ``'internal'`` and ``'forced'`` labels.
 
     Returns
     -------
@@ -707,10 +714,12 @@ def get_label(key, value, mode=None, dataset=None, perturbed=True):
     from .feedbacks import ALIAS_VARIABLES, VARIABLE_ALIASES
     from .process import get_result  # avoid recursive import
     mode = mode or 'long'
-    if mode not in ('path', 'short', 'long'):
-        raise ValueError(f'Invalid label mode {mode!r}.')
-    operator_to_label = {'+': 'plus', '-': 'minus', '*': 'times', '/': 'over'}
     dataset = dataset or xr.Dataset({})
+    translates = {'path': TRANSLATE_PATHS, 'short': TRANSLATE_SHORTS, 'long': TRANSLATE_LONGS}  # noqa: E501
+    if mode not in translates:
+        raise ValueError(f'Invalid label mode {mode!r}.')
+    translate_operator = {'+': 'plus', '-': 'minus', '*': 'times', '/': 'over'}
+    translate_part = translates.get(mode, {})
     parts = (value,) if key in ('model', 'institute') else _expand_parts(value)
     labels = []
     for part in parts:
@@ -718,8 +727,8 @@ def get_label(key, value, mode=None, dataset=None, perturbed=True):
             if part and '|' in part:
                 *_, part = part.split('|')  # numerator in pattern regression
             part = ALIAS_VARIABLES.get(part, part)
-            if part and part in operator_to_label:
-                label = part if mode == 'path' else operator_to_label[part]
+            if part and part in translate_operator:
+                label = part if mode == 'path' else translate_operator[part]
             elif mode == 'path':
                 label = VARIABLE_ALIASES.get(part, part)
             elif mode == 'short':
@@ -729,20 +738,18 @@ def get_label(key, value, mode=None, dataset=None, perturbed=True):
         elif part is None or isinstance(part, (str, tuple)):  # can have 'None' labels
             if part and part[0] == 'a' and part != 'ann' and key in ('region', 'period'):  # noqa: E501
                 part = part if mode == 'path' else part[1:]  # abrupt-only label
-            if part == (None, None):
-                label = None
-            elif part and part[0] in operator_to_label:  # e.g. (-, -) startstop tuples
-                label = part[0] if mode == 'path' else operator_to_label[part[0]]
-            elif mode == 'path':  # e.g. 'startstop'
-                label = TRANSLATE_PATHS.get((key, part), part)
-            elif mode == 'short':
-                label = TRANSLATE_SHORTS.get((key, part), part)
-            else:  # e.g. 'startstop'
-                label = TRANSLATE_LONGS.get((key, part), part)
-            if perturbed and mode != 'path' and part == 'picontrol':
-                label = 'unperturbed'
-            if perturbed and mode != 'path' and part == 'abrupt4xco2':
-                label = 'perturbed'
+            if part and part == (None, None):
+                part = None
+            if part and part[0] in translate_operator:
+                label = part[0]  # e.g. (-, -) startstop tuples
+                label = label if mode == 'path' else translate_operator[label]
+            else:
+                label = translate_part.get((key, part), part)
+                label = part if force and label is None else label
+            if experiment and mode != 'path' and part == 'picontrol':
+                label = 'internal'
+            if experiment and mode != 'path' and part == 'abrupt4xco2':
+                label = 'forced'
             if isinstance(label, tuple) and any(_ is None for _ in label):
                 label = ''
             elif isinstance(label, tuple):  # i.e. 'startstop' without shorthand
@@ -765,13 +772,13 @@ def get_label(key, value, mode=None, dataset=None, perturbed=True):
             if '-' in label and f'{deg}{pos}' in label:
                 label = label.replace('-', '').replace(f'{deg}{pos}', f'{deg}{neg}')
         if mode == 'path':  # extra processing
-            for symbol in (deg, *operator_to_label, '_', ' '):
+            for symbol in (deg, *translate_operator, '_', ' '):
                 label = label.lower().replace(symbol, '')
         labels.append(label)
     if len(labels) > 1:  # if result is still weird user should pass explicit values
-        if labels[0] in operator_to_label.values():
+        if labels[0] in translate_operator.values():
             labels = labels[1:]  # e.g. experiment=abrupt4xco2, stop=None-20
-        if labels[-1] in operator_to_label.values():
+        if labels[-1] in translate_operator.values():
             labels = labels[:-1]  # e.g. experiment=abrupt4xco2-picontrol, stop=20-None
     sep = '' if mode == 'path' else ' '
     label = sep.join(labels)
@@ -779,7 +786,7 @@ def get_label(key, value, mode=None, dataset=None, perturbed=True):
 
 
 def get_labels(
-    *kws_process, short=False, heading=False, identical=False, skip_name=False, dataset=None, **kwargs,  # noqa: E501
+    *kws_process, short=False, heading=False, identical=False, skip_name=False, **kwargs,  # noqa: E501
 ):
     """
     Convert reduction operators into human-readable labels.
@@ -790,16 +797,16 @@ def get_labels(
         The reduction keyword arguments.
     short : bool, optional
         Whether to use short names instead of long.
+    force : bool
+        Whether to avoid translations to None.
     heading : bool, optional
         Whether to format the labels as headings.
     identical : bool, optional
         Whether to keep identical reduce operations across list.
     skip_name : bool, optional
         Whether to skip names and `spatial` in the label.
-    dataset : xarray.Dataset
-        The source dataset. Required for `name` labels.
     **kwargs
-        Passed to `_split_label`.
+        Passed to `get_label` and `_split_label`.
 
     Returns
     -------
@@ -843,7 +850,8 @@ def get_labels(
         order_back = ['name', 'area', 'volume', 'spatial']
         order_read = [key for key in ORDER_READABLE if key not in order_back] + order_back  # noqa: E501
     sorter = lambda key: order_read.index(key) if key in order_read else len(order_read)
-    kw_get = {'dataset': dataset, 'mode': 'short' if short else 'long'}
+    force = kwargs.pop('force', False)  # whether to forbid none labels
+    dataset = kwargs.pop('dataset', None)  # required for 'name' labels
     kws_label = []
     for n in range(2):  # index in possible correlation pair
         ikws_label = []
@@ -857,7 +865,7 @@ def get_labels(
                         continue
                     if skip_name and key in ('name', 'spatial'):
                         continue
-                    kw_label[key] = get_label(key, value, **kw_get)
+                    kw_label[key] = get_label(key, value, force=force, dataset=dataset)
                 nkws_label.append(kw_label)
             kw_label = {}  # merge labels for stuff inside subplot
             for key in sorted((key for kw in nkws_label for key in kw), key=sorter):
@@ -889,7 +897,9 @@ def get_labels(
         if not invert:
             kws_pair = kws_pair[::-1]  # place dependent variable *first*
         for key in sorted(keys, key=sorter):
+            seen = set()  # ignore e.g. 'early early' due to translation of 'period'
             items = list(kw.get(key) for kw in kws_pair)
+            items = [item for item in items if item not in seen and not seen.add(item)]
             if key == 'area' and len(skip) == len(found) == 1:
                 pass
             elif len(set(items)) > 1:  # one unset or both set to different
@@ -904,7 +914,11 @@ def get_labels(
                     front.append(items[0])
         # Combine and adjust labels
         remove = lambda lab, key: lab[::-1].replace(key[::-1], '', 1)[::-1]
-        control, abrupt = 'pre-industrial', r'abrupt 4$\times$CO$_2$'
+        seen, control, abrupt = set(), 'pre-industrial', r'abrupt 4$\times$CO$_2$'
+        left = seen.clear() or [item for item in left if item not in seen and not seen.add(item)]  # noqa: E501
+        right = seen.clear() or [item for item in right if item not in seen and not seen.add(item)]  # noqa: E501
+        front = seen.clear() or [item for item in front if item not in seen and not seen.add(item)]  # noqa: E501
+        back = seen.clear() or [item for item in back if item not in seen and not seen.add(item)]  # noqa: E501
         left, right = ' '.join(filter(None, left)), ' '.join(filter(None, right))
         center = ' vs. '.join(filter(None, (left, right)))
         label = ' '.join(filter(None, (*front, center, *back)))
@@ -1026,7 +1040,9 @@ def parse_spec(dataset, spec, **kwargs):
     return kw_process, kw_collection
 
 
-def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
+def parse_specs(
+    dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs,
+):
     """
     Parse variable and project specifications and auto-determine row and column
     labels based on the unique names and/or keywords in the spec lists.
@@ -1200,11 +1216,12 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
         # Infer legend and axes prefixes
         # TODO: Optionaly use either 'short' or 'skip_name'? Often want single label
         # for contours but multiple longer labels for line plots.
-        kw = dict(refwidth=np.inf, identical=False, heading=False, short=False)
+        scale = kwargs.get('scale', None)  # optionally used with distribution labels
+        kw_split = dict(refwidth=np.inf, identical=False, heading=False, short=False, scale=scale)  # noqa: E501
         ikws_pair = [ikws_process[0][:1], ikws_process[0][-1:]]
         dist_pair = len(ikws_process[0]) == 2 and ikws_process[0][-1].get('area')
-        prefixes_axes = get_labels(*ikws_pair, skip_name=True, dataset=dataset, **kw)
-        prefixes_legend = get_labels(*ikws_process, dataset=dataset, **kw)
+        prefixes_axes = get_labels(*ikws_pair, skip_name=True, dataset=dataset, **kw_split)  # noqa: E501
+        prefixes_legend = get_labels(*ikws_process, dataset=dataset, **kw_split)
         for axis, prefix in zip('xy', prefixes_axes):
             if prefix and dist_pair:
                 ikws_collection[-1].attrs.setdefault(f'{axis}label_prefix', prefix)
@@ -1218,11 +1235,11 @@ def parse_specs(dataset, rowspecs=None, colspecs=None, autocmap=None, **kwargs):
     # TODO: Combine column count determination here with general_plot()?
     ncols = len(colspecs) if len(colspecs) > 1 else len(rowspecs) if len(rowspecs) > 1 else 3  # noqa: E501
     figwidth = ncols * refwidth + 0.3 * refwidth * (ncols - 1)
-    kw_label = dict(refwidth=figwidth, heading=True, identical=True, short=False,)
+    kw_label = dict(refwidth=figwidth, heading=True, identical=True, short=False, scale=scale)  # noqa: E501
     figlabel = get_labels(*kws_process, dataset=dataset, **kw_label)
     pathspecs = [dspec for ikws_process in kws_process for dspec in ikws_process]
     pathlabel = get_path(dataset, *pathspecs)
-    kw_split = dict(offset=True, refwidth=refwidth, fontsize=pplt.rc.fontlarge)
+    kw_split = dict(fontsize=pplt.rc.fontlarge, refwidth=refwidth, shift=True, scale=scale)  # noqa: E501
     if len(rowspecs) == 1 and len(colspecs) == 1:
         gridlabels = None
     elif len(rowspecs) > 1 and len(colspecs) > 1:

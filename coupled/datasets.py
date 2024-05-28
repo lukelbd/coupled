@@ -142,6 +142,8 @@ def open_scalar(path=None, ceres=False, suffix=None):
         The source feedback path.
     ceres : bool, optional
         Whether to load global CERES or CMIP feedbacks.
+    suffix : str, optional
+        The optional dataset suffix.
     """
     from .feedbacks import _update_attrs
     suffix = suffix and f'-{suffix}' or ''

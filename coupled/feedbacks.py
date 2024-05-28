@@ -724,7 +724,8 @@ def feedback_datasets(
 
 
 def process_scalar(
-    *paths, output=None, names=None, project=None, standardize=True, **kwargs,
+    *paths, output=None, names=None, project=None,
+    standardize=True, kernels=None, restrict=False, **kwargs,
 ):
     """
     Process global average unperturbed and perturbed feedback estimates.
@@ -736,9 +737,15 @@ def process_scalar(
     output : str or pathlib.Path, optional
         The output directory or name.
     names : str or sequence, optional
-        The variables to select.
+        The variables to select. Default is net, cloud, and clear-sky components.
     project : str, optional
         The project to search.
+    kernels : bool, optional
+        Whether to get kernel-adjusted cloud instead of raw cloud by default.
+    restrict : bool, optional
+        Whether to restrict the output for faster computation.
+    testing : bool, optional
+        Whether to calculate single versions for a single component.
     standardize : bool, optional
         Whether to standardize the resulting order.
     **kwargs
@@ -753,17 +760,28 @@ def process_scalar(
     # NOTE: This is used to get mean and internal variability estimates for use with
     # tables and eventual emergent constraints. Includes different estimates.
     from observed.feedbacks import _parse_kwargs, process_scalar
-    params, _, constraints = _parse_kwargs('source', **kwargs)  # skip 'source'
+    testing = bool(kwargs.get('testing', None))
+    kwargs.setdefault('annual', (None,) if restrict else (False, True))
+    kwargs.setdefault('detrend', ('xy', '')[:restrict or None])
+    kwargs.setdefault('month', ('jan', 'jul')[:restrict or None])
+    kwargs.setdefault('anomaly', (False, True)[:restrict or None])
+    params, _, constraints = _parse_kwargs('source', testing=testing, **kwargs)  # noqa: E501 skip source
     constraints['variable'] = 'fluxes'
     correct = constraints.pop('correct', None)
     translate = {('years', None): ('period', 'full'), **LABELS_YEARS}
-    testing = kwargs.get('testing', False)
     kwargs = {'output': False, 'correct': correct, 'translate': translate}
+    heads = ('', 'sw', 'lw')  # default wavelengths
+    tails = ('net', 'cld', 'ncl') if kernels else ('net', 'cre', 'cs')
+    default = tuple(  # default variables
+        head or tail if tail == 'net' else head + tail for tail in tails
+        for head in (('',) if restrict and tail not in ('cld', 'cre') else heads)
+    )
+    input = (names,) if isinstance(names, str) else names or default
+    aliases = tuple(VARIABLE_ALIASES.get(name, name) for name in input)
+    variables = tuple(ALIAS_VARIABLES.get(name, name) for name in input)
+    label = '-'.join(aliases) if input else 'cld' if kernels else 'cre'
     paths = paths or ('~/data/cmip-fluxes', '~/scratch/cmip-fluxes')
     suffix = ['0000', '0150', 'eraint', 'series']
-    defaults = ('net', 'sw', 'lw', 'cre', 'swcre', 'lwcre', 'cs', 'swcs', 'lwcs')
-    names = (names,) if isinstance(names, str) else names or defaults
-    names = tuple(ALIAS_VARIABLES.get(name, name) for name in names)
     projects = project.split(',') if isinstance(project, str) else ('cmip5', 'cmip6')
     def _find_dependencies(data, args, names=None):  # noqa: E301
         if isinstance(args, str) or type(args) not in (list, tuple):
@@ -791,6 +809,7 @@ def process_scalar(
     # options irrelevant for abrupt experiments and skip 'x' and 'y' detrend
     # options for control runs for simplicity / since climate is stationary.
     results = {}
+    print('Names:', *aliases)
     from .datasets import FACETS_LEVELS, FACETS_NAME, FACETS_RENAME
     for project in map(str.upper, projects):
         constraints['project'] = project
@@ -811,21 +830,20 @@ def process_scalar(
             for sub, replace in FACETS_RENAME.items():
                 facets = tuple(facet.replace(sub, replace) for facet in facets)
             if facets[3] == 'picontrol':  # use default 'annual' 'correct'
-                years = (None, 20, 50)
-                month = ('jan', 'jul')
-                anomaly = (True, False)
-                detrend = ('', 'xy')
+                years = (None, 20)  # default value
+                others = dict()
+                annual = False  # default value
             elif facets[3] == 'abrupt4xco2':  # use default 'annual' 'correct'
                 years = ((0, 150), (0, 20), (20, 150))
-                month = (None,)
-                anomaly = (False,)
-                detrend = ('',)
+                others = dict(month=(None,), anomaly=(False,), detrend=('',))
+                annual = True  # default value
             else:
                 continue
             # Calculate feedback parameters
-            inames, iparams = names[:1] if testing else names, params.copy()
-            iparams.update(years=years, month=month, anomaly=anomaly, detrend=detrend)
+            inames, iparams = variables[:1] if testing else variables, params.copy()
+            iparams.update(years=years, **others)
             iparams = {key: vals[:1] if testing else vals for key, vals in iparams.items()}  # noqa: E501
+            iparams['annual'] = tuple(annual if ann is None else annual for ann in iparams['annual'])  # noqa: E501
             series = load_file(paths[0], lazy=True, project=project)  # speed-up
             start = series.time.dt.strftime('%b').values[0].lower()
             fluxes = _find_dependencies(series, inames)  # 'name': [*dependencies]
@@ -894,7 +912,7 @@ def process_scalar(
         dataset = _standardize_order(dataset)
     proj = projects[0] if len(projects) == 1 else 'cmip'
     base = Path('~/data/global-feedbacks').expanduser()
-    file = 'tmp.nc' if testing else f'feedbacks_{proj.lower()}_global.nc'
+    file = 'tmp.nc' if testing else f'feedbacks_{proj.lower()}_global-{label}.nc'
     if isinstance(output, str) and '/' not in output:
         output = base / output
     elif output:

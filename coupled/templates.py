@@ -351,8 +351,8 @@ def build_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **kwa
             values = itertools.product(*(zip(*kw.values()) for kw in kws))
             values = [[v for val in vals for v in val] for vals in values]
             group.update({key: vals for key, vals in zip(keys, zip(*values))})
-    kws_outer = tuple(map(_get_dicts, kws_outer))
-    kws_inner = _get_dicts(*kws_inner)  # splat into list
+    kws_outer = tuple(filter(None, map(_get_dicts, kws_outer)))
+    kws_inner = tuple(filter(None, _get_dicts(*kws_inner)))  # splat into list
     return *kws_outer, *kws_inner, kwargs
 
 

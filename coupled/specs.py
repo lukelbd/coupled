@@ -127,9 +127,10 @@ GENERAL_LABELS = {
     ('project', 'cmip5665'): 'matching CMIP',
     ('project', 'cmip6655'): 'non-matching CMIP',
     ('project', 'cmip5566'): 'non-matching CMIP',
-    ('institute', 'avg'): None,  # or 'institute-average'
-    ('institute', 'flagship'): None,  # or 'flagship-only'
-    ('institute', None): None,  # or 'individual-model'
+    ('institute', 'flagship'): 'institute-flagship',
+    ('institute', 'avg'): 'institute-average',
+    ('institute', 'wgt'): None,
+    ('institute', None): None,
     ('experiment', 'picontrol'): 'control',
     ('experiment', 'abrupt4xco2'): r'4$\times$CO$_2$',
     ('source', 'eraint'): 'Davis et al.',
@@ -137,7 +138,7 @@ GENERAL_LABELS = {
     ('style', 'slope'): 'annual',
     ('style', 'annual'): 'annual',
     ('style', 'monthly'): 'monthly',
-    ('style', 'ratio'): 'ratio-style',
+    ('style', 'ratio'): 'ratio',
     ('startstop', (0, 150)): 'full',
     ('startstop', (1, 150)): 'full',
     ('startstop', (2, 150)): 'full',
@@ -158,20 +159,20 @@ GENERAL_LABELS = {
     ('spatial', 'corr'): 'spatial correlation',
     ('spatial', 'cov'): 'spatial covariance',
     ('spatial', 'rsq'): 'spatial variance explained',
-    ('initial', 'init'): None,
-    ('initial', 'jan'): None,
+    ('initial', 'init'): None,  # TODO: revisit this
+    ('initial', 'jan'): None,  # avoid adding labels to merged distributions
     ('period', 'full'): None,
     ('period', '20yr'): None,
     ('period', '50yr'): None,
     ('remove', 'climate'): None,
     ('remove', 'average'): None,
-    ('detrend', ''): None,
+    ('detrend', ''): None,  # TODO: revisit this
     ('detrend', 'x'): None,  # avoid adding labels to merged distributions
     ('detrend', 'y'): None,
     ('detrend', 'xy'): None,
     ('error', 'regression'): None,
     ('error', 'internal'): 'internal',
-    ('correct', ''): None,
+    ('correct', ''): None,  # TODO: revisit this
     ('correct', 'x'): None,  # avoid adding labels to merged distributions
     ('correct', 'y'): None,
     ('correct', 'r'): None,
@@ -685,18 +686,18 @@ def get_path(dataset, *kws_process):
     return result
 
 
-def get_label(key, value, mode=None, force=False, dataset=None, experiment=True):
+def get_label(key, value, mode=None, dataset=None, experiment=True):
     """
-    Return an arbitrary label type based on the dataset.
+    Return a label for the variable or selection.
 
     Parameters
     ----------
     key, value : str
         The reduce coordinate and selection.
-    force : bool
-        Whether to avoid translations to None.
     mode : {'long', 'short', 'path'}, optional
         The label mode used to translate selections.
+    restrict : str or sequence, optional
+        The reduce keys that should have non-none labels.
     dataset : xarray.Dataset, optional
         The source dataset. Required for `name` labels.
     experiment : bool, optional : str, optional
@@ -705,7 +706,7 @@ def get_label(key, value, mode=None, force=False, dataset=None, experiment=True)
     Returns
     -------
     label : str
-        The final label.
+        The variable or selection label.
     """
     # NOTE: This function is used for axis label prefixes, legend entry prefixes, row
     # and column labels, and figure and path titles. It is never used for the 'method'
@@ -720,9 +721,8 @@ def get_label(key, value, mode=None, force=False, dataset=None, experiment=True)
         raise ValueError(f'Invalid label mode {mode!r}.')
     translate_operator = {'+': 'plus', '-': 'minus', '*': 'times', '/': 'over'}
     translate_part = translates.get(mode, {})
-    parts = (value,) if key in ('model', 'institute') else _expand_parts(value)
-    labels = []
-    for part in parts:
+    parts = []
+    for part in (value,) if key in ('model', 'institute') else _expand_parts(value):
         if key == 'name':  # retrieve without calculating using get_result(attr=attr)
             if part and '|' in part:
                 *_, part = part.split('|')  # numerator in pattern regression
@@ -741,11 +741,9 @@ def get_label(key, value, mode=None, force=False, dataset=None, experiment=True)
             if part and part == (None, None):
                 part = None
             if part and part[0] in translate_operator:
-                label = part[0]  # e.g. (-, -) startstop tuples
-                label = label if mode == 'path' else translate_operator[label]
+                label = part[0] if mode == 'path' else translate_operator[part[0]]
             else:
                 label = translate_part.get((key, part), part)
-                label = part if force and label is None else label
             if experiment and mode != 'path' and part == 'picontrol':
                 label = 'internal'
             if experiment and mode != 'path' and part == 'abrupt4xco2':
@@ -774,19 +772,18 @@ def get_label(key, value, mode=None, force=False, dataset=None, experiment=True)
         if mode == 'path':  # extra processing
             for symbol in (deg, *translate_operator, '_', ' '):
                 label = label.lower().replace(symbol, '')
-        labels.append(label)
-    if len(labels) > 1:  # if result is still weird user should pass explicit values
-        if labels[0] in translate_operator.values():
-            labels = labels[1:]  # e.g. experiment=abrupt4xco2, stop=None-20
-        if labels[-1] in translate_operator.values():
-            labels = labels[:-1]  # e.g. experiment=abrupt4xco2-picontrol, stop=20-None
+        parts.append(label)
+    if len(parts) > 1:  # if result is still weird user should pass explicit values
+        if parts[0] in translate_operator.values():
+            parts = parts[1:]  # e.g. experiment=abrupt4xco2, stop=None-20
+        if parts[-1] in translate_operator.values():
+            parts = parts[:-1]  # e.g. experiment=abrupt4xco2-picontrol, stop=20-None
     sep = '' if mode == 'path' else ' '
-    label = sep.join(labels)
-    return label
+    return sep.join(parts)
 
 
 def get_labels(
-    *kws_process, short=False, heading=False, identical=False, skip_name=False, **kwargs,  # noqa: E501
+    *kws_process, short=False, restrict=None, heading=False, identical=False, skip_name=False, **kwargs,  # noqa: E501
 ):
     """
     Convert reduction operators into human-readable labels.
@@ -797,8 +794,8 @@ def get_labels(
         The reduction keyword arguments.
     short : bool, optional
         Whether to use short names instead of long.
-    force : bool
-        Whether to avoid translations to None.
+    restrict : str or sequence, optional
+        The keys used to optionally restrict the label.
     heading : bool, optional
         Whether to format the labels as headings.
     identical : bool, optional
@@ -850,8 +847,9 @@ def get_labels(
         order_back = ['name', 'area', 'volume', 'spatial']
         order_read = [key for key in ORDER_READABLE if key not in order_back] + order_back  # noqa: E501
     sorter = lambda key: order_read.index(key) if key in order_read else len(order_read)
-    force = kwargs.pop('force', False)  # whether to forbid none labels
+    mode = 'short' if short else 'long'
     dataset = kwargs.pop('dataset', None)  # required for 'name' labels
+    kw_split = kwargs.copy()
     kws_label = []
     for n in range(2):  # index in possible correlation pair
         ikws_label = []
@@ -865,7 +863,11 @@ def get_labels(
                         continue
                     if skip_name and key in ('name', 'spatial'):
                         continue
-                    kw_label[key] = get_label(key, value, force=force, dataset=dataset)
+                    if restrict and key not in restrict:  # string or tuple
+                        continue
+                    label = get_label(key, value, mode=mode, dataset=dataset)
+                    label = label or value if restrict and key in restrict else label
+                    kw_label[key] = label  # possibly force-apply label
                 nkws_label.append(kw_label)
             kw_label = {}  # merge labels for stuff inside subplot
             for key in sorted((key for kw in nkws_label for key in kw), key=sorter):
@@ -886,7 +888,7 @@ def get_labels(
     # NOTE: This optionally assigns labels that are identical across the pair to
     # the front or the back of the combined 'this vs. that' label.
     kws_label = [kws_label] if identical else list(zip(*kws_label))
-    kwargs.setdefault('fontsize', pplt.rc.fontlarge if heading else pplt.rc.fontsize)
+    kw_split.setdefault('fontsize', pplt.rc.fontlarge if heading else pplt.rc.fontsize)
     found = set(kw.get('area', None) or '' for kws in kws_label for kw in kws)
     skip = set(item for item in found if not item or item in ('local', 'global'))
     labels = []
@@ -940,7 +942,7 @@ def get_labels(
             label = label.replace('warming', 'temperature')
         if identical and label[-8:] == 'feedback':  # change end to 'feedbacks'
             label = f'{label}s'
-        label = _split_label(label.strip(), **kwargs)
+        label = _split_label(label.strip(), **kw_split)
         label = get_heading(label) if heading else label
         labels.append(label)
 
@@ -955,6 +957,8 @@ def parse_spec(dataset, spec, **kwargs):
     ----------
     dataset : `xarray.Dataset`
         The dataset.
+    bootstrap : bool, optional
+        Optional alternative for specifying the control experiment period.
     spec : sequence, str, or dict
         The variable specification. Can be a ``(name, kwargs)``, a naked ``name``,
         or a naked ``kwargs``. The name can be omitted or specified inside `kwargs`
@@ -988,11 +992,14 @@ def parse_spec(dataset, spec, **kwargs):
     # WARNING: Critical to always parse facet and version levels since figures.py will
     # auto apply these coordinates even if not present e.g. for bootstrap datasets. Then
     # have process.py ignore them when version is not present.
-    from .general import _merge_dists, _init_command, _props_command, _setup_bars, _setup_scatter  # noqa: E501
+    from .general import _merge_dists, _init_command, _props_command
+    from .general import _setup_axes, _setup_bars, _setup_scatter  # noqa: E501
     from .process import get_result, process_constraint
     from .reduce import reduce_facets, _reduce_data, _reduce_datas
-    keys_figure = [k + s for k in ('', 'ax', 'ref', 'fig') for s in ('', 'num', 'width', 'height', 'aspect')]  # noqa: E501
-    keys_tight = [k + s for k in ('span', 'share', 'align') for s in ('', 'x', 'y')]
+    sizes = [k + s for k in ('', 'ax', 'ref', 'fig') for s in ('', 'num', 'width', 'height', 'aspect')]  # noqa: E501
+    spaces = [k + s for k in ('span', 'share', 'align') for s in ('', 'x', 'y')]
+    others = (_merge_dists, _init_command, _props_command)
+    setups = _setup_axes, _setup_bars, _setup_scatter
     if spec is None:
         name, kw = None, {}
     elif isinstance(spec, str):
@@ -1004,15 +1011,17 @@ def parse_spec(dataset, spec, **kwargs):
     kw = {**kwargs, **kw}  # prefer spec arguments
     name = name or kw.pop('name', None)  # see below
     settings = ('c', 'lw', 'color', 'linewidth', 'color', 'facecolor', 'edgecolor', 'a', 'alpha')  # noqa: E501
+    experiment = kw.get('experiment', None)
     institute = kw.get('institute', None)
+    bootstrap = kw.pop('bootstrap', None)  # TODO: remove kludge
     kw.update({'institute': None} if institute == 'wgt' else {})
-    signatures = tuple(pplt.Axes._format_signatures.values())
+    formats = tuple(pplt.Axes._format_signatures.values())
     kw_process = _pop_kwargs(kw, dataset, get_result, reduce_facets, _reduce_data, _reduce_datas)  # noqa: E501
     kw_attrs = _pop_kwargs(kw, 'short_name', 'long_name', 'standard_name', 'units')
     kw_grid = _pop_kwargs(kw, pplt.GridSpec._update_params)  # overlaps kw_figure
-    kw_figure = _pop_kwargs(kw, *keys_tight, *keys_figure, pplt.Figure._format_signature)  # noqa: E501
-    kw_axes = _pop_kwargs(kw, *signatures, pplt.Figure._parse_proj)
-    kw_other = _pop_kwargs(kw, _merge_dists, _init_command, _props_command, _setup_bars, _setup_scatter, process_constraint)  # noqa: E501
+    kw_figure = _pop_kwargs(kw, *spaces, *sizes, pplt.Figure._format_signature)
+    kw_axes = _pop_kwargs(kw, *formats, pplt.Figure._parse_proj)
+    kw_other = _pop_kwargs(kw, *setups, *others, process_constraint)
     kw_command = _pop_kwargs(kw, 'cmap', 'cycle', 'extend', *settings)
     kw_config = _pop_kwargs(kw, tuple(_rc_nodots))  # overlaps kw_command (see above)
     kw_guide = _pop_kwargs(kw, pplt.Axes._add_legend, pplt.Axes._add_colorbar)
@@ -1025,6 +1034,8 @@ def parse_spec(dataset, spec, **kwargs):
         kw_other['weight'] = kw_process['weight'] = True
     if name is not None:
         kw_process['name'] = name
+    if bootstrap is not None and experiment == 'picontrol':
+        kw_process['period'] = '20yr' if bootstrap else 'full'
     if 'width' in kw_figure:  # bar widths
         kw_command['width'] = kw_figure.pop('width')
     if 'colorbar' in kw_colorbar:  # colorbar location, or use 'loc' for both

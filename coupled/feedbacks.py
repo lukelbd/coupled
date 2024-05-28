@@ -908,6 +908,7 @@ def process_scalar(
         combine_attrs='override',
     )
     dataset = dataset.transpose('facets', 'version', 'statistic', ...)
+    dataset = _update_attrs(dataset)
     if standardize:
         dataset = _standardize_order(dataset)
     proj = projects[0] if len(projects) == 1 else 'cmip'

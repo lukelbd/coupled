@@ -977,8 +977,8 @@ def _init_objects(arguments, kws_collection, geom=None, fig=None, gs=None, title
 
 
 def _merge_dists(
-    dataset, arguments, kws_collection, horizontal=False,
-    labels=None, scale=None, offset=None, intersect=False, correlation=False,
+    dataset, arguments, kws_collection, intersect=False, correlation=False,
+    horizontal=False, labels=None, restrict=None, scale=None, offset=None,
 ):
     """
     Merge distributions into single array and prepare violin and bar plots.
@@ -991,20 +991,20 @@ def _merge_dists(
         The plotting input arguments.
     kws_collection : list of namedtuple
         The plotting keyword arguments.
-    horizontal : bool, optional
-        Whether to plot horizontally.
-    defaults : bool, optional
-        Whether to apply default props.
-    labels : list of str, optional
-        Optional overrides for outer labels.
-    scale : float, optional
-        Optional scaling used for label splitting.
-    offset : float, optional
-        Offset between outer labels.
     intersect : bool, optional
         Whether to intersect coordinates on outer labels.
     correlation : bool, optional
         Whether to show correlation coefficients.
+    horizontal : bool, optional
+        Whether to plot horizontally.
+    labels : list of str, optional
+        Optional overrides for outer labels.
+    restrict : str or sequence, optional
+        Optional keys used to restrict inner labels.
+    scale : float, optional
+        Optional scaling used for label splitting.
+    offset : float, optional
+        Offset between outer labels.
 
     Returns
     -------
@@ -1155,13 +1155,14 @@ def _merge_dists(
     # Get inner and outer labels
     # NOTE: This also tries to set up appropriate automatic line breaks.
     # NOTE: Use 'skip_name' for inner labels to prevent unnecessary repetitions.
-    kw_labels = dict(force=True, short=False, heading=False, identical=False, scale=scale, dataset=dataset)  # noqa: E501
+    kw_label = dict(short=False, heading=False, identical=False)
+    kw_label.update(scale=scale, restrict=restrict, dataset=dataset)
     key, other = ('refheight', 'refwidth') if horizontal else ('refwidth', 'refheight')
     refwidth = kw_collection.figure.setdefault(key, refwidth)
     refheight = kw_collection.figure.setdefault(other, refheight)
     groupwidth = pplt.units(refwidth, 'in') / len(groups)  # scale by group count
-    labels_inner = get_labels(*kws_inner, refwidth=np.inf, skip_name=True, **kw_labels)
-    labels_outer = labels or get_labels(*kw_groups, refwidth=groupwidth, skip_name=False, **kw_labels)  # noqa: E501
+    labels_inner = get_labels(*kws_inner, refwidth=np.inf, skip_name=True, **kw_label)
+    labels_outer = labels or get_labels(*kw_groups, refwidth=groupwidth, skip_name=False, **kw_label)  # noqa: E501
     if len(labels_outer) != len(kw_groups):
         raise ValueError(f'Mismatch between {len(labels_outer)} labels and {len(kw_groups)}.')  # noqa: E501
     if labels_inner or labels_outer:
@@ -1321,7 +1322,7 @@ def _merge_handles(args, handles, pad=None, size=None, sort=True):
     return handles, labels, kw_legend
 
 
-def _setup_axes(ax, *args, command=None):
+def _setup_axes(ax, *args, command=None, zeros=None):
     """
     Adjust x and y axis labels and possibly add zero lines.
 
@@ -1331,6 +1332,8 @@ def _setup_axes(ax, *args, command=None):
         The axes.
     command : str
         The plotting command.
+    zeros : bool, optional
+        Whether to plot zero lines.
     *args : array-like
         The plotting arguments.
     **kwargs
@@ -1346,8 +1349,8 @@ def _setup_axes(ax, *args, command=None):
     # for some rcason share=True seems to have no effect but not sure why.
     top = ax._get_topmost_axes()
     fig = top.figure
-    cmds = ('scatter', 'line', 'linex', 'contour', 'contourf', 'pcolor', 'pcolormesh')
     base, data = args[0], args[-1]  # variables
+    norefs = ('scatter', 'line', 'linex', 'contour', 'contourf', 'pcolor', 'pcolormesh')
     if command is None:
         raise ValueError('Input command is required.')
     if command in ('barh', 'boxh', 'violinh'):
@@ -1373,6 +1376,7 @@ def _setup_axes(ax, *args, command=None):
     rows, cols = top._range_subplotspec('y'), top._range_subplotspec('x')
     edgex, edgey = max(rows) == nrows - 1, min(cols) == 0
     for s, data, other, edge in zip('xy', (x, y), (y, x), (edgex, edgey)):
+        zero = True if zeros is True else s in (zeros or '')
         unit = getattr(data, 'units', None)
         unit = ureg.parse_units(unit) if unit is not None else None
         share = getattr(fig, f'_share{s}', None)
@@ -1390,16 +1394,14 @@ def _setup_axes(ax, *args, command=None):
             coords = pplt.edges(locator.locs)
             for x0, x1 in zip(coords[::2], coords[1::2]):
                 cmd([x0, x1], [0, 0], [1, 1], **kw_bg)
-        if ax == top and data is not None and command not in cmds:  # reference lines
+        if ax == top and data is not None and command not in norefs:  # reference lines
             cmd = ax.linex if s == 'x' else ax.line
             kw_ref = {**KWARGS_REFERENCE, 'transform': transform}
             coords = []
-            if unit is None or unit != ureg.deg and unit != ureg.degrees_north:
-                if command:  # add for bar, violin, and line plots
-                    coords.append(0)
-            if unit is not None and unit == ureg.dimensionless:
-                if command in ('bar', 'barh'):  # add only for bar plots
-                    coords.extend((1, -1))
+            if zero or unit is None or ureg.get_base_units(unit) != ureg.radian:
+                coords.append(0)  # optionally force-add zero lines
+            if unit is not None and unit == ureg.dimensionless and 'bar' in command:
+                coords.extend((1, -1))  # add only for bar plots
             for coord in coords:
                 h, = cmd([0, 1], [coord, coord], **kw_ref)
         if label and dlabel and unit is not None:  # axis label
@@ -2327,6 +2329,7 @@ def general_plot(
             ax.format(**kw_fmt)  # apply formatting
             mask = {}  # selection
             axis = 'x' if 'x' in command else 'y'
+            zeros = kw_other.get('zeros', None)
             other, group = kw_other.get('other'), kw_other.get('group')
             autoscale = getattr(ax, f'get_autoscale{axis}_on')()
             if other and other in groups_compare and args[-1].ndim > 1:
@@ -2341,8 +2344,8 @@ def general_plot(
                 groups = tuple((key, val) for key, val in (*other, *group))
                 head = ', '.join(f'{key}={val}' for key, val in groups if key in keys)
                 print(f'\n{head} {compare}: {value.item():.4f} {value.units}', end='')
-            if ax._name == 'cartesian':
-                xunits, yunits = _setup_axes(ax, *args, command=command)
+            if ax._name == 'cartesian':  # WARNING: critical to call this first
+                xunits, yunits = _setup_axes(ax, *args, command=command, zeros=zeros)
                 groups_xunits.setdefault(xunits, []).append(ax)
                 groups_yunits.setdefault(yunits, []).append(ax)
             if 'bar' in command:  # ensure padding around bar edges

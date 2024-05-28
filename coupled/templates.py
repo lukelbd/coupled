@@ -47,8 +47,8 @@ KEYS_SPECS = (
 )
 KEYS_ITER = (
     'name', 'method', 'time', 'season', 'month', 'spatial', 'observed',
-    'period', 'initial', 'volume', 'area', 'plev', 'lat', 'lon',
-    'project', 'institute', 'experiment', 'ensemble', 'model', 'base',  # TODO: remove
+    'period', 'initial', 'volume', 'area', 'plev', 'lat', 'lon',  # TODO: remove below
+    'project', 'institute', 'experiment', 'ensemble', 'model', 'bootstrap', 'base',
     'source', 'style', 'start', 'stop', 'remove', 'detrend', 'error', 'correct',
     'region', 'alpha', 'edgecolor', 'linewidth', 'linestyle', 'color', 'facecolor',
     'xmin', 'xmax', 'ymin', 'ymax', 'xlabel', 'ylabel', 'xlocator', 'ylocator',
@@ -307,6 +307,8 @@ def build_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **kwa
     kws_inner[1].update(kw_inner)
 
     # Convert reduce vector iterables to dictionaries
+    # NOTE: Here use 'force' to ensure concatenated distributions have non-non labels
+    # e.g. 'full' 'early' 'late' instead of '' 'early' 'late' for violin plots.
     # NOTE: This also builds optional Cartesian products between lists of keywords
     # specified by 'product' keyword. Others are enforced to have same length.
     # NOTE: This can fail if user passes feedbacks along rows and requests
@@ -315,6 +317,7 @@ def build_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **kwa
     spatial = ('lon', 'lat', 'plev', 'area')  # include user input none
     product = product or ()
     product = [[keys] if isinstance(keys, str) else list(keys) for keys in product]
+    kwargs.setdefault('restrict', tuple(key for keys in product for key in keys))
     for key in KEYS_ITER:  # add scalar versions
         value = kwargs.pop(f'{key}1', sentinel)  # ignore none iteration placeholders
         if value is not sentinel and (key in spatial or value is not None):

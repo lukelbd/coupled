@@ -44,7 +44,7 @@ RESPONSE_DEFAULTS = {
 SCALAR_DEFAULTS = {
     'period': 'full',  # includes 150-year control
     'initial': 'jan',  # should be 'jan' in future
-    'remove': 'average',
+    'remove': 'climate',
     'detrend': 'xy',
     'error': 'regression',
     'correct': 'r',

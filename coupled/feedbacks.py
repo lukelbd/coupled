@@ -776,10 +776,10 @@ def process_scalar(
         head or tail if tail == 'net' else head + tail for tail in tails
         for head in (('',) if restrict and tail not in ('cld', 'cre') else heads)
     )
-    input = (names,) if isinstance(names, str) else names or default
-    aliases = tuple(VARIABLE_ALIASES.get(name, name) for name in input)
-    variables = tuple(ALIAS_VARIABLES.get(name, name) for name in input)
-    label = '-'.join(aliases) if input else 'cld' if kernels else 'cre'
+    args = (names,) if isinstance(names, str) else names
+    aliases = tuple(VARIABLE_ALIASES.get(name, name) for name in args or default)
+    variables = tuple(ALIAS_VARIABLES.get(name, name) for name in args or default)
+    label = '-'.join(aliases) if args else 'cld' if kernels else 'cre'
     paths = paths or ('~/data/cmip-fluxes', '~/scratch/cmip-fluxes')
     suffix = ['0000', '0150', 'eraint', 'series']
     projects = project.split(',') if isinstance(project, str) else ('cmip5', 'cmip6')
@@ -912,7 +912,7 @@ def process_scalar(
         dataset = _standardize_order(dataset)
     proj = projects[0] if len(projects) == 1 else 'cmip'
     base = Path('~/data/global-feedbacks').expanduser()
-    file = 'tmp.nc' if testing else f'feedbacks_{proj.lower()}_global-{label}.nc'
+    file = 'tmp.nc' if testing else f'feedbacks_{proj.upper()}_global-{label}.nc'
     if isinstance(output, str) and '/' not in output:
         output = base / output
     elif output:

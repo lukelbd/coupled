@@ -172,35 +172,28 @@ def _get_dicts(*kws, scalar=True, splat=True, check=True):
     # for multiple items in a single subplot. See notebooks for details.
     lengths, results = [], []
     for i, kw in enumerate(kws):
-        length = {}
+        lens = {}
         for key, val in tuple(kw.items()):
             vals = tuple(val) if isinstance(val, (tuple, list)) else (val,)
             if 'color' in key or 'cycle' in key:
                 continue
-            kw[key] = vals
-            length[key] = len(vals)
-        ilength = set(length.values()) - {1}
-        if check and len(ilength) > 1:
-            msg = ', '.join(f'{key}={val}' for key, val in length.items())
+            kw[key], lens[key] = vals, len(vals)
+        ilens = set(lens.values()) - {1}
+        if check and len(ilens) > 1:
+            msg = ', '.join(f'{key}={val}' for key, val in lens.items())
             raise ValueError(f'Unexpected inner keyword mixed lengths: {msg}.')
-        ilen = ilength and ilength.pop() or 1
+        ilen = ilens and ilens.pop() or 1
         ires = {key: ilen * val if len(val) == 1 else val for key, val in kw.items()}
         if not splat:
-            result = {
-                key: vals[0] if scalar and len(vals) == 1 else vals
-                for key, vals in ires.items()
-            }
+            result = {key: vals[0] if scalar and len(vals) == 1 else vals for key, vals in ires.items()}  # noqa: E501
         else:
-            result = [
-                _get_dicts(dict(zip(ires, vals)), splat=False)
-                for vals in zip(*ires.values())
-            ]
+            result = [_get_dicts(dict(zip(ires, vals)), splat=False) for vals in zip(*ires.values())]  # noqa: E501
         results.append(result)
-        lengths.append({f'{key}{i + 1}': val for key, val in length.items()})
-    length = {key: val for length in lengths for key, val in length.items()}
-    ilength = set(length.values()) - {1}
-    if check and len(ilength) > 1:
-        msg = ', '.join(f'{key}={val}' for key, val in length.items())
+        lengths.append({f'{key}{i + 1}': val for key, val in lens.items()})
+    lens = {key: val for lens in lengths for key, val in lens.items()}
+    ilens = set(lens.values()) - {1}
+    if check and len(ilens) > 1:
+        msg = ', '.join(f'{key}={val}' for key, val in lens.items())
         raise ValueError(f'Unexpected inner keyword mixed lengths: {msg}.')
     return results[0] if len(results) == 1 else results
 
@@ -261,7 +254,7 @@ def build_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **kwa
         kw_default = {'ncols': ncols or maxcols}
     idxs = [i for i, keys in enumerate(outer) if 'breakdown' in keys]
     jdxs = [i for i, keys in enumerate(outer) if 'name' in keys]  # if breakdown not passed  # noqa: E501
-    kws_inner = [{}, {}]
+    kws_inner = [{}, {}]  # ensure always paired
     kws_outer = [{} for i in range(len(outer))]
     for key, value in kw_default.items():
         kwargs.setdefault(key, value)
@@ -341,7 +334,7 @@ def build_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **kwa
                 value = group.get(key, None)
                 if idx or not isinstance(value, (tuple, list)):
                     continue
-                if any(isinstance(val, (tuple, list)) for val in value):
+                if all(isinstance(val, (list, tuple)) for val in value):  # TODO: check
                     inners.append(key)
             for keys in product:  # then skip if absent
                 keys = set(keys) - set(inners)
@@ -354,8 +347,10 @@ def build_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **kwa
             values = itertools.product(*(zip(*kw.values()) for kw in kws))
             values = [[v for val in vals for v in val] for vals in values]
             group.update({key: vals for key, vals in zip(keys, zip(*values))})
-    kws_outer = tuple(filter(None, map(_get_dicts, kws_outer)))
-    kws_inner = tuple(filter(None, _get_dicts(*kws_inner)))  # splat into list
+    kws_outer = tuple(map(_get_dicts, kws_outer))  # rows and columns
+    kws_outer = [kw for kw in kws_outer if kw]  # single gridspec
+    kws_inner = _get_dicts(*kws_inner)  # inner reduce pairs
+    kws_inner = [kw or [{}] for kw in kws_inner]
     return *kws_outer, *kws_inner, kwargs
 
 
@@ -403,7 +398,7 @@ def divide_specs(name, specs, **kwargs):
     # Iterate over split indices
     # NOTE: This comes *after* generating specs with _parse_specs. Simply yield
     # subselections of resulting dictionary lists and update figure settings.
-    for idxs in split:
+    for idxs in split:  # split indexes
         kwargs = kwargs.copy()
         if not np.iterable(idxs):
             idxs = (idxs,)
@@ -908,6 +903,7 @@ def regression_plot(data, method=None, contours=True, hatching=True, **kwargs):
     kwargs.update(maxcols=1, method=method)
     stipple, hatches, levels = _get_props(method=method)
     rowspecs, *colspecs, subspecs1, subspecs2, kwargs = build_specs(**kwargs)
+    colspecs = colspecs and colspecs[0] or [{}]
     if len(subspecs1) != 1 or len(subspecs2) != 1:
         raise ValueError(f'Too many constraints {subspecs1} and {subspecs2}. Check outer argument.')  # noqa: E501
     (subspec1,), (subspec2,) = subspecs1, subspecs2
@@ -917,10 +913,6 @@ def regression_plot(data, method=None, contours=True, hatching=True, **kwargs):
         subspec = subspec1  # TODO: more complex rules?
     else:
         subspec = subspec2
-    if colspecs:  # i.e. single row-column plot
-        colspecs, = colspecs
-    else:
-        colspecs = [{}]
     default = kwargs.pop('base', None)
     keys_both = (*KEYS_SHADING, *KEYS_CONTOUR)
     kw_shading = {key: kwargs.pop(key) for key in KEYS_SHADING if key in kwargs}
@@ -966,7 +958,6 @@ def regression_plot(data, method=None, contours=True, hatching=True, **kwargs):
                 spec.append(({**ispec, **subspec1}, {**ispec, **subspec2}))
             cspecs.append(spec)
         for cspecs, kwargs in divide_specs('col', cspecs, **kwargs):
-            # ic(rspecs, cspecs)
             result = general_plot(data, rspecs, cspecs, **kwargs)
             results.append(result)
     result = results[0] if len(results) == 1 else results

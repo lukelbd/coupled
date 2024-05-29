@@ -539,18 +539,18 @@ def _props_guide(*axs, loc=None, figurespan=None, cbarlength=None, cbarwrap=None
     # TODO: Here 'extendsize' is always accurate since we call .auto_layout(tight=False)
     # whenever axes are created, but in current proplot branch this is wrong. Should
     # consider applying .auto_layout(tight=False) after drawing each axes.
-    if loc[0] in 'lr':
+    if loc and loc[0] in 'lr':
         nspan = max(rows) - min(rows) + 1
         span = (min(rows) + 1, max(rows) + 1) if src is fig else None
     else:
         nspan = max(cols) - min(cols) + 1
         span = (min(cols) + 1, max(cols) + 1) if src is fig else None
-    shrink = 0.5 if nspan > 2 else 0.66  # shorter for e.g. 3 or 4 columns
+    shrink = 0.5 if nspan > 2 else 0.66
     adjust = 1.3 if src is fig and nspan > 1 else 1.0
     offset = 1.10 if axs[0]._name == 'cartesian' else 1.02  # for colorbar and legend
     factor = cbarwrap or 1.2  # additional scaling
-    xoffset = loc[0] in 'lr' and (rows[1] - rows[0]) % 2
-    yoffset = loc[0] in 'tb' and (cols[1] - cols[0]) % 2
+    xoffset = loc and loc[0] in 'lr' and (rows[1] - rows[0]) % 2
+    yoffset = loc and loc[0] in 'tb' and (cols[1] - cols[0]) % 2
     xcoords = {'l': 1, 'b': offset, 'r': 0, 't': offset}
     ycoords = {'l': offset, 'b': 1, 'r': offset, 't': 0}
     width, height = axs[0]._get_size_inches()
@@ -568,7 +568,7 @@ def _props_guide(*axs, loc=None, figurespan=None, cbarlength=None, cbarwrap=None
     else:
         bbox = (xcoords[loc[0]], ycoords[loc[0]])
         length = (offset - length / 2, offset + length / 2)
-    if loc[0] in 'lr':  # get size used for wrapping
+    if loc and loc[0] in 'lr':  # get size used for wrapping
         size = nspan * height
     else:
         size = nspan * width
@@ -978,7 +978,7 @@ def _init_objects(arguments, kws_collection, geom=None, fig=None, gs=None, title
 
 def _merge_dists(
     dataset, arguments, kws_collection, intersect=False, correlation=False,
-    horizontal=False, labels=None, restrict=None, scale=None, offset=None,
+    horizontal=False, outers=None, inners=None, restrict=None, scale=None, offset=None,
 ):
     """
     Merge distributions into single array and prepare violin and bar plots.
@@ -997,7 +997,9 @@ def _merge_dists(
         Whether to show correlation coefficients.
     horizontal : bool, optional
         Whether to plot horizontally.
-    labels : list of str, optional
+    outers : list of str, optional
+        Optional overrides for outer labels.
+    inner : list of str, optional
         Optional overrides for outer labels.
     restrict : str or sequence, optional
         Optional keys used to restrict inner labels.
@@ -1161,8 +1163,8 @@ def _merge_dists(
     refwidth = kw_collection.figure.setdefault(key, refwidth)
     refheight = kw_collection.figure.setdefault(other, refheight)
     groupwidth = pplt.units(refwidth, 'in') / len(groups)  # scale by group count
-    labels_inner = get_labels(*kws_inner, refwidth=np.inf, skip_name=True, **kw_label)
-    labels_outer = labels or get_labels(*kw_groups, refwidth=groupwidth, skip_name=False, **kw_label)  # noqa: E501
+    labels_inner = inners or get_labels(*kws_inner, refwidth=np.inf, skip_name=True, **kw_label)  # noqa: E501
+    labels_outer = outers or get_labels(*kw_groups, refwidth=groupwidth, skip_name=False, **kw_label)  # noqa: E501
     if len(labels_outer) != len(kw_groups):
         raise ValueError(f'Mismatch between {len(labels_outer)} labels and {len(kw_groups)}.')  # noqa: E501
     if labels_inner or labels_outer:
@@ -1705,7 +1707,7 @@ def _setup_scatter(
         param = r'\Delta \mathrm{CI}'
         ratio = (max(ymaxs2) - min(ymins2)) / (max(yorigs) - min(yorigs)) - 1
         ratio = ureg.Quantity(ratio, '').to('percent')
-        label = rf'${param}\,=\,{ratio:~L+.0f}$'
+        label = rf'${param}\,=\,{ratio:~L+.1f}$'
         label = re.sub(r'(?<!\\)%', r'\%', label)
         label = re.sub(r'(?<!\s)-', '{-}', label)
         color = 'red7' if ratio > 0 else 'black'
@@ -1918,6 +1920,7 @@ def general_plot(
     ncols=None,
     nrows=None,
     gridskip=None,
+    hardskip=None,
     argskip=None,
     nopoles=True,
     reflect=False,
@@ -1987,7 +1990,9 @@ def general_plot(
     nrows, ncols : float, optional
         Number of rows or columns when either of the plot specs are singleton.
     gridskip : int or sequence, optional
-        The integer gridspec slots to skip.
+        The integer gridspec slots to skip (plotting arguments not skipped).
+    hardskip : int or sequence, optional
+        The integer gridspec slots to skip (plotting arguments skipped).
     argskip : int or sequence, optional
         The axes indices to omit from auto scaling levels for geographic plots.
     nopoles : bool or 2-tuple, optional
@@ -2034,6 +2039,7 @@ def general_plot(
     # shadestd, shadepctile, etc. methods instead of using map. See reduce_facets.
     argskip = np.atleast_1d(() if argskip is None else argskip)
     gridskip = np.atleast_1d(() if gridskip is None else gridskip)
+    hardskip = np.atleast_1d(() if hardskip is None else hardskip)
     nopoles = tuple(nopoles) if np.iterable(nopoles) else (-60, 60) if nopoles else (-89, 89)  # noqa: E501
     kws_process, kws_collection, figlabel, pathlabel, gridlabels = parse_specs(
         dataset, rowspecs, colspecs, **kwargs  # parse input specs
@@ -2103,13 +2109,12 @@ def general_plot(
         # Generate arrays and figure objects
         # TODO: Support *stacked* scatter plots and *grouped* bar plots with 2D arrays
         # for non-project multiple selections? Not difficult... but maybe not worth it.
-        if num in gridskip:
+        if num in gridskip or count >= nprocess:
             continue
-        if count >= nprocess:
+        count, ikws_process, ikws_collection, title = count + 1, *count_items[count]
+        if num in hardskip:
             continue
         print(f'{num + 1}/{grows * gcols}', end=' ')
-        count += 1  # position accounting for gridskip
-        ikws_process, ikws_collection, title = count_items[count - 1]
         transpose, icycles, imethods = False, [], []
         arguments, kws_collection, kw_merge = [], [], {}
         for kw_process, kw_collection in zip(ikws_process, ikws_collection):
@@ -2530,17 +2535,28 @@ def general_plot(
     # Optionally save the figure
     # NOTE: Still add empty axes so super title is centered above empty
     # slots and so row and column labels can exist above empty slots.
-    for num in gridskip:
-        ax = fig.add_subplot(gs[num])
-        ax._invisible = True
+    rowkey = 'rightlabels' if labelright else 'leftlabels'
+    colkey = 'bottomlabels' if labelbottom else 'toplabels'  # noqa: E501
+    for skip in (gridskip, hardskip):
+        for num in skip:
+            ax = fig.add_subplot(gs[num])
+            ax._invisible = True
     for ax in fig.axes:
         if getattr(ax, '_invisible', None):
             ax.format(grid=False)  # needed for cartopy axes
             for obj in ax.get_children():
                 obj.set_visible(False)
-    rowkey = 'rightlabels' if labelright else 'leftlabels'
-    colkey = 'bottomlabels' if labelbottom else 'toplabels'
-    fig.format(figtitle=figtitle, **{rowkey: rowlabels, colkey: collabels})
+    if not labelbottom and not any(titles):
+        cols, labels, collabels = [], collabels, None
+        for row in range(fig.gridspec.nrows):
+            for col in range(fig.gridspec.ncols):
+                ax = fig.subplotgrid[row, col]
+                idx = col + row * fig.gridspec.ncols
+                if col not in cols and not getattr(ax, '_invisible', None):
+                    ax.format(title=labels[col], titleweight='bold')
+                    cols.append(col)
+    kw_labels = {rowkey: rowlabels, colkey: collabels}
+    fig.format(figtitle=figtitle, titleweight='bold', **kw_labels)
     if save:  # save path
         path = Path().expanduser().resolve()
         if path.name in ('notebooks', 'meetings', 'manuscripts'):

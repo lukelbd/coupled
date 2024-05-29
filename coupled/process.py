@@ -445,7 +445,8 @@ def process_constraint(
     # TODO: Use estimates from global average model feedbacks
     from .datasets import open_scalar
     from .reduce import _get_regression
-    N = N or 100000  # samples to draw
+    np.random.seed(51423)  # see: https://stackoverflow.com/a/63980788/4970632
+    N = N or 10000000  # samples to draw
     historical = 24  # historical observation years
     constraint = 'cre' if constraint is None or constraint is True else constraint
     observed = observed or historical

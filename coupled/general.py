@@ -545,7 +545,7 @@ def _props_guide(*axs, loc=None, figurespan=None, cbarlength=None, cbarwrap=None
     else:
         nspan = max(cols) - min(cols) + 1
         span = (min(cols) + 1, max(cols) + 1) if src is fig else None
-    shrink = 0.5 if nspan > 2 else 0.66  # shorter for e.g. 3 or 4 columns
+    shrink = 0.5 if nspan > 2 else 0.66
     adjust = 1.3 if src is fig and nspan > 1 else 1.0
     offset = 1.10 if axs[0]._name == 'cartesian' else 1.02  # for colorbar and legend
     factor = cbarwrap or 1.2  # additional scaling
@@ -2535,8 +2535,10 @@ def general_plot(
     # Optionally save the figure
     # NOTE: Still add empty axes so super title is centered above empty
     # slots and so row and column labels can exist above empty slots.
+    rowkey = 'rightlabels' if labelright else 'leftlabels'
+    colkey = 'bottomlabels' if labelbottom else 'toplabels'  # noqa: E501
     for skip in (gridskip, hardskip):
-        for num in gridskip:
+        for num in skip:
             ax = fig.add_subplot(gs[num])
             ax._invisible = True
     for ax in fig.axes:
@@ -2544,9 +2546,17 @@ def general_plot(
             ax.format(grid=False)  # needed for cartopy axes
             for obj in ax.get_children():
                 obj.set_visible(False)
-    rowkey = 'rightlabels' if labelright else 'leftlabels'
-    colkey = 'bottomlabels' if labelbottom else 'toplabels'
-    fig.format(figtitle=figtitle, **{rowkey: rowlabels, colkey: collabels})
+    if not labelbottom and not any(titles):
+        cols, labels, collabels = [], collabels, None
+        for row in range(fig.gridspec.nrows):
+            for col in range(fig.gridspec.ncols):
+                ax = fig.subplotgrid[row, col]
+                idx = col + row * fig.gridspec.ncols
+                if col not in cols and not getattr(ax, '_invisible', None):
+                    ax.format(title=labels[col], titleweight='bold')
+                    cols.append(col)
+    kw_labels = {rowkey: rowlabels, colkey: collabels}
+    fig.format(figtitle=figtitle, titleweight='bold', **kw_labels)
     if save:  # save path
         path = Path().expanduser().resolve()
         if path.name in ('notebooks', 'meetings', 'manuscripts'):

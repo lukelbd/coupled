@@ -132,11 +132,11 @@ def _get_parts(
         parts = trans('dse', 'hse', 'gse')
         search, replace = 'sensible', 'dry'
     elif name == 'tdev':  # TODO: define other 'relative' variables?
-        parts, relative = ('tstd',), (True,)
-        attrs.update(units='K', long_name='temperature anomaly', short_name='anomaly')
+        parts, relative = ('tstd',), (True,)  # TODO: revisit labels
+        attrs.update(units='K', long_name='temperature anomaly', short_name='anomaly')  # noqa: E501
     elif name == 'tabs':  # warming pattern for scaled sensitivity
-        parts, product = ('tpat', 'ecs'), (True,)
-        attrs.update(units='K', long_name='temperature response', short_name='response')
+        parts, product = ('tpat', 'ecs'), (True,)  # TODO: revisit
+        attrs.update(units='K', long_name='temperature response', short_name='response')  # noqa: E501
     elif param == 'ts' or param == 'ta':  # eqtemp = temp - (temp - eqtemp) (see below)
         delta = name.replace('_' + param, '_dt')  # climate minus implied deviation
         parts, signs = (param, delta), (1, -1)
@@ -762,7 +762,8 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
             arg.name = name  # kluge for e.g. 'ts' minus 'tstd'
         if suffix and any(sign == -1 for sign in signs):
             suffix = 'anomaly' if suffix is True else suffix
-            arg.attrs['short_suffix'] = arg.attrs['long_suffix'] = suffix
+            arg.attrs['long_suffix'] = ''  # TODO: revisit
+            arg.attrs['short_suffix'] = ''
         if 'sigma' in datas[0].dims:  # see _apply_single and _apply_double
             dof = defaults.pop('dof', None)
             sigma = sum(data.isel(sigma=1) for data in datas) ** 0.5

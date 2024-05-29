@@ -555,7 +555,7 @@ def _props_guide(*axs, loc=None, figurespan=None, cbarlength=None, cbarwrap=None
     ycoords = {'l': offset, 'b': 1, 'r': offset, 't': 0}
     width, height = axs[0]._get_size_inches()
     if cbarlength:
-        length = cbarlength
+        length = cbarlength / nspan
     elif nspan == 1:
         length = 1
     elif src is fig:  # shrink along figure
@@ -880,7 +880,9 @@ def _init_command(
     return command, guide, args, kw_collection
 
 
-def _init_objects(arguments, kws_collection, geom=None, fig=None, gs=None, title=None):
+def _init_objects(
+    arguments, kws_collection, geom=None, fig=None, gs=None, title=None, texts=None
+):
     """
     Initialize plotting objects given input arguments.
 
@@ -901,6 +903,8 @@ def _init_objects(arguments, kws_collection, geom=None, fig=None, gs=None, title
         The existing gridspec.
     title : str, optional
         The default title of the axes.
+    texts : str or dict, optional
+        Optional additional text specification.
 
     Returns
     -------
@@ -920,6 +924,7 @@ def _init_objects(arguments, kws_collection, geom=None, fig=None, gs=None, title
         raise RuntimeError(f'Conflicting dimensionalities in single subplot: {dims}')
     keys_ignore = ('lon', 'lat')  # format instructions to ignore
     kw_axes = {}  # default settings
+    texts = texts or []
     dims = set(dims[0])
     geom = geom or (1, 1, 0)  # total subplotspec geometry
     span, sharex, sharey = False, 'labels', 'labels'
@@ -947,15 +952,14 @@ def _init_objects(arguments, kws_collection, geom=None, fig=None, gs=None, title
     # on number of violins and bars. Also note save space by using inset a-b-c below.
     kw_axes.update(KWARGS_FIG)  # abc and title properties
     kw_axes.update({'abcloc': 'ul'} if title is None else {'title': title})
+    kw_axes.update({'abc': False} if max(geom[:2]) == 1 else {})
     kw_figure = {'sharex': sharex, 'sharey': sharey, 'span': span}
     kw_figure.update({'refwidth': kw_axes.pop('refwidth', None)})
     kw_gridspec = {}  # no defaults currently
-    if max(geom[:2]) == 1:  # remove individual label
-        kw_axes.pop('abc', None)
     if gs is None:
         for kw_collection in kws_collection:
             kw_gridspec.update(kw_collection.gridspec)
-        gs = pplt.GridSpec(*geom[:2], **kw_collection.gridspec)
+        gs = pplt.GridSpec(*geom[:2], **kw_gridspec)
     if fig is None:  # also support updating? or too slow?
         skip = any('share' in kw_collection.figure for kw_collection in kws_collection)
         for key in (('sharex', 'sharey') if skip else ()):
@@ -972,6 +976,16 @@ def _init_objects(arguments, kws_collection, geom=None, fig=None, gs=None, title
     with warnings.catch_warnings():  # ignore matplotlib map_projection warning
         warnings.simplefilter('ignore')
         ax = fig.add_subplot(gs[geom[2]], **kw_axes)
+    for text in texts:
+        if not text or not isinstance(text, tuple):
+            continue
+        x, y, s, *kw_text = text
+        kw_text = kw_text and kw_text[0] or {}
+        kw_text.setdefault('transform', 'axes')
+        kw_text.setdefault('weight', 'bold')
+        kw_text.setdefault('fontsize', pplt.rc.fontlarge)
+        obj = ax.text(x, y, s, **kw_text)
+        obj.set_in_layout(False)
     fig.auto_layout(tight=False)  # TODO: commit on master
     return fig, gs, ax
 
@@ -1158,7 +1172,7 @@ def _merge_dists(
     # NOTE: This also tries to set up appropriate automatic line breaks.
     # NOTE: Use 'skip_name' for inner labels to prevent unnecessary repetitions.
     kw_label = dict(short=False, heading=False, identical=False)
-    kw_label.update(scale=scale, restrict=restrict, dataset=dataset)
+    kw_label.update(scale=scale, strict=restrict, dataset=dataset)
     key, other = ('refheight', 'refwidth') if horizontal else ('refwidth', 'refheight')
     refwidth = kw_collection.figure.setdefault(key, refwidth)
     refheight = kw_collection.figure.setdefault(other, refheight)
@@ -1629,7 +1643,7 @@ def _setup_scatter(
         ax.use_sticky_edges = False  # show end of line fit shading
         ax.plot(datax, fit, ls='-', lw=1.5 * pplt.rc.metawidth, c=color)
         ax.area(datax, fit_lower.squeeze(), fit_upper.squeeze(), lw=0, a=0.3, c=color)
-        ax.format(lrtitle=label, lrtitle_kw={'size': 'med'})
+        ax.format(lrtitle=label, lrtitle_kw={'size': 'med', 'weight': 'normal'})
 
     # Add constraint indicator
     # NOTE: Previously got cmip5/cmip6 bounds from t-distributions of their standard
@@ -1917,6 +1931,7 @@ def general_plot(
     rowlabels=None,
     collabels=None,
     titles=None,
+    texts=None,
     ncols=None,
     nrows=None,
     gridskip=None,
@@ -1983,8 +1998,10 @@ def general_plot(
 
     Other Parameters
     ----------------
-    figtitle, rowlabels, collabels, titles : optional
+    figtitle, rowlabels, collabels : optional
         Optional figure and label overrides.
+    titles, texts : optional
+        Optional title and text specifications per subplot.
     figprefix, figsuffix : str, optional
         Optional modifications to the default figure title.
     nrows, ncols : float, optional
@@ -2067,6 +2084,8 @@ def general_plot(
     figtitle = figtitle if figtitle is not None else figlabel
     figtitle = get_heading(figtitle, prefix=figprefix, suffix=figsuffix)
     geometry = (grows, gcols, grows * gcols)
+    texts = texts or (None,) * len(titles)
+    texts = texts if isinstance(texts, list) else [texts]
     labels_input = (rowlabels, collabels, titles)
     labels_output = []
     for nlabels, ilabels, dlabels in zip(geometry, labels_input, labels_default):
@@ -2103,7 +2122,7 @@ def general_plot(
     fig = gs = None  # delay instantiation
     leggroup = groupnames is not True if leggroup is None else leggroup
     methods, commands, groups_compare, groups_commands = [], [], {}, {}
-    count, count_items = 0, list(zip(kws_process, kws_collection, titles))
+    count, count_items = 0, list(zip(kws_process, kws_collection, titles, *texts))
     print('Getting data:', end=' ')
     for num in range(grows * gcols):
         # Generate arrays and figure objects
@@ -2111,10 +2130,11 @@ def general_plot(
         # for non-project multiple selections? Not difficult... but maybe not worth it.
         if num in gridskip or count >= nprocess:
             continue
-        count, ikws_process, ikws_collection, title = count + 1, *count_items[count]
+        count = count + 1
         if num in hardskip:
             continue
         print(f'{num + 1}/{grows * gcols}', end=' ')
+        ikws_process, ikws_collection, title, *itexts = count_items[count - 1]
         transpose, icycles, imethods = False, [], []
         arguments, kws_collection, kw_merge = [], [], {}
         for kw_process, kw_collection in zip(ikws_process, ikws_collection):
@@ -2150,7 +2170,7 @@ def general_plot(
         if not dims[0] and len(arguments) == 1 and 'facets' in arguments[0][-1].dims:
             coords = _get_annotations(arguments[0][-1])
             arguments[0][-1].coords.update(coords)
-        kw_objects = dict(title=title, fig=fig, gs=gs, geom=(grows, gcols, num))
+        kw_objects = dict(fig=fig, gs=gs, geom=(grows, gcols, num), texts=itexts, title=title)  # noqa: E501
         fig, gs, ax = _init_objects(arguments, kws_collection, **kw_objects)
         parent = child = ax  # possibly duplicate axes
 
@@ -2537,7 +2557,8 @@ def general_plot(
     # slots and so row and column labels can exist above empty slots.
     rowkey = 'rightlabels' if labelright else 'leftlabels'
     colkey = 'bottomlabels' if labelbottom else 'toplabels'  # noqa: E501
-    for skip in (gridskip, hardskip):
+    # for skip in (gridskip, hardskip):
+    for skip in (gridskip,):
         for num in skip:
             ax = fig.add_subplot(gs[num])
             ax._invisible = True
@@ -2546,17 +2567,27 @@ def general_plot(
             ax.format(grid=False)  # needed for cartopy axes
             for obj in ax.get_children():
                 obj.set_visible(False)
-    if not labelbottom and not any(titles):
-        cols, labels, collabels = [], collabels, None
+    if not labelbottom and not all(titles):
+        rows, cols, labels, collabels = [], [], collabels, None
         for row in range(fig.gridspec.nrows):
             for col in range(fig.gridspec.ncols):
                 ax = fig.subplotgrid[row, col]
-                idx = col + row * fig.gridspec.ncols
-                if col not in cols and not getattr(ax, '_invisible', None):
-                    ax.format(title=labels[col], titleweight='bold')
-                    cols.append(col)
+                if getattr(ax, '_invisible', None):
+                    continue
+                if not isinstance(ax, pplt.axes.Axes):
+                    continue
+                if col not in cols:
+                    rows, cols = (*rows, row), (*cols, col)
+        for row in sorted(set(rows)):
+            for col in cols:  # repeat across rows
+                ax = fig.subplotgrid[row, col]
+                if not isinstance(ax, pplt.axes.Axes):
+                    continue
+                head = ax.get_title()  # used for fancy pattern figure
+                label = f'{head}\n{labels[col]}' if head else labels[col]
+                ax.format(ctitle=label, ctitle_kw={'weight': 'bold'})
     kw_labels = {rowkey: rowlabels, colkey: collabels}
-    fig.format(figtitle=figtitle, titleweight='bold', **kw_labels)
+    fig.format(figtitle=figtitle, **kw_labels)
     if save:  # save path
         path = Path().expanduser().resolve()
         if path.name in ('notebooks', 'meetings', 'manuscripts'):

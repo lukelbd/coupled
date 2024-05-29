@@ -277,8 +277,9 @@ METHOD_LONGS = {
     ('method', 'dist'): None,
 }
 METHOD_SHORTS = {
-    ('method', 'avg'): 'averages',
-    ('method', 'med'): 'medians',
+    ('method', 'avg'): None,  # TODO: revisit
+    ('method', 'med'): None,  # TODO: revisit
+    ('method', 'dist'): None,
     ('method', 'std'): 'standard deviation',
     ('method', 'var'): 'variance',
     ('method', 'skew'): 'skewness',
@@ -289,7 +290,6 @@ METHOD_SHORTS = {
     ('method', 'corr'): 'correlations',
     ('method', 'rsq'): 'variance explained',
     ('method', 'diff'): 'composite differences',
-    ('method', 'dist'): None,
 }
 
 # Period and time translations
@@ -823,7 +823,8 @@ def get_label(key, value, mode=None, dataset=None, experiment=True):
 
 
 def get_labels(
-    *kws_process, short=False, restrict=None, heading=False, identical=False, skip_name=False, **kwargs,  # noqa: E501
+    *kws_process, short=False, restrict=None, strict=None,
+    heading=False, identical=False, skip_name=False, **kwargs,  # noqa: E501
 ):
     """
     Convert reduction operators into human-readable labels.
@@ -836,6 +837,8 @@ def get_labels(
         Whether to use short names instead of long.
     restrict : str or sequence, optional
         The keys used to optionally restrict the label.
+    strict : str or sequence, optional
+        As with `restrict` but also ensure labels are non-none.
     heading : bool, optional
         Whether to format the labels as headings.
     identical : bool, optional
@@ -886,10 +889,11 @@ def get_labels(
     else:
         order_back = ['name', 'area', 'volume', 'spatial', 'method']
         order_read = [key for key in ORDER_READABLE if key not in order_back] + order_back  # noqa: E501
+    restrict, strict = restrict or (), strict or ()
     sorter = lambda key: order_read.index(key) if key in order_read else len(order_read)
     mode = 'short' if short else 'long'
+    keys = (*restrict, *strict)
     dataset = kwargs.pop('dataset', None)  # required for 'name' labels
-    restrict = restrict or ()  # restricted keywords
     kw_split = kwargs.copy()
     kws_label = []
     for n in range(2):  # index in possible correlation pair
@@ -903,12 +907,12 @@ def get_labels(
                     is_reduce = bool(_pop_kwargs({key: value}, *reduces))
                     if skip_name and key in ('name', 'spatial', 'method'):
                         continue
-                    if restrict and key not in restrict:  # string or tuple
+                    if keys and key not in keys:  # string or tuple
                         continue
-                    if is_reduce and key not in restrict:  # method explicit only
+                    if is_reduce and key not in keys:  # method explicit only
                         continue
                     label = get_label(key, value, mode=mode, dataset=dataset)
-                    label = label or value if restrict and key in restrict else label
+                    label = label or value if strict and key in strict else label
                     kw_label[key] = label  # possibly force-apply label
                 nkws_label.append(kw_label)
             kw_label = {}  # merge labels for stuff inside subplot
@@ -980,6 +984,8 @@ def get_labels(
             label = label.replace(sub, abrupt, 1)
         if label.count(sub := 'boreal') == 2:  # e.g. 'boreal winter - boreal summer'
             label = remove(label, f'{sub} ')
+        if heading and 'anomaly' in label:  # convert plural
+            label = label.replace('anomaly', 'anomalies')
         if control in label and 'surface warming' in label:  # convert 'ts'
             label = label.replace('warming', 'temperature')
         if identical and label[-8:] == 'feedback':  # change end to 'feedbacks'

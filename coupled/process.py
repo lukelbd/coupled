@@ -165,7 +165,7 @@ def _get_parts(
         signs = (-1, 1)
     elif sky == 'ce':  # raw cloud effect
         parts = trans(regex, r'\1\2\3\4\5cs', r'\1\2\3\4\5')
-        search, replace = 'clear-sky', 'cloud'
+        search, replace = 'clear-sky', 'cloud effect'
         signs = (-1, 1)
     elif bnd == 'a':  # net atmosheric (surface and TOA are positive into atmosphere)
         parts = trans(regex, r'\1\2\3\4t\6', r'\1\2\3\4s\6')
@@ -722,6 +722,7 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
             datas.append(data)
             exps.append(experiment)
         datas, method, default = reduce_facets(*datas, **kw_facets)
+        default.pop('symbol', None)
         for key, value in default.items():
             defaults.setdefault(key, value)
         if len(datas) == 1:  # e.g. regression applied

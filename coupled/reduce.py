@@ -550,7 +550,7 @@ def _reduce_datas(
         result0, result1 = xr.align(result0, result1)  # intersection-style broadcast
         result = (result0, result1)
         name = None
-        # sym = r'$X$'
+        sym = r'$X$'
     elif method == 'diff':  # composite difference along first arrays
         kw_composite = dict(dim=dim, pctile=pctile, **kwargs)
         result0, result1 = _get_composite(data0, data1, **kw_composite)
@@ -559,22 +559,23 @@ def _reduce_datas(
         result.attrs['units'] = data1.units
         short = f'{data1.short_name} composite difference'
         long = f'{data0.long_name}-composite {data1.long_name} difference'
-        # sym = r'$\Delta X$'
+        sym = r'$\Delta X$'
     elif method in ('corr', 'rsq'):
         kw_regress = dict(stat='corr', nobnds=True, manual=manual, weights=wgts)
         result = regress_dims(data0, data1, dim, **kwargs, **kw_regress)
+        result = ureg.dimensionless * result
         if method == 'corr':  # correlation coefficient
             result = result.climo.to_units('dimensionless').climo.dequantify()
             result.attrs['units'] = ''
             short = f'{short_prefix}correlation'
             long = f'{long_prefix}correlation coefficient'
-            # sym = '$r$'
+            sym = r'$\rho_{I,\,F}$'
         else:  # variance explained
             result = (result ** 2).climo.to_units('percent').climo.dequantify()
             result.attrs['units'] = '%'
             short = f'{short_prefix}variance explained'
             long = f'{long_prefix}variance explained'
-            # sym = '$r^2$'
+            sym = r'$r^2_{I,\,F}$'
     elif method in ('cov', 'proj', 'slope'):
         nobnds = all(nums is None for nums in (pctile, std))
         kw_regress = dict(stat=method, nobnds=nobnds, weights=wgts, manual=manual)
@@ -584,17 +585,17 @@ def _reduce_datas(
             result.attrs['units'] = f'{data1.units} {data0.units}'
             short = f'{short_prefix}covariance'
             long = f'{long_prefix}covariance'
-            # sym = r'$\sigma^2_{12}$'  # slope
+            sym = r'Cov$(I,\,F)$'  # covariance
         elif method == 'proj':
             result.attrs['units'] = data1.units
             short = f'{short_prefix}projection'
             long = f'{long_prefix}projection'
-            # sym = r'$\sigma_{12}$'  # projection
+            sym = r'Proj$(I,\,F)$'  # projection
         else:
             result.attrs['units'] = f'{data1.units} / ({data0.units})'
             short = f'{short_prefix}regression coefficient'
             long = f'{long_prefix}regression coefficient'
-            # sym = r'$\beta_{12}$'  # slope
+            sym = r'$\beta_{I,\,F}$'  # regression
         if not nobnds and result.ndim == 1:
             key = 'pctile' if pctile is not None else 'std'
             nums = pctile if pctile is not None else std
@@ -606,7 +607,7 @@ def _reduce_datas(
             defaults.update({'shadealpha': 0.25, 'fadealpha': 0.15})
     else:
         raise ValueError(f'Invalid double-variable method {method}')
-    kw = {'name': name, 'short_name': short, 'long_name': long}
+    kw = {'name': name, 'symbol': sym, 'short_name': short, 'long_name': long}
     defaults.update(kw)
     return result, defaults
 

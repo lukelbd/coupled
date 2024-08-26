@@ -172,28 +172,38 @@ def _get_dicts(*kws, scalar=True, splat=True, check=True):
     # for multiple items in a single subplot. See notebooks for details.
     lengths, results = [], []
     for i, kw in enumerate(kws):
-        lens = {}
-        for key, val in tuple(kw.items()):
-            vals = tuple(val) if isinstance(val, (tuple, list)) else (val,)
+        ilengths = {}
+        for key, value in tuple(kw.items()):  # TODO: revisit
+            if not isinstance(value, (list, tuple)):
+                kw[key] = value = (value,)
             if 'color' in key or 'cycle' in key:
                 continue
-            kw[key], lens[key] = vals, len(vals)
-        ilens = set(lens.values()) - {1}
-        if check and len(ilens) > 1:
-            msg = ', '.join(f'{key}={val}' for key, val in lens.items())
+            ilengths[key] = len(value)
+        ilength = set(ilengths.values()) - {1}
+        if check and len(ilength) > 1:
+            msg = ', '.join(f'{key}={value}' for key, value in ilengths.items())
             raise ValueError(f'Unexpected inner keyword mixed lengths: {msg}.')
-        ilen = ilens and ilens.pop() or 1
-        ires = {key: ilen * val if len(val) == 1 else val for key, val in kw.items()}
-        if not splat:
-            result = {key: vals[0] if scalar and len(vals) == 1 else vals for key, vals in ires.items()}  # noqa: E501
+        ilength = ilength and ilength.pop() or 1
+        iresult = {
+            key: ilength * value if len(value) == 1
+            else value for key, value in kw.items()
+        }
+        if splat:
+            result = [
+                _get_dicts(dict(zip(iresult, vals)), splat=False)
+                for vals in zip(*iresult.values())
+            ]
         else:
-            result = [_get_dicts(dict(zip(ires, vals)), splat=False) for vals in zip(*ires.values())]  # noqa: E501
+            result = {
+                key: vals[0] if scalar and len(vals) == 1 else vals
+                for key, vals in iresult.items()
+            }
         results.append(result)
-        lengths.append({f'{key}{i + 1}': val for key, val in lens.items()})
-    lens = {key: val for lens in lengths for key, val in lens.items()}
-    ilens = set(lens.values()) - {1}
-    if check and len(ilens) > 1:
-        msg = ', '.join(f'{key}={val}' for key, val in lens.items())
+        lengths.append({f'{key}{i + 1}': value for key, value in ilengths.items()})
+    lens = {key: value for lens in lengths for key, value in lens.items()}
+    jlengths = set(lens.values()) - {1}
+    if check and len(jlengths) > 1:
+        msg = ', '.join(f'{key}={value}' for key, value in lens.items())
         raise ValueError(f'Unexpected inner keyword mixed lengths: {msg}.')
     return results[0] if len(results) == 1 else results
 
@@ -310,7 +320,9 @@ def build_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **kwa
     spatial = ('lon', 'lat', 'plev', 'area')  # include user input none
     product = product or ()
     product = [[keys] if isinstance(keys, str) else list(keys) for keys in product]
-    kwargs.setdefault('restrict', tuple(key for keys in product for key in keys))
+    restrict = tuple(key for keys in product for key in keys)
+    restrict += ('startstop',) if 'start' in restrict and 'stop' in restrict else ()
+    kwargs.setdefault('restrict', restrict)
     for key in KEYS_ITER:  # add scalar versions
         value = kwargs.pop(f'{key}1', sentinel)  # ignore none iteration placeholders
         if value is not sentinel and (key in spatial or value is not None):
@@ -332,10 +344,10 @@ def build_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **kwa
             check = tuple(key for keys in product for key in keys)
             for key in check:
                 value = group.get(key, None)
-                if idx or not isinstance(value, (tuple, list)):
+                if idx or not isinstance(value, (list, tuple)):
                     continue
-                if all(isinstance(val, (list, tuple)) for val in value):  # TODO: check
-                    inners.append(key)
+                if any(isinstance(val, (list, tuple)) for val in value):  # TODO: all?
+                    inners.append(key)  # TODO: revisit or make configurable
             for keys in product:  # then skip if absent
                 keys = set(keys) - set(inners)
                 if not any(key in group for key in keys):
@@ -834,13 +846,14 @@ def pattern_plot(data, method=None, shading=True, contours=True, **kwargs):
     if 'breakdown' not in kwargs and 'component' not in kwargs and 'outer' not in kwargs:  # noqa: E501
         raise ValueError('Feedback breakdown not specified.')
     if not isinstance(method := method or 'avg', str):
-        method1, method2 = method
+        method1, *methods = method
     elif method in ('avg', 'med'):
-        method1, method2 = method, 'std'
+        method1, *methods = method, 'std'
     elif method in ('std', 'var', 'pctile'):
-        method1, method2 = method, 'avg'
+        method1, *methods = method, 'avg'
     else:
         raise ValueError(f'Invalid pattern_plot() method {method!r}.')
+    kwargs.pop('base', None)  # base not used
     kwargs.update(maxcols=1)  # use custom method assignment
     rowspecs, colspecs, *_, kwargs = build_specs(**kwargs)
     kw_shading = dict(shading) if isinstance(shading, dict) else {}
@@ -853,9 +866,9 @@ def pattern_plot(data, method=None, shading=True, contours=True, **kwargs):
         for rspec in rowspecs:  # kwargs take precedence
             kw = {key: val for key, val in rspec.items() if key not in KEYS_CONTOUR}
             spec = [{**kw, 'method': method1, **kw_shading}]
-            if contours:
+            if contours and methods:
                 kw = {key: val for key, val in rspec.items() if key not in KEYS_SHADING}
-                spec.append({**kw, 'method': method2, **kw_contour})
+                spec.append({**kw, 'method': methods[0], **kw_contour})
             rspecs.append(spec)
         cspecs = []  # NOTE: irrelevant keywords for non-cmap figures are ignored
         for cspec in colspecs:

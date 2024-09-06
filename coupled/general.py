@@ -514,127 +514,1139 @@ def _get_scalars(*args, units=False, tuples=False, pairs=False):
     return result
 
 
-def _props_guide(*axs, loc=None, figurespan=None, cbarlength=None, cbarwrap=None):
+def _format_axes(ax, *args, command=None, zeros=None):
     """
-    Return properties for the guide based on input arguments.
+    Adjust x and y axis labels and possibly add zero lines.
 
     Parameters
     ----------
-    *axs : proplot.Axes
-        The referenced axes.
-    loc : str, optional
-        The input guide location.
-    figurespan : bool, optional
-        Whether to make colorbars and legends span the entire figure.
-    cbarlength : float, default: auto
-        The relative colorbar length based on input.
-    cbarwrap : float, default: 1.2
-        Scaling to apply to size used to wrap colorbar labels.
+    ax : matplotlib.axes.Axes
+        The axes.
+    command : str
+        The plotting command.
+    zeros : bool, optional
+        Whether to plot zero lines.
+    *args : array-like
+        The plotting arguments.
+    **kwargs
+        Additional format arguments.
 
     Returns
     -------
-    src : object
-        The figure or axes to use.
-    loc : str
-        The guide location to use.
-    span : 2-tuple
-        The span for figure-edge labels.
-    bbox : 2-tuple
-        The bounding box for legends.
-    length : float
-        The relative length for colorbars.
-    size : float
-        The size in inches.
+    xunits, yunits : str
+        The associated x and y-axis units.
     """
-    # Infer gridspec location of axes
-    # WARNING: This all must come after axes are drawn and content is plotted inside.
-    # Otherwise position will be wrong.
-    fig = axs[0].figure  # {{{
-    axs = pplt.SubplotGrid(axs)  # then select
-    rows = tuple(zip(*(ax._get_topmost_axes()._range_subplotspec('y') for ax in axs)))
-    cols = tuple(zip(*(ax._get_topmost_axes()._range_subplotspec('x') for ax in axs)))
-    nrows, ncols = axs.shape  # shape of underlying gridspec
-    rows = (min(rows[0]), max(rows[1]))
-    cols = (min(cols[0]), max(cols[1]))
-    row = (rows[0] + rows[1] + 1) // 2  # prefer bottom i.e. higher index
-    col = (cols[0] + cols[1]) // 2  # prefer left i.e. lower index
-    if loc is None or figurespan is False:
-        pass
-    elif not isinstance(loc, str) or loc[0] not in 'lrtb':
-        raise ValueError(f'Invalid location {loc!r}.')
-    if figurespan is False or figurespan is None and len(axs) == 1:
-        src = axs[0]
-    elif figurespan:
-        src = fig
-        if loc is not None:
-            pass
-        elif max(cols) == axs.shape[1] - 1 and max(rows) != axs.shape[0] - 1:
-            loc = 'right'
-        elif min(cols) == 0 and max(rows) != axs.shape[0] - 1:
-            loc = 'left'
+    # Initial stuff
+    # TODO: Handle labels automatically with climopy and proplot autoformatting...
+    # for some rcason share=True seems to have no effect but not sure why.
+    top = ax._get_topmost_axes()  # {{{
+    fig = top.figure
+    base, data = args[0], args[-1]  # variables
+    norefs = ('scatter', 'line', 'linex', 'contour', 'contourf', 'pcolor', 'pcolormesh')
+    if command is None:
+        raise ValueError('Input command is required.')
+    if command in ('barh', 'boxh', 'violinh'):
+        y = None
+    elif command in ('bar', 'box', 'violin', 'area', 'line', 'scatter'):
+        y = data
+    else:
+        y = data.coords[data.dims[0]]
+    if command in ('bar', 'box', 'violin'):
+        x = None
+    elif command in ('barh', 'boxh', 'violinh'):
+        x = data
+    elif command in ('areax', 'linex', 'scatter'):
+        x = base
+    else:
+        x = data.coords[data.dims[-1]]  # e.g. contour() is y by x
+
+    # Handle x and y axis settings
+    # NOTE: Want to disable axhline()/axvline() autoscaling but not currently possible
+    # so use plot(). See: https://github.com/matplotlib/matplotlib/issues/14651
+    units = []  # {{{
+    nrows, ncols, *_ = top.get_subplotspec()._get_geometry()  # custom geometry function
+    rows, cols = top._range_subplotspec('y'), top._range_subplotspec('x')
+    edgex, edgey = max(rows) == nrows - 1, min(cols) == 0
+    for s, data, other, edge in zip('xy', (x, y), (y, x), (edgex, edgey)):
+        zero = True if zeros is True else s in (zeros or '')
+        unit = getattr(data, 'units', None)
+        unit = ureg.parse_units(unit) if unit is not None else None
+        share = getattr(fig, f'_share{s}', None)
+        label = edge or not share or ax != top
+        locator = getattr(ax, f'{s}axis').get_major_locator()
+        dlabel = getattr(ax, f'{s}axis').isDefault_label
+        dlocator = getattr(ax, f'{s}axis').isDefault_majloc
+        transform = getattr(ax, f'get_{s}axis_transform')()
+        if data is None and dlocator:  # hide tick labels
+            kw = {f'{s}locator': 'null'}
+            ax.format(**kw)
+        if other is not None and 'components' in other.sizes and hasattr(locator, 'locs'):  # shading # noqa: E501
+            cmd = ax.area if s == 'x' else ax.areax
+            kw_bg = {**KWARGS_BACKGROUND, 'transform': transform}
+            coords = pplt.edges(locator.locs)
+            for x0, x1 in zip(coords[::2], coords[1::2]):
+                cmd([x0, x1], [0, 0], [1, 1], **kw_bg)
+        if ax == top and data is not None and command not in norefs:  # reference lines
+            cmd = ax.linex if s == 'x' else ax.line
+            kw_ref = {**KWARGS_REFERENCE, 'transform': transform}
+            coords = []
+            if zero or unit is None or ureg.get_base_units(unit) != ureg.radian:
+                coords.append(0)  # optionally force-add zero lines
+            if unit is not None and unit == ureg.dimensionless and 'bar' in command:
+                coords.extend((1, -1))  # add only for bar plots
+            for coord in coords:
+                h, = cmd([0, 1], [coord, coord], **kw_ref)
+        if label and dlabel and unit is not None:  # axis label
+            data = data.copy()
+            for key in ('short_prefix', 'short_suffix'):
+                data.attrs.pop(key, None)  # avoid e.g. 'anomaly' for non-anomaly data
+            data.attrs.setdefault('short_name', '')   # avoid cfvariable inheritence
+            data.attrs['short_prefix'] = data.attrs.get(f'{s}label_prefix', '')
+            if getattr(fig, f'_span{s}'):
+                width, height = fig.get_size_inches()
+            else:
+                width, height = ax._get_size_inches()  # all axes present by now
+            size = width if s == 'x' else height
+            label = _split_label(data.climo.cfvariable.short_label, refwidth=size)
+            ax.format(**{f'{s}label': label})  # include share settings
+        units.append(unit)
+    return units
+
+
+def _format_bars(
+    ax, args, errdata=None, handle=None, horizontal=False, annotate=False, **kwargs,
+):
+    """
+    Adjust and optionally add content to bar plots.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The axes.
+    args : xarray.DataArray
+        The input arguments.
+    errdata : xarray.Dataarray
+        The error bar data.
+    handle : matplotlib.containers.BarContainer
+        The bar container.
+
+    Other Parameters
+    ----------------
+    horizontal : bool, optional
+        Whether the bars were plotted horizontally.
+    annotate : bool, optional
+        Whether to add annotations to the bars.
+    **kwargs : optional
+        Passed to text annotations.
+    """
+    # Plot thick outline bars on top (flagship models) and remove alpha from edge
+    # NOTE: Skip applying opacity to edges because faded outline appears conflicting
+    # in combination with white hatching and outline used for non-matching CMIP6.
+    axis = 'y' if horizontal else 'x'  # {{{
+    handle = handle or ()
+    for obj in handle:
+        getattr(obj.sticky_edges, axis).clear()  # offset from zero and edge
+        alpha = obj.get_alpha()
+        color = pplt.to_xyz(obj.get_edgecolor(), space='hsv')
+        zorder = 1 + 0.001 * (100 - color[2]) + 0.01 * obj.get_linewidth()
+        obj.set_zorder(zorder)
+        if alpha is not None and alpha < 1:  # restore edge color
+            color = pplt.set_alpha(obj.get_facecolor(), alpha)
+            obj.set_alpha(None)
+            obj.set_facecolor(color)
+
+    # Figure out space occupied by text
+    # WARNING: Here 1.5 is used when orientation is in direction of bars but
+    # also use 1.5 for R^2 tex annotations because gives best size after testing.
+    # NOTE: Matplotlib cannot include text labels in autoscaling so have
+    # to adjust manually. See: https://stackoverflow.com/a/32637550/4970632
+    locs, data = (np.arange(args[-1].size), *args) if len(args) == 1 else args  # {{{
+    labels = data.coords.get('annotation', data.coords[data.dims[0]]).values
+    labels = [' '.join(lab) if isinstance(lab, tuple) else str(lab) for lab in labels]
+    nwidth = max(2.2 if '$' in label else 1 for label in labels)
+    width, height = ax._get_size_inches()  # axes size
+    if not horizontal:
+        s, width, height, slice_ = 'y', width, height, slice(None)
+    else:
+        s, width, height, slice_ = 'x', height, width, slice(None, None, -1)
+    fontsize = kwargs.pop('fontsize', pplt.rc.fontsize)
+    fontsize = pplt.utils._fontsize_to_pt(fontsize)
+    space = width / (max(locs) - min(locs) + 2)  # +2 accounts for padding on ends
+    space = pplt.units(space, 'in', 'pt')
+    nums = pplt.arange(0.75, 1.0, 0.025)  # automatically scale in this range
+    sizes = nwidth * fontsize * nums
+    fontsize *= nums[np.argmin(np.abs(sizes - space))]
+
+    # Adjust axes limits
+    # NOTE: This also asserts that error bars without labels are excluded from
+    # the default data limits (e.g. when extending below zero).
+    # above = np.sum(data >= 0) >= data.size // 2  # average bar sign
+    lower, upper = (data, data) if errdata is None else errdata  # {{{
+    data = getattr(data, 'values', data)
+    above = np.mean(data) >= 0  # average bar position
+    lower = getattr(lower, 'values', lower)
+    upper = getattr(upper, 'values', upper)
+    points = np.array(upper if above else lower)  # copy for the labels
+    points = np.clip(points, 0 if above else None, None if above else 0)
+    lower = data if above else lower  # used for auto scaling
+    upper = upper if above else data  # used for auto scaling
+    offsets = [2.8 if '$' in label else len(label) for label in labels]  # R^2 notation
+    offsets = (fontsize / 72) * np.array(offsets)  # approx inches
+    offsets *= 0.8 * (max(np.max(upper), 0) - min(np.min(lower), 0)) / height
+    min_ = np.min(lower - (not above) * annotate * offsets)
+    max_ = np.max(upper + above * annotate * offsets)
+    margin = pplt.rc[f'axes.{s}margin'] * (max_ - min_)
+    min_ = 0 if min_ >= 0 else min_ - margin
+    max_ = 0 if max_ <= 0 else max_ + margin
+    if getattr(ax, f'get_autoscale{s}_on')():
+        ax.format(**{f'{s}lim': (min_, max_)})
+
+    # Add annotations
+    # NOTE: Using set_in_layout False significantly improves speed since tightbbox is
+    # faster and looks nicer to allow overlap into margin without affecting the space.
+    if annotate:  # {{{
+        kw_annotate = {'fontsize': fontsize, **KWARGS_ANNOTATE}
+        kw_annotate.update(kwargs)  # optional additional arguments
+        for loc, point, label in zip(locs, points, labels):
+            # rotation = 90
+            rotation = 0 if '$' in label else 90  # assume math does not need rotation
+            if not horizontal:
+                va = 'bottom' if above else 'top'
+                kw_annotate.update({'ha': 'center', 'va': va, 'rotation': rotation})
+            else:
+                ha = 'left' if above else 'right'
+                kw_annotate.update({'ha': ha, 'va': 'center', 'rotation': 0})
+            offset = 0.4 * fontsize  # offset = 0.2 * fontsize
+            xydata = (loc, point)[slice_]  # position is 'y' if horizontal
+            xytext = (0, offset * (1 if above else -1))[slice_]  # as above
+            res = ax.annotate(label, xydata, xytext, **kw_annotate)
+            res.set_in_layout(False)
+    return handle or None
+
+
+def _format_scatter(
+    ax, data0, data1, handle=None, source=None, zeros=False, oneone=False, linefit=False,  # noqa: E501
+    highlight=False, annotate=False, constraint=None, masking=None, original=None,
+    cumulative=False, alternative=False, weight=False, pctile=None, **kwargs,
+):
+    """
+    Adjust and optionally add content to scatter plots.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The axes.
+    data0, data1 : xarray.DataArray
+        The input arguments.
+    handle : matplotlib.collection.Collection
+        The scatter collection handle.
+    source : xarray.Dataset, optional
+        The source dataset possibly required for the constraint.
+
+    Other Parameters
+    ----------------
+    zeros : bool, optional
+        Whether to add dotted lines on zeros.
+    oneone : bool, optional
+        Whether to add a one-one dotted line.
+    linefit : bool, optional
+        Whether to add a least-squares fit line.
+    highlight : bool, optional
+        Whether to highlight positive slopes with red.
+    annotate : bool, optional
+        Whether to add annotations to the scatter markers.
+    constraint : bool or float, optional
+        Whether to plot emergent constraint results.
+    masking : bool, optional
+        Whether to automatically infer observational masking from models.
+    cumulative : bool, optional
+        Whether to compute unconstrained bounds from the native distribution.
+    original : str or bool, optional
+        Whether to include original unconstrained inter-model uncertainty bounds.
+    alternative : bool, optional
+        Whether to include alternative estimate that omits regression uncertainty.
+    weight : bool, optional
+        Whether to weight by institute (set to ``True`` if ``institute='wgt'`` passed).
+    pctile : float, optional
+        Percentile range used for line fit and constraint bounds.
+    **kwargs
+        Passed to annotation or `process_constraint`.
+    """
+    # Add reference one:one line
+    # NOTE: This also disables autoscaling so that line always looks like a diagonal
+    # drawn right across the axes. Also requires same units on x and y axis.
+    kw_constraint = _pop_kwargs(kwargs, process_constraint)  # {{{
+    kw_constraint['source'] = source if masking else None
+    fontsize = kwargs.pop('fontsize', None)  # see also _format_bars()
+    fontsize = pplt.utils._fontsize_to_pt(fontsize)
+    with pplt.rc.context({} if fontsize is None else {'fontsize': fontsize}):
+        textsize = pplt.utils._fontsize_to_pt('x-small')
+        titlesize = pplt.utils._fontsize_to_pt('med')
+    if zeros:  # disabled by default
+        style = dict(color='k', lw=1 * pplt.rc.metawidth)
+        ax.axhline(0, alpha=0.1, zorder=0, **style)
+        ax.axvline(0, alpha=0.1, zorder=0, **style)
+    if oneone:  # disabled by default
+        style = dict(color='k', dashes=(1, 3), lw=pplt.rc.metawidth)
+        units0 = data0.climo.units
+        units1 = data1.climo.units
+        if units0 == units1:
+            lim = (*ax.get_xlim(), *ax.get_ylim())
+            lim = (min(lim), max(lim))
+            avg = 0.5 * (lim[0] + lim[1])
+            span = lim[1] - lim[0]
+            ones = (avg - 1e3 * span, avg + 1e3 * span)
+            ax.add_artist(mlines.Line2D(ones, ones, **style))
+
+    # Add annotations
+    # NOTE: Using set_in_layout False significantly improves speed since tight bounding
+    # box is faster and looks nicer to allow slight overlap with axes edge.
+    if annotate:  # {{{
+        kw_annotate = {'fontsize': textsize, 'textcoords': 'offset points'}
+        labels = data1.coords.get('annotation', data1.coords[data1.dims[0]]).values
+        labels = [' '.join(lab) if isinstance(lab, tuple) else str(lab) for lab in labels]  # noqa: E501
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        width, _ = ax._get_size_inches()
+        diff = (textsize / 72) * (max(xlim) - min(xlim)) / width
+        xmax = xlim[1] + 5 * diff if ax.get_autoscalex_on() else None
+        ymin = ylim[0] - 1 * diff if ax.get_autoscaley_on() else None
+        ax.format(xmax=xmax, ymin=ymin)  # skip if overridden by user
+        for x, y, label in zip(data0.values, data1.values, labels):
+            xy = (x, y)  # data coordaintes
+            xytext = (2, -2)  # offset coordaintes
+            res = ax.annotate(label, xy, xytext, ha='left', va='top', **kw_annotate)
+            res.set_in_layout(False)
+
+    # Add manual regression line
+    # NOTE: Here climopy automatically reapplies dataarray coordinates to fit line
+    # and lower and upper bounds so do not explicitly need sorted x coordinates.
+    # sign = '(\N{MINUS SIGN})' if slope < 0 else ''  # negative r-squared
+    # label = rf'$r^2={sign}{value:~L.0f}$'
+    # label = rf'r$={np.sign(slope) * rsquare.item() ** 0.5:.2f}$'
+    # color = 'red' if constraint is None else color  # line fit color
+    if linefit or constraint is not None:  # {{{
+        dim = data0.dims and data0.dims[0] or None
+        pct = pctile or 95  # default percentile range
+        result = _get_regression(data0, data1, dim=dim, pctile=pct, weight=weight)
+        slope, _, _, fit, fit_lower, fit_upper, rss, rsq, _ = result
+        value = ureg.Quantity(rsq.item(), '').to('percent')
+        label = rf'$r^2={value:~L.0f}$'
+        label = re.sub(r'(?<!\\)%', r'\%', label)
+        label = label.replace(r'\ ', '')
+        datax = np.sort(data0, axis=0)  # linefit returns result for sorted data
+        color = 'gray8' if constraint is None or not handle else handle[0].get_color()
+        color = 'red8' if highlight and slope > 0 else color  # positive regressions
+        title_kw = {'size': titlesize, 'weight': 'normal'}
+        title_kw.update(kwargs)  # additional keywords
+        ax.use_sticky_edges = False  # show end of line fit shading
+        ax.plot(datax, fit, lw=1.5 * pplt.rc.metawidth, ls='-', a=1.0, c=color)
+        ax.area(datax, fit_lower.squeeze(), fit_upper.squeeze(), lw=0, a=0.3, c=color)
+        ax.format(lrtitle=label, lrtitle_kw=title_kw)
+
+    # Add constraint indicator
+    # NOTE: Previously got cmip5/cmip6 bounds from t-distributions of their standard
+    # deviations but this was needlessly unfavorable. Now use weighted percentile by
+    # sorting and arranging along a 'CDF': https://stackoverflow.com/a/29677616/4970632
+    # NOTE: Here get constrained/unconstrained standard deviation ratio using ratio of
+    # percentile intervals. Should be similar since Monte Carlo sampling used to arrive
+    # at constraint estimate comprises t-distributions with same degrees of freedom.
+    # xorigs = np.percentile(data0.values, 100 * xpctile, method='linear')
+    # yorigs = np.percentile(data1.values, 100 * ypctile, method='linear')
+    if constraint is not None:  # {{{
+        # Process input data
+        pct = pctile or 95  # default percentile range
+        pcts = 0.01 * np.array([50 - 0.5 * pct, 50 + 0.5 * pct])
+        original = 'xy' if original is True else '' if original is False else original
+        original = ''.join('y' if original is None else original)
+        xpctile = (pcts[0], 0.5, pcts[-1]) if 'x' in original else ()
+        ypctile = (pcts[0], 0.5, pcts[-1]) if 'y' in original else ()
+        if weight:
+            wgts = _get_weights(data0, dim='facets')
         else:
-            loc = 'bottom'
-    else:
-        if loc is None:
-            loc = 'right' if len(rows) == 1 else 'bottom'
-        if loc[0] == 't':
-            src = fig if min(rows) == 0 else axs[rows[0], col]
-        elif loc[0] == 'l':
-            src = fig if min(cols) == 0 else axs[row, cols[0]]
-        elif loc[0] == 'b':
-            src = fig if max(rows) == nrows - 1 else axs[rows[1], col]
-        elif loc[0] == 'r':
-            src = fig if max(cols) == ncols - 1 else axs[row, cols[1]]
+            wgts = xr.ones_like(data0.facets, dtype=float)
+        if not cumulative:
+            dof = wgts.sum() - 1  # standard deviation uncertainty
+            wgts = wgts.drop_vars('facets')  # xarray bug (see above)
+            mean0 = (data0 * wgts).sum() / wgts.sum()
+            mean1 = (data1 * wgts).sum() / wgts.sum()
+            scale0 = np.sqrt((wgts * (data0 - mean0) ** 2 / dof).sum())
+            scale1 = np.sqrt((wgts * (data1 - mean1) ** 2 / dof).sum())
+            xorigs = stats.t(df=dof, loc=mean0, scale=scale0).ppf(xpctile)
+            yorigs = stats.t(df=dof, loc=mean1, scale=scale1).ppf(ypctile)
         else:
-            src = axs[row, col]  # fallback but should be impossible
-    if isinstance(src, pplt.SubplotGrid):
-        src = axs[0]  # fallback in case empty list
+            idx0, idx1 = np.argsort(data0.values), np.argsort(data1.values)
+            idata0, wgts0 = data0.isel(facets=idx0), wgts.isel(facets=idx0)
+            idata1, wgts1 = data1.isel(facets=idx1), wgts.isel(facets=idx1)
+            cdf0 = (wgts0.cumsum() - 0.5 * wgts0) / wgts0.sum()  # CDF function
+            cdf1 = (wgts1.cumsum() - 0.5 * wgts1) / wgts1.sum()  # CDF function
+            cdf0 = (cdf0 - cdf0[0]) / (cdf0[-1] - cdf0[0])  # 0% minimum 100% maximum
+            cdf1 = (cdf1 - cdf1[0]) / (cdf1[-1] - cdf1[0])  # 0% minimum 100% maximum
+            xorigs = np.interp(xpctile, cdf0, idata0)  # weighted percentile
+            yorigs = np.interp(ypctile, cdf1, idata1)
+        # Process constraint
+        kw_constraint.update(weight=weight, pctile=pctile)
+        xs, ys1, ys2 = process_constraint(data0, data1, constraint, **kw_constraint)
+        xcolor, ycolor = 'cyan7', 'pink7'
+        nbounds = len(xs) // 2  # should be one or two
+        xmins, xmean, xmaxs = xs[:nbounds], xs[nbounds], xs[-nbounds:]
+        nbounds = len(ys1) // 2  # should be one or two
+        ymins1, ymean, ymaxs1 = ys1[:nbounds], ys1[nbounds], ys1[-nbounds:]
+        ymins2, ymean, ymaxs2 = ys2[:nbounds], ys2[nbounds], ys2[-nbounds:]
+        horig, alphas = None, (0.1, 0.2)  # opacities of spanning shading
+        args = ([xmean, xmean], [min(ymins2) - 100, ymean])
+        xobjs = [ax.add_artist(mlines.Line2D(*args, lw=1, color=xcolor, label='observations'))]  # noqa: E501
+        color = 'cyan7' if 'y' in original or not handle else handle[0].get_color()
+        for alph, xmin, xmax in zip(alphas[-nbounds:], xmins, xmaxs[::-1]):
+            xobjs.append(ax.axvspan(xmin, xmax, lw=0, color=xcolor, alpha=alph))
+        for idx, bound in enumerate(xorigs):  # unconstrained x bounds
+            ls, lw = (':', 0.9) if idx == 1 else ('--', 0.7)
+            horig = ax.axvline(bound, ls=ls, lw=lw, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
+        if alternative:  # with and without regression uncertainty
+            ymins, ymaxs = (ymins2[0], ymins1[0]), (ymaxs2[-1], ymaxs1[-1])
+        else:  # with and without bootstrapped model-impled obs uncertainty
+            ymins, ymaxs, alphas = ymins2, ymaxs2[::-1], alphas[-nbounds:]
+        # Add labels and bounds
+        args = ([min(xmins) - 100, xmean], [ymean, ymean])
+        yobjs = [ax.add_artist(mlines.Line2D(*args, lw=1, color=ycolor, label='constrained'))]  # noqa: E501
+        color = ycolor if 'x' in original or not handle else handle[0].get_color()
+        for alph, ymin, ymax in zip(alphas, ymins, ymaxs):
+            yobjs.append(ax.axhspan(ymin, ymax, lw=0, color=ycolor, alpha=alph))
+        for idx, bound in enumerate(yorigs):  # unconstrained y bounds matching color
+            ls, lw = (':', 0.9) if idx == 1 else ('--', 0.7)
+            horig = ax.axhline(bound, ls=ls, lw=0.7, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
+        handle = [tuple(xobjs), tuple(yobjs)] + ([horig] if horig else [])
+        # param = r'\sigma_{\mathrm{constrained}} - \sigma_{\mathrm{unconstrained}}'
+        # param = rf'\dfrac{{{param}}}{{\sigma_{{\mathrm{{unconstrained}}}}}}'
+        param = r'\Delta \mathrm{CI}'
+        ratio = (max(ymaxs2) - min(ymins2)) / (max(yorigs) - min(yorigs)) - 1
+        ratio = ureg.Quantity(ratio, '').to('percent')
+        label = rf'${param}\,=\,{ratio:~L+.1f}$'
+        label = re.sub(r'(?<!\\)%', r'\%', label)
+        label = re.sub(r'(?<!\s)-', '{-}', label)
+        color = 'red7' if ratio > 0 else 'black'
+        title_kw = {'size': titlesize, 'color': color}
+        title_kw.update(kwargs)
+        ax.format(ultitle=label, ultitle_kw=title_kw)
+    return handle
 
-    # Infer settings
-    # TODO: Here 'extendsize' is always accurate since we call .auto_layout(tight=False)
-    # whenever axes are created, but in current proplot branch this is wrong. Should
-    # consider applying .auto_layout(tight=False) after drawing each axes.
-    if loc and loc[0] in 'lr':  # {{{
-        nspan = max(rows) - min(rows) + 1
-        span = (min(rows) + 1, max(rows) + 1) if src is fig else None
-    else:
-        nspan = max(cols) - min(cols) + 1
-        span = (min(cols) + 1, max(cols) + 1) if src is fig else None
-    shrink = 0.5 if nspan > 2 else 0.66
-    adjust = 1.3 if src is fig and nspan > 1 else 1.0
-    offset = 1.10 if axs[0]._name == 'cartesian' else 1.02  # for colorbar and legend
-    factor = cbarwrap or 1.2  # additional scaling
-    xoffset = loc and loc[0] in 'lr' and (rows[1] - rows[0]) % 2
-    yoffset = loc and loc[0] in 'tb' and (cols[1] - cols[0]) % 2
-    xcoords = {'l': 1, 'b': offset, 'r': 0, 't': offset}
-    ycoords = {'l': offset, 'b': 1, 'r': offset, 't': 0}
-    width, height = axs[0]._get_size_inches()
-    if cbarlength:
-        length = cbarlength / (1 if src is fig else adjust * nspan)
-    elif nspan == 1:
-        length = 1
-    elif src is fig:  # shrink along figure
-        length = shrink
-    elif src is not fig:  # extend beyond axes
-        length = adjust * nspan * shrink
-    if src is fig or not xoffset and not yoffset:
-        bbox = None
-        length = (0.5 - length / 2, 0.5 + length / 2)
-    else:
-        bbox = (xcoords[loc[0]], ycoords[loc[0]])
-        length = (offset - length / 2, offset + length / 2)
-    if loc and loc[0] in 'lr':  # get size used for wrapping
-        size = nspan * height
-    else:
-        size = nspan * width
-    if src is fig:  # include space between subplots
-        size += (adjust - 1) * (nspan - 1)
-    if factor:  # NOTE: currently always true
-        size *= factor
-    return src, loc, span, bbox, length, size
+
+def _format_violins(
+    ax, data, handle, line=None, width=None, median=False, horizontal=False, **kwargs
+):
+    """
+    Adjust and optionally add content to violin plots.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.axes
+        The original axes.
+    data : array-like
+        The original violin data.
+    handle : list of matplotlib.patches.Path
+        The violin patches.
+    line : list of matplotlib.lines.Line2D
+        The violin lines.
+
+    Other Parameters
+    ----------------
+    width : float, optional
+        The violin width in data units.
+    median : bool, optional
+        Whether to show the median instead of mean.
+    horizontal : bool, optional
+        Whether the violins were plotted horizontally.
+    **kwargs : optional
+        Additional properties to apply to violins (sequences allowed).
+    """
+    # Apply violin styling
+    # NOTE: Skip applying opacity to edges because faded outline appears conflicting
+    # in combination with white hatching and outline used for non-matching CMIP6.
+    # NOTE: Convert opacity to actual solid color so that overlapping violin shapes
+    # are not transparent and line opacities are not combined with background.
+    # NOTE: Seaborn ignores opacity channel on input color palette so must be
+    # manually applied here. Also apply to lines denoting individual observations
+    # and use manual alpha blending so that violin shapes can overlap without issues.
+    # See: https://github.com/mwaskom/seaborn/issues/622
+    # See: https://stackoverflow.com/q/68731566/4970632
+    # See: https://matplotlib.org/3.1.0/tutorials/colors/colors.html
+    data = getattr(data, 'values', data)  # {{{
+    hbase, lbase, handles, lines, locs = 0, 0, [], [], []
+    for idx in range(data.shape[1]):
+        num = np.sum(np.isfinite(np.unique(data[:, idx])))
+        if num > 0:  # violins plotted
+            locs.append(idx)
+            lines.append(line[lbase:lbase + num] if line else ())
+            handles.append(handle[hbase] if handle and num > 1 else None)
+        hbase += int(num > 1)
+        lbase += num
+    for key in ('alpha', 'hatch', 'linewidth', 'edgecolor'):
+        values = kwargs.get(key, None)
+        if values is None or np.isscalar(values):
+            values = [values] * len(handles)
+        for ihandle, ilines, value in zip(handles, lines, values):
+            if value is None:
+                continue
+            if ihandle:
+                if key != 'alpha':  # update property
+                    ihandle.update({key: value})
+                else:  # manually impose opacity
+                    color = ihandle.get_facecolor().squeeze()[:3]  # singleton array
+                    color = color * value + np.array([1, 1, 1]) * (1 - value)
+                    ihandle.set_facecolor(color)
+            for line in ilines:
+                line_color = line_alpha = False
+                if line_color and key == 'edgecolor':  # apply violin edge color
+                    line.set_color(value)
+                if line_alpha and key == 'alpha':  # apply violin fill opacity
+                    color = np.array(pplt.to_rgb(line.get_color()))
+                    color = color * value + np.array([1, 1, 1]) * (1 - value)
+                    line.set_color(color)
+
+    # Scale widths and add median
+    # TODO: Move this into custom proplot function. Matplotlib and seaborn both
+    # proihbit skipping width scaling, matplotlib seems to use weaker custom gaussian
+    # kde estimator instead of scipy version, and seaborn has major design limitations.
+    # NOTE: Seaborn violin plot 'width' and 'count' both scale by maximum density per
+    # violin and 'area' by maximum density across all violins. Otherwise the default
+    # scipy kde gaussian result evaluates to one when integrated over its domain in
+    # data units. To restore that behavior, and thus have equal area violins across
+    # many subplots, we undo the scaling by performing the integral ourselves.
+    axis = 'y' if horizontal else 'x'  # {{{
+    adjust = data.shape[1] / len(handles)  # treat violins as if separated by 1 x-step
+    width = width or KWARGS_VIOLIN.get('width', 1.0)  # scaled width preserving area
+    scatter = 'scatterx' if horizontal else 'scatter'
+    for i, (ihandle, ilines, iloc) in enumerate(zip(handles, lines, locs)):
+        zorder = 1 + (i + 1) / len(handles)
+        if not ihandle:
+            continue
+        polys = ihandle.get_paths()[0].to_polygons()[0]
+        grids = polys[:, 1 - int(horizontal)]  # gridpoints for gaussian kde sample
+        kdefit = polys[:, int(horizontal)]  # symmetric gaussian kde sample points
+        span = np.max(grids) - np.min(grids)
+        center = np.mean(kdefit)  # central coordinate of symmetric gaussian kde
+        scale = span * np.mean(np.abs(kdefit - center))  # integral of pdf over shape
+        polys[:, int(horizontal)] = center + adjust * width * (kdefit - center) / scale
+        ihandle.set_verts([polys])
+        ihandle.set_zorder(zorder)
+        for line in ilines:
+            points = getattr(line, f'get_{axis}data')()
+            points = center + adjust * width * (points - center) / scale
+            getattr(line, f'set_{axis}data')(points)
+            line.set_solid_capstyle('butt')  # prevent overlapping on violin edges
+            line.set_zorder(zorder)
+        cmd = np.nanmedian if median else np.nanmean
+        point = cmd(data[:, iloc])
+        getattr(ax, scatter)(center, point, zorder=zorder + 0.001, **KWARGS_CENTER)
+    return handles  # possibly adjusted handles
 
 
-def _props_command(
+def _merge_dists(
+    dataset, arguments, kws_collection, intersect=False, correlation=False, horizontal=False,  # noqa: E501
+    outers=None, inners=None, restrict=None, scale=None, offset=None, missing=None,
+):
+    """
+    Merge distributions into single array and prepare violin and bar plots.
+
+    Parameters
+    ----------
+    dataset : xarray.Dataset
+        The source dataset.
+    arguments : list of tuple
+        The plotting input arguments.
+    kws_collection : list of namedtuple
+        The plotting keyword arguments.
+    intersect : bool, optional
+        Whether to intersect coordinates on outer labels.
+    correlation : bool, optional
+        Whether to show correlation coefficients.
+    horizontal : bool, optional
+        Whether to plot horizontally.
+    outers : list of str, optional
+        Optional overrides for outer labels.
+    inner : list of str, optional
+        Optional overrides for outer labels.
+    restrict : str or sequence, optional
+        Optional keys used to restrict inner labels.
+    scale : float, optional
+        Optional scaling used for label splitting.
+    offset : float, optional
+        Offset between outer label groups.
+    missing : int, optional
+        Number of missing items per group.
+
+    Returns
+    -------
+    args : tuple
+        The merged arguments.
+    kw_collection : namedtuple
+        The merged keyword arguments.
+    """
+    # Merge distribution and scatter plot instructions into array
+    # NOTE: Currently this does regressions of differences instead of differences
+    # of regressions (and correlations, covariances, etc.) when using multidimensional
+    # reductions. Although they are the same if predictor is the same.
+    # NOTE: Considered removing this and having get_spec support 'lists of lists
+    # of specs' per subplot but this is complicated, and would still have to split
+    # then re-combine scalar coordinates e.g. 'project', so not much more elegant.
+    if len(nargs := set(map(len, arguments))) != 1:  # {{{
+        raise RuntimeError(f'Unexpected combination of argument counts {nargs}.')
+    if (nargs := nargs.pop()) not in (1, 2):
+        raise RuntimeError(f'Unexpected number of arguments {nargs}.')
+    refwidth = 1 + 0.25 * len(arguments)  # default width (compare with below)
+    refheight = 2.0  # default thickness (compare with below)
+    # refheight = 2.5 if nargs == 1 else 2.0
+    non_feedback = (ureg.K, ureg.K / ureg.K, ureg.W / ureg.m ** 2)
+    kw_collection = copy.deepcopy(kws_collection[0])  # deep copy of namedtuple
+    for kw, field in itertools.product(kws_collection, kws_collection[0]._fields):
+        getattr(kw_collection, field).update(getattr(kw, field))
+    if nargs == 1:
+        # Get violin data. To facillitate putting feedbacks and sensitivity in
+        # same panel, scale 4xCO2 values into 2xCO2 values. Also detect e.g.
+        # internal sensitivitye stimates and set all values to zero.
+        boxdata = bardata = annotations = None  # {{{
+        args = [data for (data,) in arguments]
+        units = [data.climo.units for data in args]
+        for i, iunits in enumerate(units):
+            data = args[i]
+            if iunits in non_feedback and data.name not in ('ts', 'tstd', 'tdev'):
+                data = 0.5 * data  # halve the spread
+                data.attrs.clear()  # defer to feedback labels
+                if np.all(np.abs(args[i]) < 0.1):  # pre-industrial forcing/sensitivity
+                    data = xr.zeros_like(data)
+                elif ureg.parse_units('W m^-2 K^-1') in units:
+                    data = data - 4  # adjust abrupt4xco2 ecs or erf to 2xco2
+                args[i] = data   # }}}
+    else:
+        # Get regression data. To facillitate putting feedback and sensitivity
+        # regression coefficients in same panel, scale 4xCO2 values into 2xCO2 values.
+        # TODO: Support *difference between slopes* instead of slopes of difference
+        # and support user-input 'pctile' as with reduce_facets()?
+        args, boxdata, bardata, annotations = [], [], [], []  # {{{
+        index, units = pd.Index(()), [data.climo.units for *_, data in arguments]
+        weight = kw_collection.other.get('weight', False)
+        kw_collection.command.setdefault('width', 1.0)  # ignore staggered bars
+        kw_collection.command['absolute_width'] = True
+        for iargs, iunits in zip(arguments, units):  # merge into slope estimators
+            dim = iargs[0].dims[0]  # currently always 'facets'
+            keys = sorted(set(key for arg in iargs for key in arg.coords))
+            kw_regress = dict(dim=dim, weight=weight, pctile=(50, 95), nofit=True)
+            result = _get_regression(*iargs, **kw_regress)
+            data, data_lower, data_upper, *_, rsq, _ = result
+            if correlation:
+                data.attrs['units'] = ''
+                data.attrs['short_name'] = 'correlation coefficient'
+            elif iunits in non_feedback:  # adjust to 2xco2 scaling
+                data.attrs.clear()  # NOTE: defer to feedback labels!
+                data, data_lower, data_upper = 0.5 * data, 0.5 * data_lower, 0.5 * data_upper  # noqa: E501
+            else:
+                data.attrs['units'] = f'{iargs[1].units} / ({iargs[0].units})'
+                data.attrs['short_name'] = 'regression coefficient'
+            for key in keys:
+                if any(key in arg.sizes for arg in iargs):
+                    continue  # non-scalar
+                if key in ('facets', 'version'):
+                    continue  # multi-index
+                if any(key in arg.indexes.get('facets', index).names for arg in iargs):
+                    continue  # xarray bug: https://github.com/pydata/xarray/issues/7695
+                if any(key in arg.indexes.get('version', index).names for arg in iargs):
+                    continue  # xarray bug: https://github.com/pydata/xarray/issues/7695
+                coords = [arg.coords[key].item() for arg in iargs if key in arg.coords]
+                dtype = np.asarray(coords[0]).dtype  # see process_data()
+                isnan = np.issubdtype(dtype, float) and np.isnan(coords[0])
+                if isnan or len(coords) == 1 or coords[0] == coords[1]:
+                    value = coords[0]
+                elif key in ('start', 'stop'):
+                    value = coords[1]  # kludge for constraints
+                else:  # WARNING: currently dropped by _get_scalars() below
+                    value = np.array(None, dtype=object)  # see process_data()
+                    value[...] = tuple(coords)
+                data.coords[key] = value
+            data.name = '|'.join((arg.name for arg in iargs))
+            data_lower1, data_lower2 = data_lower.values.flat
+            data_upper1, data_upper2 = data_upper.values.flat
+            rsq = ureg.Quantity(rsq.item(), '').to('percent')
+            annotation = f'${rsq:~L.0f}$'.replace(r'\ ', '')
+            # annotation = f'${corr.item():.2f}$'  # latex for long dash minus sign
+            args.append(data)
+            boxdata.append([data_lower1, data_upper1])
+            bardata.append([data_lower2, data_upper2])
+            annotations.append(annotation)  # }}}
+
+    # Infer inner and outer coordinates
+    # TODO: Switch to tuples=True and support tuple coords in _setup_command
+    # NOTE: The below code for kws_outer supports both intersections of outer labels
+    # and intersections of inner labels. Default behavior is to intersect inner
+    # labels on the legend and only denote "outer-most" coordinates with outer labels.
+    kws_outer, kws_inner = {}, {}  # {{{
+    kw_scalar, kw_vector, kw_outer, kw_inner = {}, {}, {}, {},
+    kw_coords = _get_scalars(*args, pairs=True)  # select second pair
+    kw_counts = {key: len(list(itertools.groupby(value))) for key, value in kw_coords.items()}  # noqa: E501
+    for key, values, count in zip(kw_coords, kw_coords.values(), kw_counts.values()):
+        if key == 'units':  # used for queue identifiers
+            continue
+        if count == 1:
+            kw_scalar[key] = values[0]
+        elif intersect or count == min(n for n in kw_counts.values() if n > 1):
+            kw_vector[key] = kw_outer[key] = values
+        else:
+            kw_vector[key] = kw_inner[key] = values
+    if not kw_vector:
+        raise RuntimeError('No coordinates found for concatenation.')
+    kws_inner = [dict(zip(kw_inner, vals)) for vals in zip(*kw_inner.values())]
+    kws_outer = [dict(zip(kw_outer, vals)) for vals in zip(*kw_outer.values())]
+    for kw_inner in kws_inner:
+        kw_inner.setdefault('name', 'net')
+
+    # Infer object and tick locations
+    # WARNING: For some reason naked len(itertools.groupby()) fails. Note this finds
+    # consecutive groups in a list of hashables and we want the fewest groups.
+    num, base, locs, ticks, kw_groups = 0, 0, [], [], []  # {{{
+    width = kw_collection.command.get('width') or 1.0
+    offset = 0.8 if offset is None else float(offset)  # additional offset coordinate
+    groups = list(itertools.groupby(kws_outer))
+    missing = missing or 0  # NOTE: Use this with rowspecs to align figure columns
+    for group, items in itertools.groupby(kws_outer):
+        items = list(items)
+        count = len(list(items))  # convert itertools._group object
+        ilocs = width * np.arange(base, base + count - 0.5)
+        ikws = kws_inner[num:num + count]
+        keys = [('name',), ('project',), ('experiment', 'start', 'stop', 'period')]
+        for key in keys:  # TODO: generalize the above 'keys' groups
+            values = [tuple(kw.get(_) for _ in key) for kw in ikws]
+            lengths = [len(list(items)) for _, items in itertools.groupby(values)]
+            if 1 < len(lengths) < len(values):  # i.e. additional groups are present
+                for idx in np.cumsum(lengths[:-1]):
+                    ilocs[idx:] += 0.5 * width * offset  # TODO: make this configurable?
+        tick = 0.5 * (ilocs[0] + ilocs[-1])
+        base += width * (1 + offset) + (ilocs[-1] - ilocs[0]) + missing  # coordinate
+        num += count + missing  # integer index
+        locs.extend(ilocs)
+        ticks.append(tick)
+        kw_groups.append(group)  # unique keyword argument groups
+
+    # Get inner and outer labels
+    # NOTE: This also tries to set up appropriate automatic line breaks.
+    # NOTE: Use 'skip_name' for inner labels to prevent unnecessary repetitions.
+    kw_label = dict(short=False, heading=False, identical=False)  # {{{
+    kw_label.update(scale=scale, strict=restrict, dataset=dataset)
+    key, other = ('refheight', 'refwidth') if horizontal else ('refwidth', 'refheight')
+    refwidth = kw_collection.figure.setdefault(key, refwidth)
+    refheight = kw_collection.figure.setdefault(other, refheight)
+    groupwidth = pplt.units(refwidth, 'in') / len(groups)  # scale by group count
+    labels_inner = inners or get_labels(*kws_inner, refwidth=np.inf, skip_name=True, **kw_label)  # noqa: E501
+    labels_outer = outers or get_labels(*kw_groups, refwidth=groupwidth, skip_name=False, **kw_label)  # noqa: E501
+    if len(labels_outer) != len(kw_groups):
+        raise ValueError(f'Mismatch between {len(labels_outer)} labels and {len(kw_groups)}.')  # noqa: E501
+    if labels_inner or labels_outer:
+        seen = set()  # seen labels
+        labels_print = [l for l in labels_inner if l not in seen and not seen.add(l)]
+        print()  # end previous line
+        print('Inner labels:', ', '.join(map(repr, labels_print)), end=' ')
+        print('Outer labels:', ', '.join(map(repr, labels_outer)), end=' ')
+    if labels_outer:
+        axis = 'y' if horizontal else 'x'
+        kw_axes = {
+            f'{axis}ticks': ticks,
+            f'{axis}ticklabels': labels_outer,
+            f'{axis}grid': False,
+            f'{axis}ticklen': 0,
+            f'{axis}tickmajorpad': 5,
+            f'{axis}rotation': 90 if axis == 'y' else 0,
+        }
+        kw_collection.axes.update(kw_axes)
+
+    # Concatenate arrays
+    # WARNING: np.array([(1, 2), (3, 4)], dtype=object) will create 2D array with
+    # tuples along rows instead of ragged arrays. Use proplot workaround below.
+    # NOTE: Only 'project' and 'institute' levels of 'components' are used elsewhere
+    keys = ('short_prefix', 'short_suffix', 'short_name', 'units')  # {{{
+    attrs = {key: val for data in args for key, val in data.attrs.items() if key in keys}  # noqa: E501
+    locs = np.array(locs or np.arange(len(kws_inner)), dtype=float)
+    if nargs == 1:  # violin plot arguments
+        values = np.empty(len(args), dtype=object)
+        values[:len(args)] = [tuple(data.values) for data in args]
+    else:
+        values = [data.item() for data in args]
+        values = np.array(values)
+    name = args[0].name
+    index = pd.MultiIndex.from_arrays(list(kw_vector.values()), names=list(kw_vector))
+    coords = {'components': index, **kw_scalar}
+    values = xr.DataArray(values, name=name, dims='components', attrs=attrs, coords=coords)  # noqa: E501
+    labels = labels_outer if intersect else labels_inner
+    if boxdata:
+        kw_collection.command.update(boxdata=np.array(boxdata).T, **KWARGS_ERRBOX)
+    if bardata:
+        kw_collection.command.update(bardata=np.array(bardata).T, **KWARGS_ERRBAR)
+    if labels:  # used for legend entries
+        values.coords['label'] = ('components', labels)
+    if annotations:  # used for _format_bars annotations
+        values.coords['annotation'] = ('components', annotations)
+    args = (locs, values)
+    return args, kw_collection
+
+
+def _merge_guides(args, handles, pad=None, size=None, sort=True):
+    """
+    Return handles and labels merged from multiple inputs.
+
+    Parameters
+    ----------
+    args : list of xarray.DataArray
+        The input data arrays.
+    handles : list of iterable
+        The input plot handle lists.
+    sort : bool, optional
+        Whether to sort input values.
+
+    Other Parameters
+    ----------------
+    pad : optional
+        Total padding between items.
+    size : optional
+        Total length and height of each item.
+
+    Returns
+    -------
+    handles : list of proplot.Artist
+        The merged handles.
+    labels : list of str
+        The merged labels.
+    kw_legend : dict
+        Additional legend keyword arguments.
+    """
+    # Helper function
+    # NOTE: Originally needed to use 'luminance' for sorting violins that used alpha
+    # manually but now just retrieve handles with insertion order.
+    def _sort_idxs(handles, sort=True):
+        none = lambda: None
+        idxs = list(range(len(handles)))
+        if sort and handles and hasattr(handles[0], 'get_facecolor'):
+            colors = [getattr(handle, 'get_facecolor', none)() for handle in handles]
+            colors = ['none' if value is None else value for value in colors]
+            colors = [value.squeeze() if hasattr(value, 'squeeze') else value for value in colors]  # noqa: E501
+            alphas = [pplt.to_rgba(value)[3] for value in colors]
+            hatches = [bool(getattr(handle, 'get_hatch', none)()) for handle in handles]
+            widths = [handle.get_linewidth() for handle in handles]
+            keys = list(zip(alphas, hatches, widths, range(len(alphas))))
+            idxs = [idx for idx, _ in sorted(enumerate(keys), key=lambda pair: pair[1])]
+        return idxs
+
+    # Iterate jointly over arguments handle components
+    # NOTE: Identify handles that have not yet been drawn by explicit list
+    # of possible artist properties. Can add to this list.
+    # WARNING: Iterate in reverse order for special case where effective climate
+    # sensitivity places on first column but has empty violin slots.
+    tuples = {}  # {{{
+    properties = set()
+    for num, (arg, objects) in enumerate(zip(args, handles)):
+        labels = arg.coords.get('label', None)
+        if labels is None:
+            raise ValueError('Input data has no label coordinate.')
+        labels = [label for label in labels.values if label is not None]  # for seaborn
+        if len(objects) > len(labels):  # allow less than for e.g. sensitivity
+            raise ValueError(f'Number of labels ({len(labels)}) differs from handles ({len(objects)}).')  # noqa: E501
+        for idx in _sort_idxs(objects, sort=sort)[::-1]:  # e.g. cmip5 then cmip6
+            props, label, handle = {}, labels[idx], objects[idx]
+            if not handle:  # empty violin slot due to e.g. all-zero array
+                continue
+            for key, value in handle.properties().items():
+                if key not in PROPS_LEGEND:
+                    continue
+                if hasattr(value, 'name'):  # e.g. PathCollection, LineCollection cmap
+                    value = value.name
+                if isinstance(value, list):
+                    value = tuple(value)
+                if getattr(value, 'ndim', None) == 1:
+                    value = tuple(value.tolist())
+                if np.issubdtype(getattr(value, 'dtype', object), float):
+                    value = np.round(value, 3)
+                if getattr(value, 'ndim', None) == 2:
+                    value = tuple(map(tuple, value.tolist()))
+                props[key] = value
+            tups = tuples.setdefault(label, [])
+            props = tuple(props.items())
+            if props not in properties:  # only unique handles
+                tups.append((num, idx, handle))  # sort by original index below
+                properties.add(props)
+
+    # Get legend args and kwargs
+    # NOTE: Try to make each box in the handle-tuple approximately square and use
+    # same 'ndivide' for all entries so that final handles have the same length.
+    result = {}  # {{{
+    size = size or pplt.rc['legend.handleheight']
+    pad = pad or 0  # make items flush by default
+    for label, handles in tuple(tuples.items())[::-1]:  # restore *original* order
+        handles = [handle for *_, handle in sorted(handles, key=lambda tup: tup[:2])]
+        handle = tuple(handles[idx] for idx in _sort_idxs(handles, sort=False))
+        result[label] = handle  # combined with tupler handle
+    ndivide = max(map(len, result.values()))
+    handler = mhandler.HandlerTuple(pad=pad, ndivide=ndivide)
+    kw_legend = {
+        'handleheight': size,
+        'handlelength': size * max(map(len, result.values())),
+        'handler_map': {tuple: handler},  # or use tuple coords as map keys
+    }
+    labels, handles = map(list, zip(*result.items()))
+    return handles, labels, kw_legend
+
+
+def _setup_axes(
+    arguments, kws_collection, geom=None, fig=None, gs=None, title=None, texts=None
+):
+    """
+    Initialize plotting objects given input arguments.
+
+    Parameters
+    ----------
+    arguments : list of tuple of xarray.DataArray
+        The plotting input arguments.
+    kws_collection : list of namedtuple of dict
+        The keyword arguments for each command.
+
+    Other Parameters
+    ----------------
+    geom : tuple, optional
+        The ``(nrows, ncols, index)`` geometry.
+    fig : proplot.Figure, optional
+        The existing figure.
+    gs : proplot.GridSpec, optional
+        The existing gridspec.
+    title : str, optional
+        The default title of the axes.
+    texts : str or dict, optional
+        Optional additional text specification.
+
+    Returns
+    -------
+    fig : proplot.Figure
+        The source figure.
+    gs : proplot.GridSpec
+        The source gridspec.
+    ax : proplot.Axes
+        The plotting axes.
+    """
+    # Update defaults
+    # NOTE: Transpose is used for e.g. latitude average panels on geographic plots.
+    dims_ignore = {'facets', 'version', 'period'}  # {{{
+    dims = [tuple(sorted(args[-1].sizes.keys() - dims_ignore)) for args in arguments]
+    if len(set(dims)) != 1:
+        raise RuntimeError(f'Conflicting dimensionalities in single subplot: {dims}')
+    transpose = any(kw_collection.other.get('transpose') for kw_collection in kws_collection)  # noqa: E501
+    keys_ignore = ('lon', 'lat')  # format instructions to ignore
+    kw_axes = {}  # default settings
+    dims = set(dims[0])
+    geom = geom or (1, 1, 0)  # total subplotspec geometry
+    span, sharex, sharey = False, 'labels', 'labels'
+    if 'lon' in dims and 'lat' in dims:
+        kw = KWARGS_GEO.copy()
+        keys_ignore = ('x', 'y')
+        kw_axes.update(kw)
+    if 'lon' not in dims and 'lat' in dims:
+        kw = KWARGS_LAT.copy()
+        sharex = True  # no duplicate latitude labels
+        if transpose:  # latitude on y axis
+            kw = {key[0].replace('x', 'y') + key[1:]: val for key, val in kw.items()}
+            kw.update(ytickloc='right')  # generally combined with shading
+        kw_axes.update(kw)
+    if 'plev' in dims:
+        kw = KWARGS_PLEV.copy()
+        sharey = True  # no duplicate pressure labels
+        if transpose:  # pressure on x axis
+            kw = {key[0].replace('y', 'x') + key[1:]: val for key, val in kw.items()}
+            kw.update(xtickloc='top')  # generally combined with shading
+        kw_axes.update(kw)
+
+    # Initialize figure and axes
+    # WARNING: Critical to merge commands first since they apply default width based
+    # on number of violins and bars. Also note save space by using inset a-b-c below.
+    kw_axes.update(KWARGS_FIG)  # abc and title properties {{{
+    kw_axes.update({'abcloc': 'ul'} if title is None else {'title': title})
+    kw_axes.update({'abc': False} if max(geom[:2]) == 1 else {})
+    kw_figure = {'sharex': sharex, 'sharey': sharey, 'span': span}
+    kw_figure.update({'refwidth': kw_axes.pop('refwidth', None)})
+    kw_gridspec = {}  # no defaults currently
+    if gs is None:
+        for kw_collection in kws_collection:
+            kw_gridspec.update(kw_collection.gridspec)
+        gs = pplt.GridSpec(*geom[:2], **kw_gridspec)
+    if fig is None:  # also support updating? or too slow?
+        skip = any('share' in kw_collection.figure for kw_collection in kws_collection)
+        for key in (('sharex', 'sharey') if skip else ()):
+            kw_figure.pop(key, None)
+        for kw_collection in kws_collection:
+            kw_figure.update(kw_collection.figure)
+        fig = pplt.figure(**kw_figure)
+    for kw_collection in kws_collection:
+        keys = [x for x in kw_collection.axes if any(x[:len(y)] == y for y in keys_ignore)]  # noqa: E501
+        for key in keys:
+            del kw_collection.axes[key]
+        kw_axes.update(kw_collection.axes)
+        kw_collection.axes.update(kw_axes)  # re-apply after plotting
+    with warnings.catch_warnings():  # ignore matplotlib map_projection warning
+        warnings.simplefilter('ignore')
+        ax = fig.add_subplot(gs[geom[2]], **kw_axes)
+    for text in texts or ():
+        if not text or not isinstance(text, tuple):
+            continue
+        x, y, s, *kw_text = text
+        kw_text = kw_text and kw_text[0] or {}
+        kw_text.setdefault('transform', 'axes')
+        kw_text.setdefault('weight', 'bold')
+        kw_text.setdefault('fontsize', pplt.rc.fontlarge)
+        obj = ax.text(x, y, s, **kw_text)
+        obj.set_in_layout(False)
+    fig.auto_layout(tight=False)  # TODO: commit on master
+    return fig, gs, ax
+
+
+def _setup_command(
+    args, kw_collection, horizontal=False, transpose=False, sortby=None,
+    violin=True, shading=True, pcolor=False, contour=None,
+):
+    """
+    Generate a plotting command and keyword arguments from the input arguments.
+
+    Parameters
+    ----------
+    args : xarray.DataArray
+        Input arguments.
+    kw_collection : namedtuple
+        Input keyword arguments.
+    horizontal : bool, optional
+        Whether to use vertical or horizontal orientation.
+    transpose : bool, optional
+        Whether to transpose variables for line plots.
+    sortby : array-like, optional
+        The array to optionally use for sorting bar plots.
+    violin : bool, optional
+        Whether to use violins for several 1D array inputs.
+    shading : bool or dict, optional
+        Whether to use shading or contours for 2D array inputs.
+    contour : dict, optional
+        Additional contour properties for 2D array inputs.
+    pcolor : bool, optional
+        Whether to use `pcolormesh` for 2D shaded plot.
+
+    Results
+    -------
+    command : str
+        The plotting command.
+    guide : str
+        The guide to use for the command.
+    args : tuple
+        The positional arguments.
+    kw_collection : namedtuple
+        The possibly updated keyword arguments.
+    """
+    # Assign plotting command
+    # WARNING: Critical to get properties before sorting below or
+    # else flagship model designation is not detected correctly.
+    hatch = kw_patch = kw_scatter = {}  # {{{
+    ignore = {'time', 'facets', 'version', 'components'}
+    *_, data = args  # ignore constraint and regression scatter
+    if dims := sorted(data.sizes.keys() - ignore):
+        # Spatial plots with shading
+        # TODO: Support hist and hist2d plots in addition to scatter and barh
+        # plots (or just hist since hist2d usually looks ugly with so little data).
+        negpos = kw_collection.command.get('negpos', None)  # {{{
+        hatch = any(val for key, val in kw_collection.command.items() if 'hatch' in key)
+        if len(dims) == 1 and dims[0] == 'plev':
+            command = 'line' if negpos is None else 'area'
+            command += '' if transpose else 'x'
+            defaults = (KWARGS_LINE if negpos is None else KWARGS_AREA).copy()
+        elif len(dims) == 1:
+            command = 'line' if negpos is None else 'area'
+            command += 'x' if transpose else ''
+            defaults = (KWARGS_LINE if negpos is None else KWARGS_AREA).copy()
+        elif hatch:  # hatching
+            command = 'contourf'
+            defaults = KWARGS_HATCH.copy()
+        elif shading:  # shading
+            command = 'pcolormesh' if pcolor else 'contourf'
+            defaults = {**KWARGS_SHADING, **({} if shading is True else shading or {})}
+        else:  # no shading
+            command = 'contour'
+            defaults = {**KWARGS_CONTOUR, **({} if contour is True else contour or {})}  # noqa: E501  # }}}
+    else:
+        # Scalar plots with advanced default properties
+        # NOTE: _setup_violins applies custom grouping and spacing of violin plots
+        # by inserting nan columns then _format_violins imposes properties on resluts.
+        nargs = sum(isinstance(arg, xr.DataArray) for arg in args)  # {{{
+        ragged = data.ndim == 2 or data.ndim == 1 and data.dtype == 'O'
+        dists = 'facets' in data.sizes  # auto settings
+        violin = kw_collection.other.get('violin', True)
+        horizontal = kw_collection.other.get('horizontal', False)
+        flagships, weights = _get_institutes(data)  # WARNING: critical to come first
+        if nargs == 1 and not ragged and dists:  # sort distribution
+            idxs = (data if sortby is None else sortby).argsort()
+            args = (*args[:-1], data := data[idxs.values])
+            weights = np.take(weights, idxs)
+            flagships = np.take(flagships, idxs)
+        kw_props = _pop_kwargs(kw_collection.other.copy(), _setup_defaults)
+        kw_props.update(flagships=flagships, weights=weights)
+        colors, kw_patch, kw_scatter = _setup_defaults(data, **kw_props)
+        if nargs == 1 and violin and ragged:
+            kw_violin = dict(color=colors, horizontal=horizontal, **kw_patch)
+            *args, kw_collection = _setup_violins(*args, kw_collection, **kw_violin)
+        if nargs == 2:
+            command = 'scatter'
+            defaults = {**KWARGS_SCATTER, **kw_scatter}
+        elif not ragged:  # bar plot
+            command = 'barh' if horizontal else 'bar'
+            defaults = {**KWARGS_BAR, **kw_patch}
+        elif not violin:
+            command = 'boxh' if horizontal else 'box'
+            defaults = {**KWARGS_BOX, **kw_patch}
+        else:
+            command = 'violinh' if horizontal else 'violin'
+            defaults = {key: val for key, val in KWARGS_VIOLIN.items() if key != 'color'}  # noqa: E501
+        if dists and 'bar' in command:
+            if 'color' in kw_collection.command:  # no manual color/auto autocolor
+                defaults['negpos'] = data.name[-3:] not in ('ecs',)
+        elif not dists and 'violin' not in command and 'scatter' not in command:
+            if all(c is not None for c in colors):  # TODO: figure out when used
+                defaults['color'] = colors  # }}}
+
+    # Update guide keywords
+    # NOTE: This enforces legend handles grouped only for parameters with identical
+    # units e.g. separate legends for sensitivity and feedback bar plots.
+    # WARNING: Critical to delay wrapping the colorbar label until content is
+    # drawn or else the reference width and height cannot be known.
+    shading = command in ('contourf', 'pcolormesh')  # {{{
+    contours = command == 'contour'
+    kw_collection = copy.deepcopy(kw_collection)
+    for key in PROPS_CONTOUR:
+        if not shading and not contours:
+            kw_collection.command.pop(key, None)
+    for key, value in defaults.items():  # including e.g. width=None
+        if kw_collection.command.get(key, None) is None and value is not None:
+            kw_collection.command[key] = value
+    prefix = data.attrs.pop('short_prefix', None)
+    short = data.attrs.get('short_name', '')
+    long = data.attrs.get('long_name', '')
+    if not hatch and (shading or contours):
+        guide = 'colorbar' if shading else 'legend'
+        label = data.climo.short_label
+        color = kw_collection.command.pop('color', None)
+        if shading:  # colorbar label
+            kw_collection.colorbar.setdefault('label', label)
+        else:  # legend label
+            kw_collection.legend.setdefault('label', label)
+        if color is not None:  # colormap for queue
+            kw_collection.command['cmap'] = (color,)
+    else:   # generalized legend
+        guide = 'legend'
+        if 'label' in data.coords or 'contour' in command and hatch:
+            label = None  # TODO: revisit this?
+        else:  # default label
+            label = prefix or long.replace(short, '').strip()
+        if not dims and command[-1] == 'h':
+            kw_collection.axes.setdefault('yreverse', True)
+        kw_collection.legend.setdefault('label', label)
+    return command, guide, args, kw_collection
+
+
+def _setup_defaults(
     data, cycle=None, autocolor=False, flagships=None, weights=None,
 ):
     """
@@ -792,1139 +1804,129 @@ def _props_command(
     return colors, kw_patch, kw_scatter
 
 
-def _init_command(
-    args, kw_collection, horizontal=False, transpose=False, sortby=None,
-    violin=True, shading=True, pcolor=False, contour=None,
-):
+def _setup_guide(*axs, loc=None, figurespan=None, cbarlength=None, cbarwrap=None):
     """
-    Generate a plotting command and keyword arguments from the input arguments.
+    Return properties for the guide based on input arguments.
 
     Parameters
     ----------
-    args : xarray.DataArray
-        Input arguments.
-    kw_collection : namedtuple
-        Input keyword arguments.
-    horizontal : bool, optional
-        Whether to use vertical or horizontal orientation.
-    transpose : bool, optional
-        Whether to transpose variables for line plots.
-    sortby : array-like, optional
-        The array to optionally use for sorting bar plots.
-    violin : bool, optional
-        Whether to use violins for several 1D array inputs.
-    shading : bool or dict, optional
-        Whether to use shading or contours for 2D array inputs.
-    contour : dict, optional
-        Additional contour properties for 2D array inputs.
-    pcolor : bool, optional
-        Whether to use `pcolormesh` for 2D shaded plot.
-
-    Results
-    -------
-    command : str
-        The plotting command.
-    guide : str
-        The guide to use for the command.
-    args : tuple
-        The positional arguments.
-    kw_collection : namedtuple
-        The possibly updated keyword arguments.
-    """
-    # Assign plotting command
-    # WARNING: Critical to get properties before sorting below or
-    # else flagship model designation is not detected correctly.
-    hatch = kw_patch = kw_scatter = {}  # {{{
-    ignore = {'time', 'facets', 'version', 'components'}
-    *_, data = args  # ignore constraint and regression scatter
-    if dims := sorted(data.sizes.keys() - ignore):
-        # Spatial plots with shading
-        # TODO: Support hist and hist2d plots in addition to scatter and barh
-        # plots (or just hist since hist2d usually looks ugly with so little data).
-        negpos = kw_collection.command.get('negpos', None)  # {{{
-        hatch = any(val for key, val in kw_collection.command.items() if 'hatch' in key)
-        if len(dims) == 1 and dims[0] == 'plev':
-            command = 'line' if negpos is None else 'area'
-            command += '' if transpose else 'x'
-            defaults = (KWARGS_LINE if negpos is None else KWARGS_AREA).copy()
-        elif len(dims) == 1:
-            command = 'line' if negpos is None else 'area'
-            command += 'x' if transpose else ''
-            defaults = (KWARGS_LINE if negpos is None else KWARGS_AREA).copy()
-        elif hatch:  # hatching
-            command = 'contourf'
-            defaults = KWARGS_HATCH.copy()
-        elif shading:  # shading
-            command = 'pcolormesh' if pcolor else 'contourf'
-            defaults = {**KWARGS_SHADING, **({} if shading is True else shading or {})}
-        else:  # no shading
-            command = 'contour'
-            defaults = {**KWARGS_CONTOUR, **({} if contour is True else contour or {})}  # noqa: E501  # }}}
-    else:
-        # Scalar plots with advanced default properties
-        # NOTE: _violin_data applies custom grouping and spacing of violin plots by
-        # inserting nan columns then _setup_violins imposes properties on resluts.
-        nargs = sum(isinstance(arg, xr.DataArray) for arg in args)  # {{{
-        ragged = data.ndim == 2 or data.ndim == 1 and data.dtype == 'O'
-        dists = 'facets' in data.sizes  # auto settings
-        violin = kw_collection.other.get('violin', True)
-        horizontal = kw_collection.other.get('horizontal', False)
-        flagships, weights = _get_institutes(data)  # WARNING: critical to come first
-        if nargs == 1 and not ragged and dists:  # sort distribution
-            idxs = (data if sortby is None else sortby).argsort()
-            args = (*args[:-1], data := data[idxs.values])
-            weights = np.take(weights, idxs)
-            flagships = np.take(flagships, idxs)
-        kw_props = _pop_kwargs(kw_collection.other.copy(), _props_command)
-        kw_props.update(flagships=flagships, weights=weights)
-        colors, kw_patch, kw_scatter = _props_command(data, **kw_props)
-        if nargs == 1 and violin and ragged:
-            kw_violin = dict(color=colors, horizontal=horizontal, **kw_patch)
-            *args, kw_collection = _violin_data(*args, kw_collection, **kw_violin)
-        if nargs == 2:
-            command = 'scatter'
-            defaults = {**KWARGS_SCATTER, **kw_scatter}
-        elif not ragged:  # bar plot
-            command = 'barh' if horizontal else 'bar'
-            defaults = {**KWARGS_BAR, **kw_patch}
-        elif not violin:
-            command = 'boxh' if horizontal else 'box'
-            defaults = {**KWARGS_BOX, **kw_patch}
-        else:
-            command = 'violinh' if horizontal else 'violin'
-            defaults = {key: val for key, val in KWARGS_VIOLIN.items() if key != 'color'}  # noqa: E501
-        if dists and 'bar' in command:
-            if 'color' in kw_collection.command:  # no manual color/auto autocolor
-                defaults['negpos'] = data.name[-3:] not in ('ecs',)
-        elif not dists and 'violin' not in command and 'scatter' not in command:
-            if all(c is not None for c in colors):  # TODO: figure out when used
-                defaults['color'] = colors  # }}}
-
-    # Update guide keywords
-    # NOTE: This enforces legend handles grouped only for parameters with identical
-    # units e.g. separate legends for sensitivity and feedback bar plots.
-    # WARNING: Critical to delay wrapping the colorbar label until content is
-    # drawn or else the reference width and height cannot be known.
-    shading = command in ('contourf', 'pcolormesh')  # {{{
-    contours = command == 'contour'
-    kw_collection = copy.deepcopy(kw_collection)
-    for key in PROPS_CONTOUR:
-        if not shading and not contours:
-            kw_collection.command.pop(key, None)
-    for key, value in defaults.items():  # including e.g. width=None
-        if kw_collection.command.get(key, None) is None and value is not None:
-            kw_collection.command[key] = value
-    prefix = data.attrs.pop('short_prefix', None)
-    short = data.attrs.get('short_name', '')
-    long = data.attrs.get('long_name', '')
-    if not hatch and (shading or contours):
-        guide = 'colorbar' if shading else 'legend'
-        label = data.climo.short_label
-        color = kw_collection.command.pop('color', None)
-        if shading:  # colorbar label
-            kw_collection.colorbar.setdefault('label', label)
-        else:  # legend label
-            kw_collection.legend.setdefault('label', label)
-        if color is not None:  # colormap for queue
-            kw_collection.command['cmap'] = (color,)
-    else:   # generalized legend
-        guide = 'legend'
-        if 'label' in data.coords or 'contour' in command and hatch:
-            label = None  # TODO: revisit this?
-        else:  # default label
-            label = prefix or long.replace(short, '').strip()
-        if not dims and command[-1] == 'h':
-            kw_collection.axes.setdefault('yreverse', True)
-        kw_collection.legend.setdefault('label', label)
-    return command, guide, args, kw_collection
-
-
-def _init_objects(
-    arguments, kws_collection, geom=None, fig=None, gs=None, title=None, texts=None
-):
-    """
-    Initialize plotting objects given input arguments.
-
-    Parameters
-    ----------
-    arguments : list of tuple of xarray.DataArray
-        The plotting input arguments.
-    kws_collection : list of namedtuple of dict
-        The keyword arguments for each command.
-
-    Other Parameters
-    ----------------
-    geom : tuple, optional
-        The ``(nrows, ncols, index)`` geometry.
-    fig : proplot.Figure, optional
-        The existing figure.
-    gs : proplot.GridSpec, optional
-        The existing gridspec.
-    title : str, optional
-        The default title of the axes.
-    texts : str or dict, optional
-        Optional additional text specification.
+    *axs : proplot.Axes
+        The referenced axes.
+    loc : str, optional
+        The input guide location.
+    figurespan : bool, optional
+        Whether to make colorbars and legends span the entire figure.
+    cbarlength : float, default: auto
+        The relative colorbar length based on input.
+    cbarwrap : float, default: 1.2
+        Scaling to apply to size used to wrap colorbar labels.
 
     Returns
     -------
-    fig : proplot.Figure
-        The source figure.
-    gs : proplot.GridSpec
-        The source gridspec.
-    ax : proplot.Axes
-        The plotting axes.
+    src : object
+        The figure or axes to use.
+    loc : str
+        The guide location to use.
+    span : 2-tuple
+        The span for figure-edge labels.
+    bbox : 2-tuple
+        The bounding box for legends.
+    length : float
+        The relative length for colorbars.
+    size : float
+        The size in inches.
     """
-    # Update defaults
-    # NOTE: Transpose is used for e.g. latitude average panels on geographic plots.
-    dims_ignore = {'facets', 'version', 'period'}  # {{{
-    dims = [tuple(sorted(args[-1].sizes.keys() - dims_ignore)) for args in arguments]
-    if len(set(dims)) != 1:
-        raise RuntimeError(f'Conflicting dimensionalities in single subplot: {dims}')
-    transpose = any(kw_collection.other.get('transpose') for kw_collection in kws_collection)  # noqa: E501
-    keys_ignore = ('lon', 'lat')  # format instructions to ignore
-    kw_axes = {}  # default settings
-    dims = set(dims[0])
-    geom = geom or (1, 1, 0)  # total subplotspec geometry
-    span, sharex, sharey = False, 'labels', 'labels'
-    if 'lon' in dims and 'lat' in dims:
-        kw = KWARGS_GEO.copy()
-        keys_ignore = ('x', 'y')
-        kw_axes.update(kw)
-    if 'lon' not in dims and 'lat' in dims:
-        kw = KWARGS_LAT.copy()
-        sharex = True  # no duplicate latitude labels
-        if transpose:  # latitude on y axis
-            kw = {key[0].replace('x', 'y') + key[1:]: val for key, val in kw.items()}
-            kw.update(ytickloc='right')  # generally combined with shading
-        kw_axes.update(kw)
-    if 'plev' in dims:
-        kw = KWARGS_PLEV.copy()
-        sharey = True  # no duplicate pressure labels
-        if transpose:  # pressure on x axis
-            kw = {key[0].replace('y', 'x') + key[1:]: val for key, val in kw.items()}
-            kw.update(xtickloc='top')  # generally combined with shading
-        kw_axes.update(kw)
-
-    # Initialize figure and axes
-    # WARNING: Critical to merge commands first since they apply default width based
-    # on number of violins and bars. Also note save space by using inset a-b-c below.
-    kw_axes.update(KWARGS_FIG)  # abc and title properties {{{
-    kw_axes.update({'abcloc': 'ul'} if title is None else {'title': title})
-    kw_axes.update({'abc': False} if max(geom[:2]) == 1 else {})
-    kw_figure = {'sharex': sharex, 'sharey': sharey, 'span': span}
-    kw_figure.update({'refwidth': kw_axes.pop('refwidth', None)})
-    kw_gridspec = {}  # no defaults currently
-    if gs is None:
-        for kw_collection in kws_collection:
-            kw_gridspec.update(kw_collection.gridspec)
-        gs = pplt.GridSpec(*geom[:2], **kw_gridspec)
-    if fig is None:  # also support updating? or too slow?
-        skip = any('share' in kw_collection.figure for kw_collection in kws_collection)
-        for key in (('sharex', 'sharey') if skip else ()):
-            kw_figure.pop(key, None)
-        for kw_collection in kws_collection:
-            kw_figure.update(kw_collection.figure)
-        fig = pplt.figure(**kw_figure)
-    for kw_collection in kws_collection:
-        keys = [x for x in kw_collection.axes if any(x[:len(y)] == y for y in keys_ignore)]  # noqa: E501
-        for key in keys:
-            del kw_collection.axes[key]
-        kw_axes.update(kw_collection.axes)
-        kw_collection.axes.update(kw_axes)  # re-apply after plotting
-    with warnings.catch_warnings():  # ignore matplotlib map_projection warning
-        warnings.simplefilter('ignore')
-        ax = fig.add_subplot(gs[geom[2]], **kw_axes)
-    for text in texts or ():
-        if not text or not isinstance(text, tuple):
-            continue
-        x, y, s, *kw_text = text
-        kw_text = kw_text and kw_text[0] or {}
-        kw_text.setdefault('transform', 'axes')
-        kw_text.setdefault('weight', 'bold')
-        kw_text.setdefault('fontsize', pplt.rc.fontlarge)
-        obj = ax.text(x, y, s, **kw_text)
-        obj.set_in_layout(False)
-    fig.auto_layout(tight=False)  # TODO: commit on master
-    return fig, gs, ax
-
-
-def _merge_dists(
-    dataset, arguments, kws_collection, intersect=False, correlation=False, horizontal=False,  # noqa: E501
-    outers=None, inners=None, restrict=None, scale=None, offset=None, missing=None,
-):
-    """
-    Merge distributions into single array and prepare violin and bar plots.
-
-    Parameters
-    ----------
-    dataset : xarray.Dataset
-        The source dataset.
-    arguments : list of tuple
-        The plotting input arguments.
-    kws_collection : list of namedtuple
-        The plotting keyword arguments.
-    intersect : bool, optional
-        Whether to intersect coordinates on outer labels.
-    correlation : bool, optional
-        Whether to show correlation coefficients.
-    horizontal : bool, optional
-        Whether to plot horizontally.
-    outers : list of str, optional
-        Optional overrides for outer labels.
-    inner : list of str, optional
-        Optional overrides for outer labels.
-    restrict : str or sequence, optional
-        Optional keys used to restrict inner labels.
-    scale : float, optional
-        Optional scaling used for label splitting.
-    offset : float, optional
-        Offset between outer label groups.
-    missing : int, optional
-        Number of missing items per group.
-
-    Returns
-    -------
-    args : tuple
-        The merged arguments.
-    kw_collection : namedtuple
-        The merged keyword arguments.
-    """
-    # Merge distribution and scatter plot instructions into array
-    # NOTE: Currently this does regressions of differences instead of differences
-    # of regressions (and correlations, covariances, etc.) when using multidimensional
-    # reductions. Although they are the same if predictor is the same.
-    # NOTE: Considered removing this and having get_spec support 'lists of lists
-    # of specs' per subplot but this is complicated, and would still have to split
-    # then re-combine scalar coordinates e.g. 'project', so not much more elegant.
-    if len(nargs := set(map(len, arguments))) != 1:  # {{{
-        raise RuntimeError(f'Unexpected combination of argument counts {nargs}.')
-    if (nargs := nargs.pop()) not in (1, 2):
-        raise RuntimeError(f'Unexpected number of arguments {nargs}.')
-    refwidth = 1 + 0.25 * len(arguments)  # default width (compare with below)
-    refheight = 2.0  # default thickness (compare with below)
-    # refheight = 2.5 if nargs == 1 else 2.0
-    non_feedback = (ureg.K, ureg.K / ureg.K, ureg.W / ureg.m ** 2)
-    kw_collection = copy.deepcopy(kws_collection[0])  # deep copy of namedtuple
-    for kw, field in itertools.product(kws_collection, kws_collection[0]._fields):
-        getattr(kw_collection, field).update(getattr(kw, field))
-    if nargs == 1:
-        # Get violin data. To facillitate putting feedbacks and sensitivity in
-        # same panel, scale 4xCO2 values into 2xCO2 values. Also detect e.g.
-        # internal sensitivitye stimates and set all values to zero.
-        boxdata = bardata = annotations = None  # {{{
-        args = [data for (data,) in arguments]
-        units = [data.climo.units for data in args]
-        for i, iunits in enumerate(units):
-            data = args[i]
-            if iunits in non_feedback and data.name not in ('ts', 'tstd', 'tdev'):
-                data = 0.5 * data  # halve the spread
-                data.attrs.clear()  # defer to feedback labels
-                if np.all(np.abs(args[i]) < 0.1):  # pre-industrial forcing/sensitivity
-                    data = xr.zeros_like(data)
-                elif ureg.parse_units('W m^-2 K^-1') in units:
-                    data = data - 4  # adjust abrupt4xco2 ecs or erf to 2xco2
-                args[i] = data   # }}}
-    else:
-        # Get regression data. To facillitate putting feedback and sensitivity
-        # regression coefficients in same panel, scale 4xCO2 values into 2xCO2 values.
-        # TODO: Support *difference between slopes* instead of slopes of difference
-        # and support user-input 'pctile' as with reduce_facets()?
-        args, boxdata, bardata, annotations = [], [], [], []  # {{{
-        index, units = pd.Index(()), [data.climo.units for *_, data in arguments]
-        weight = kw_collection.other.get('weight', False)
-        kw_collection.command.setdefault('width', 1.0)  # ignore staggered bars
-        kw_collection.command['absolute_width'] = True
-        for iargs, iunits in zip(arguments, units):  # merge into slope estimators
-            dim = iargs[0].dims[0]  # currently always 'facets'
-            keys = sorted(set(key for arg in iargs for key in arg.coords))
-            kw_regress = dict(dim=dim, weight=weight, pctile=(50, 95), nofit=True)
-            result = _get_regression(*iargs, **kw_regress)
-            data, data_lower, data_upper, *_, rsq, _ = result
-            if correlation:
-                data.attrs['units'] = ''
-                data.attrs['short_name'] = 'correlation coefficient'
-            elif iunits in non_feedback:  # adjust to 2xco2 scaling
-                data.attrs.clear()  # NOTE: defer to feedback labels!
-                data, data_lower, data_upper = 0.5 * data, 0.5 * data_lower, 0.5 * data_upper  # noqa: E501
-            else:
-                data.attrs['units'] = f'{iargs[1].units} / ({iargs[0].units})'
-                data.attrs['short_name'] = 'regression coefficient'
-            for key in keys:
-                if any(key in arg.sizes for arg in iargs):
-                    continue  # non-scalar
-                if key in ('facets', 'version'):
-                    continue  # multi-index
-                if any(key in arg.indexes.get('facets', index).names for arg in iargs):
-                    continue  # xarray bug: https://github.com/pydata/xarray/issues/7695
-                if any(key in arg.indexes.get('version', index).names for arg in iargs):
-                    continue  # xarray bug: https://github.com/pydata/xarray/issues/7695
-                coords = [arg.coords[key].item() for arg in iargs if key in arg.coords]
-                dtype = np.asarray(coords[0]).dtype  # see process_data()
-                isnan = np.issubdtype(dtype, float) and np.isnan(coords[0])
-                if isnan or len(coords) == 1 or coords[0] == coords[1]:
-                    value = coords[0]
-                elif key in ('start', 'stop'):
-                    value = coords[1]  # kludge for constraints
-                else:  # WARNING: currently dropped by _get_scalars() below
-                    value = np.array(None, dtype=object)  # see process_data()
-                    value[...] = tuple(coords)
-                data.coords[key] = value
-            data.name = '|'.join((arg.name for arg in iargs))
-            data_lower1, data_lower2 = data_lower.values.flat
-            data_upper1, data_upper2 = data_upper.values.flat
-            rsq = ureg.Quantity(rsq.item(), '').to('percent')
-            annotation = f'${rsq:~L.0f}$'.replace(r'\ ', '')
-            # annotation = f'${corr.item():.2f}$'  # latex for long dash minus sign
-            args.append(data)
-            boxdata.append([data_lower1, data_upper1])
-            bardata.append([data_lower2, data_upper2])
-            annotations.append(annotation)  # }}}
-
-    # Infer inner and outer coordinates
-    # TODO: Switch to tuples=True and support tuple coords in _init_command
-    # NOTE: The below code for kws_outer supports both intersections of outer labels
-    # and intersections of inner labels. Default behavior is to intersect inner
-    # labels on the legend and only denote "outer-most" coordinates with outer labels.
-    kws_outer, kws_inner = {}, {}  # {{{
-    kw_scalar, kw_vector, kw_outer, kw_inner = {}, {}, {}, {},
-    kw_coords = _get_scalars(*args, pairs=True)  # select second pair
-    kw_counts = {key: len(list(itertools.groupby(value))) for key, value in kw_coords.items()}  # noqa: E501
-    for key, values, count in zip(kw_coords, kw_coords.values(), kw_counts.values()):
-        if key == 'units':  # used for queue identifiers
-            continue
-        if count == 1:
-            kw_scalar[key] = values[0]
-        elif intersect or count == min(n for n in kw_counts.values() if n > 1):
-            kw_vector[key] = kw_outer[key] = values
+    # Infer gridspec location of axes
+    # WARNING: This all must come after axes are drawn and content is plotted inside.
+    # Otherwise position will be wrong.
+    fig = axs[0].figure  # {{{
+    axs = pplt.SubplotGrid(axs)  # then select
+    rows = tuple(zip(*(ax._get_topmost_axes()._range_subplotspec('y') for ax in axs)))
+    cols = tuple(zip(*(ax._get_topmost_axes()._range_subplotspec('x') for ax in axs)))
+    nrows, ncols = axs.shape  # shape of underlying gridspec
+    rows = (min(rows[0]), max(rows[1]))
+    cols = (min(cols[0]), max(cols[1]))
+    row = (rows[0] + rows[1] + 1) // 2  # prefer bottom i.e. higher index
+    col = (cols[0] + cols[1]) // 2  # prefer left i.e. lower index
+    if loc is None or figurespan is False:
+        pass
+    elif not isinstance(loc, str) or loc[0] not in 'lrtb':
+        raise ValueError(f'Invalid location {loc!r}.')
+    if figurespan is False or figurespan is None and len(axs) == 1:
+        src = axs[0]
+    elif figurespan:
+        src = fig
+        if loc is not None:
+            pass
+        elif max(cols) == axs.shape[1] - 1 and max(rows) != axs.shape[0] - 1:
+            loc = 'right'
+        elif min(cols) == 0 and max(rows) != axs.shape[0] - 1:
+            loc = 'left'
         else:
-            kw_vector[key] = kw_inner[key] = values
-    if not kw_vector:
-        raise RuntimeError('No coordinates found for concatenation.')
-    kws_inner = [dict(zip(kw_inner, vals)) for vals in zip(*kw_inner.values())]
-    kws_outer = [dict(zip(kw_outer, vals)) for vals in zip(*kw_outer.values())]
-    for kw_inner in kws_inner:
-        kw_inner.setdefault('name', 'net')
-
-    # Infer object and tick locations
-    # WARNING: For some reason naked len(itertools.groupby()) fails. Note this finds
-    # consecutive groups in a list of hashables and we want the fewest groups.
-    num, base, locs, ticks, kw_groups = 0, 0, [], [], []  # {{{
-    width = kw_collection.command.get('width') or 1.0
-    offset = 0.8 if offset is None else float(offset)  # additional offset coordinate
-    groups = list(itertools.groupby(kws_outer))
-    missing = missing or 0  # NOTE: Use this with rowspecs to align figure columns
-    for group, items in itertools.groupby(kws_outer):
-        items = list(items)
-        count = len(list(items))  # convert itertools._group object
-        ilocs = width * np.arange(base, base + count - 0.5)
-        ikws = kws_inner[num:num + count]
-        keys = [('name',), ('project',), ('experiment', 'start', 'stop', 'period')]
-        for key in keys:  # TODO: generalize the above 'keys' groups
-            values = [tuple(kw.get(_) for _ in key) for kw in ikws]
-            lengths = [len(list(items)) for _, items in itertools.groupby(values)]
-            if 1 < len(lengths) < len(values):  # i.e. additional groups are present
-                for idx in np.cumsum(lengths[:-1]):
-                    ilocs[idx:] += 0.5 * width * offset  # TODO: make this configurable?
-        tick = 0.5 * (ilocs[0] + ilocs[-1])
-        base += width * (1 + offset) + (ilocs[-1] - ilocs[0]) + missing  # coordinate
-        num += count + missing  # integer index
-        locs.extend(ilocs)
-        ticks.append(tick)
-        kw_groups.append(group)  # unique keyword argument groups
-
-    # Get inner and outer labels
-    # NOTE: This also tries to set up appropriate automatic line breaks.
-    # NOTE: Use 'skip_name' for inner labels to prevent unnecessary repetitions.
-    kw_label = dict(short=False, heading=False, identical=False)  # {{{
-    kw_label.update(scale=scale, strict=restrict, dataset=dataset)
-    key, other = ('refheight', 'refwidth') if horizontal else ('refwidth', 'refheight')
-    refwidth = kw_collection.figure.setdefault(key, refwidth)
-    refheight = kw_collection.figure.setdefault(other, refheight)
-    groupwidth = pplt.units(refwidth, 'in') / len(groups)  # scale by group count
-    labels_inner = inners or get_labels(*kws_inner, refwidth=np.inf, skip_name=True, **kw_label)  # noqa: E501
-    labels_outer = outers or get_labels(*kw_groups, refwidth=groupwidth, skip_name=False, **kw_label)  # noqa: E501
-    if len(labels_outer) != len(kw_groups):
-        raise ValueError(f'Mismatch between {len(labels_outer)} labels and {len(kw_groups)}.')  # noqa: E501
-    if labels_inner or labels_outer:
-        seen = set()  # seen labels
-        labels_print = [l for l in labels_inner if l not in seen and not seen.add(l)]
-        print()  # end previous line
-        print('Inner labels:', ', '.join(map(repr, labels_print)), end=' ')
-        print('Outer labels:', ', '.join(map(repr, labels_outer)), end=' ')
-    if labels_outer:
-        axis = 'y' if horizontal else 'x'
-        kw_axes = {
-            f'{axis}ticks': ticks,
-            f'{axis}ticklabels': labels_outer,
-            f'{axis}grid': False,
-            f'{axis}ticklen': 0,
-            f'{axis}tickmajorpad': 5,
-            f'{axis}rotation': 90 if axis == 'y' else 0,
-        }
-        kw_collection.axes.update(kw_axes)
-
-    # Concatenate arrays
-    # WARNING: np.array([(1, 2), (3, 4)], dtype=object) will create 2D array with
-    # tuples along rows instead of ragged arrays. Use proplot workaround below.
-    # NOTE: Only 'project' and 'institute' levels of 'components' are used elsewhere
-    keys = ('short_prefix', 'short_suffix', 'short_name', 'units')  # {{{
-    attrs = {key: val for data in args for key, val in data.attrs.items() if key in keys}  # noqa: E501
-    locs = np.array(locs or np.arange(len(kws_inner)), dtype=float)
-    if nargs == 1:  # violin plot arguments
-        values = np.empty(len(args), dtype=object)
-        values[:len(args)] = [tuple(data.values) for data in args]
+            loc = 'bottom'
     else:
-        values = [data.item() for data in args]
-        values = np.array(values)
-    name = args[0].name
-    index = pd.MultiIndex.from_arrays(list(kw_vector.values()), names=list(kw_vector))
-    coords = {'components': index, **kw_scalar}
-    values = xr.DataArray(values, name=name, dims='components', attrs=attrs, coords=coords)  # noqa: E501
-    labels = labels_outer if intersect else labels_inner
-    if boxdata:
-        kw_collection.command.update(boxdata=np.array(boxdata).T, **KWARGS_ERRBOX)
-    if bardata:
-        kw_collection.command.update(bardata=np.array(bardata).T, **KWARGS_ERRBAR)
-    if labels:  # used for legend entries
-        values.coords['label'] = ('components', labels)
-    if annotations:  # used for _setup_bars annotations
-        values.coords['annotation'] = ('components', annotations)
-    args = (locs, values)
-    return args, kw_collection
-
-
-def _merge_handles(args, handles, pad=None, size=None, sort=True):
-    """
-    Return handles and labels merged from multiple inputs.
-
-    Parameters
-    ----------
-    args : list of xarray.DataArray
-        The input data arrays.
-    handles : list of iterable
-        The input plot handle lists.
-    sort : bool, optional
-        Whether to sort input values.
-
-    Other Parameters
-    ----------------
-    pad : optional
-        Total padding between items.
-    size : optional
-        Total length and height of each item.
-
-    Returns
-    -------
-    handles : list of proplot.Artist
-        The merged handles.
-    labels : list of str
-        The merged labels.
-    kw_legend : dict
-        Additional legend keyword arguments.
-    """
-    # Helper function
-    # NOTE: Originally needed to use 'luminance' for sorting violins that used alpha
-    # manually but now just retrieve handles with insertion order.
-    def _sort_idxs(handles, sort=True):
-        none = lambda: None
-        idxs = list(range(len(handles)))
-        if sort and handles and hasattr(handles[0], 'get_facecolor'):
-            colors = [getattr(handle, 'get_facecolor', none)() for handle in handles]
-            colors = ['none' if value is None else value for value in colors]
-            colors = [value.squeeze() if hasattr(value, 'squeeze') else value for value in colors]  # noqa: E501
-            alphas = [pplt.to_rgba(value)[3] for value in colors]
-            hatches = [bool(getattr(handle, 'get_hatch', none)()) for handle in handles]
-            widths = [handle.get_linewidth() for handle in handles]
-            keys = list(zip(alphas, hatches, widths, range(len(alphas))))
-            idxs = [idx for idx, _ in sorted(enumerate(keys), key=lambda pair: pair[1])]
-        return idxs
-
-    # Iterate jointly over arguments handle components
-    # NOTE: Identify handles that have not yet been drawn by explicit list
-    # of possible artist properties. Can add to this list.
-    # WARNING: Iterate in reverse order for special case where effective climate
-    # sensitivity places on first column but has empty violin slots.
-    tuples = {}  # {{{
-    properties = set()
-    for num, (arg, objects) in enumerate(zip(args, handles)):
-        labels = arg.coords.get('label', None)
-        if labels is None:
-            raise ValueError('Input data has no label coordinate.')
-        labels = [label for label in labels.values if label is not None]  # for seaborn
-        if len(objects) > len(labels):  # allow less than for e.g. sensitivity
-            raise ValueError(f'Number of labels ({len(labels)}) differs from handles ({len(objects)}).')  # noqa: E501
-        for idx in _sort_idxs(objects, sort=sort)[::-1]:  # e.g. cmip5 then cmip6
-            props, label, handle = {}, labels[idx], objects[idx]
-            if not handle:  # empty violin slot due to e.g. all-zero array
-                continue
-            for key, value in handle.properties().items():
-                if key not in PROPS_LEGEND:
-                    continue
-                if hasattr(value, 'name'):  # e.g. PathCollection, LineCollection cmap
-                    value = value.name
-                if isinstance(value, list):
-                    value = tuple(value)
-                if getattr(value, 'ndim', None) == 1:
-                    value = tuple(value.tolist())
-                if np.issubdtype(getattr(value, 'dtype', object), float):
-                    value = np.round(value, 3)
-                if getattr(value, 'ndim', None) == 2:
-                    value = tuple(map(tuple, value.tolist()))
-                props[key] = value
-            tups = tuples.setdefault(label, [])
-            props = tuple(props.items())
-            if props not in properties:  # only unique handles
-                tups.append((num, idx, handle))  # sort by original index below
-                properties.add(props)
-
-    # Get legend args and kwargs
-    # NOTE: Try to make each box in the handle-tuple approximately square and use
-    # same 'ndivide' for all entries so that final handles have the same length.
-    result = {}  # {{{
-    size = size or pplt.rc['legend.handleheight']
-    pad = pad or 0  # make items flush by default
-    for label, handles in tuple(tuples.items())[::-1]:  # restore *original* order
-        handles = [handle for *_, handle in sorted(handles, key=lambda tup: tup[:2])]
-        handle = tuple(handles[idx] for idx in _sort_idxs(handles, sort=False))
-        result[label] = handle  # combined with tupler handle
-    ndivide = max(map(len, result.values()))
-    handler = mhandler.HandlerTuple(pad=pad, ndivide=ndivide)
-    kw_legend = {
-        'handleheight': size,
-        'handlelength': size * max(map(len, result.values())),
-        'handler_map': {tuple: handler},  # or use tuple coords as map keys
-    }
-    labels, handles = map(list, zip(*result.items()))
-    return handles, labels, kw_legend
-
-
-def _setup_axes(ax, *args, command=None, zeros=None):
-    """
-    Adjust x and y axis labels and possibly add zero lines.
-
-    Parameters
-    ----------
-    ax : matplotlib.axes.Axes
-        The axes.
-    command : str
-        The plotting command.
-    zeros : bool, optional
-        Whether to plot zero lines.
-    *args : array-like
-        The plotting arguments.
-    **kwargs
-        Additional format arguments.
-
-    Returns
-    -------
-    xunits, yunits : str
-        The associated x and y-axis units.
-    """
-    # Initial stuff
-    # TODO: Handle labels automatically with climopy and proplot autoformatting...
-    # for some rcason share=True seems to have no effect but not sure why.
-    top = ax._get_topmost_axes()  # {{{
-    fig = top.figure
-    base, data = args[0], args[-1]  # variables
-    norefs = ('scatter', 'line', 'linex', 'contour', 'contourf', 'pcolor', 'pcolormesh')
-    if command is None:
-        raise ValueError('Input command is required.')
-    if command in ('barh', 'boxh', 'violinh'):
-        y = None
-    elif command in ('bar', 'box', 'violin', 'area', 'line', 'scatter'):
-        y = data
-    else:
-        y = data.coords[data.dims[0]]
-    if command in ('bar', 'box', 'violin'):
-        x = None
-    elif command in ('barh', 'boxh', 'violinh'):
-        x = data
-    elif command in ('areax', 'linex', 'scatter'):
-        x = base
-    else:
-        x = data.coords[data.dims[-1]]  # e.g. contour() is y by x
-
-    # Handle x and y axis settings
-    # NOTE: Want to disable axhline()/axvline() autoscaling but not currently possible
-    # so use plot(). See: https://github.com/matplotlib/matplotlib/issues/14651
-    units = []  # {{{
-    nrows, ncols, *_ = top.get_subplotspec()._get_geometry()  # custom geometry function
-    rows, cols = top._range_subplotspec('y'), top._range_subplotspec('x')
-    edgex, edgey = max(rows) == nrows - 1, min(cols) == 0
-    for s, data, other, edge in zip('xy', (x, y), (y, x), (edgex, edgey)):
-        zero = True if zeros is True else s in (zeros or '')
-        unit = getattr(data, 'units', None)
-        unit = ureg.parse_units(unit) if unit is not None else None
-        share = getattr(fig, f'_share{s}', None)
-        label = edge or not share or ax != top
-        locator = getattr(ax, f'{s}axis').get_major_locator()
-        dlabel = getattr(ax, f'{s}axis').isDefault_label
-        dlocator = getattr(ax, f'{s}axis').isDefault_majloc
-        transform = getattr(ax, f'get_{s}axis_transform')()
-        if data is None and dlocator:  # hide tick labels
-            kw = {f'{s}locator': 'null'}
-            ax.format(**kw)
-        if other is not None and 'components' in other.sizes and hasattr(locator, 'locs'):  # shading # noqa: E501
-            cmd = ax.area if s == 'x' else ax.areax
-            kw_bg = {**KWARGS_BACKGROUND, 'transform': transform}
-            coords = pplt.edges(locator.locs)
-            for x0, x1 in zip(coords[::2], coords[1::2]):
-                cmd([x0, x1], [0, 0], [1, 1], **kw_bg)
-        if ax == top and data is not None and command not in norefs:  # reference lines
-            cmd = ax.linex if s == 'x' else ax.line
-            kw_ref = {**KWARGS_REFERENCE, 'transform': transform}
-            coords = []
-            if zero or unit is None or ureg.get_base_units(unit) != ureg.radian:
-                coords.append(0)  # optionally force-add zero lines
-            if unit is not None and unit == ureg.dimensionless and 'bar' in command:
-                coords.extend((1, -1))  # add only for bar plots
-            for coord in coords:
-                h, = cmd([0, 1], [coord, coord], **kw_ref)
-        if label and dlabel and unit is not None:  # axis label
-            data = data.copy()
-            for key in ('short_prefix', 'short_suffix'):
-                data.attrs.pop(key, None)  # avoid e.g. 'anomaly' for non-anomaly data
-            data.attrs.setdefault('short_name', '')   # avoid cfvariable inheritence
-            data.attrs['short_prefix'] = data.attrs.get(f'{s}label_prefix', '')
-            if getattr(fig, f'_span{s}'):
-                width, height = fig.get_size_inches()
-            else:
-                width, height = ax._get_size_inches()  # all axes present by now
-            size = width if s == 'x' else height
-            label = _split_label(data.climo.cfvariable.short_label, refwidth=size)
-            ax.format(**{f'{s}label': label})  # include share settings
-        units.append(unit)
-    return units
-
-
-def _setup_bars(
-    ax, args, errdata=None, handle=None, horizontal=False, annotate=False, **kwargs,
-):
-    """
-    Adjust and optionally add content to bar plots.
-
-    Parameters
-    ----------
-    ax : matplotlib.axes.Axes
-        The axes.
-    args : xarray.DataArray
-        The input arguments.
-    errdata : xarray.Dataarray
-        The error bar data.
-    handle : matplotlib.containers.BarContainer
-        The bar container.
-
-    Other Parameters
-    ----------------
-    horizontal : bool, optional
-        Whether the bars were plotted horizontally.
-    annotate : bool, optional
-        Whether to add annotations to the bars.
-    **kwargs : optional
-        Passed to text annotations.
-    """
-    # Plot thick outline bars on top (flagship models) and remove alpha from edge
-    # NOTE: Skip applying opacity to edges because faded outline appears conflicting
-    # in combination with white hatching and outline used for non-matching CMIP6.
-    axis = 'y' if horizontal else 'x'  # {{{
-    handle = handle or ()
-    for obj in handle:
-        getattr(obj.sticky_edges, axis).clear()  # offset from zero and edge
-        alpha = obj.get_alpha()
-        color = pplt.to_xyz(obj.get_edgecolor(), space='hsv')
-        zorder = 1 + 0.001 * (100 - color[2]) + 0.01 * obj.get_linewidth()
-        obj.set_zorder(zorder)
-        if alpha is not None and alpha < 1:  # restore edge color
-            color = pplt.set_alpha(obj.get_facecolor(), alpha)
-            obj.set_alpha(None)
-            obj.set_facecolor(color)
-
-    # Figure out space occupied by text
-    # WARNING: Here 1.5 is used when orientation is in direction of bars but
-    # also use 1.5 for R^2 tex annotations because gives best size after testing.
-    # NOTE: Matplotlib cannot include text labels in autoscaling so have
-    # to adjust manually. See: https://stackoverflow.com/a/32637550/4970632
-    locs, data = (np.arange(args[-1].size), *args) if len(args) == 1 else args  # {{{
-    labels = data.coords.get('annotation', data.coords[data.dims[0]]).values
-    labels = [' '.join(lab) if isinstance(lab, tuple) else str(lab) for lab in labels]
-    nwidth = max(2.2 if '$' in label else 1 for label in labels)
-    width, height = ax._get_size_inches()  # axes size
-    if not horizontal:
-        s, width, height, slice_ = 'y', width, height, slice(None)
-    else:
-        s, width, height, slice_ = 'x', height, width, slice(None, None, -1)
-    fontsize = kwargs.pop('fontsize', pplt.rc.fontsize)
-    fontsize = pplt.utils._fontsize_to_pt(fontsize)
-    space = width / (max(locs) - min(locs) + 2)  # +2 accounts for padding on ends
-    space = pplt.units(space, 'in', 'pt')
-    nums = pplt.arange(0.75, 1.0, 0.025)  # automatically scale in this range
-    sizes = nwidth * fontsize * nums
-    fontsize *= nums[np.argmin(np.abs(sizes - space))]
-
-    # Adjust axes limits
-    # NOTE: This also asserts that error bars without labels are excluded from
-    # the default data limits (e.g. when extending below zero).
-    # above = np.sum(data >= 0) >= data.size // 2  # average bar sign
-    lower, upper = (data, data) if errdata is None else errdata  # {{{
-    data = getattr(data, 'values', data)
-    above = np.mean(data) >= 0  # average bar position
-    lower = getattr(lower, 'values', lower)
-    upper = getattr(upper, 'values', upper)
-    points = np.array(upper if above else lower)  # copy for the labels
-    points = np.clip(points, 0 if above else None, None if above else 0)
-    lower = data if above else lower  # used for auto scaling
-    upper = upper if above else data  # used for auto scaling
-    offsets = [2.8 if '$' in label else len(label) for label in labels]  # R^2 notation
-    offsets = (fontsize / 72) * np.array(offsets)  # approx inches
-    offsets *= 0.8 * (max(np.max(upper), 0) - min(np.min(lower), 0)) / height
-    min_ = np.min(lower - (not above) * annotate * offsets)
-    max_ = np.max(upper + above * annotate * offsets)
-    margin = pplt.rc[f'axes.{s}margin'] * (max_ - min_)
-    min_ = 0 if min_ >= 0 else min_ - margin
-    max_ = 0 if max_ <= 0 else max_ + margin
-    if getattr(ax, f'get_autoscale{s}_on')():
-        ax.format(**{f'{s}lim': (min_, max_)})
-
-    # Add annotations
-    # NOTE: Using set_in_layout False significantly improves speed since tightbbox is
-    # faster and looks nicer to allow overlap into margin without affecting the space.
-    if annotate:  # {{{
-        kw_annotate = {'fontsize': fontsize, **KWARGS_ANNOTATE}
-        kw_annotate.update(kwargs)  # optional additional arguments
-        for loc, point, label in zip(locs, points, labels):
-            # rotation = 90
-            rotation = 0 if '$' in label else 90  # assume math does not need rotation
-            if not horizontal:
-                va = 'bottom' if above else 'top'
-                kw_annotate.update({'ha': 'center', 'va': va, 'rotation': rotation})
-            else:
-                ha = 'left' if above else 'right'
-                kw_annotate.update({'ha': ha, 'va': 'center', 'rotation': 0})
-            offset = 0.4 * fontsize  # offset = 0.2 * fontsize
-            xydata = (loc, point)[slice_]  # position is 'y' if horizontal
-            xytext = (0, offset * (1 if above else -1))[slice_]  # as above
-            res = ax.annotate(label, xydata, xytext, **kw_annotate)
-            res.set_in_layout(False)
-    return handle or None
-
-
-def _setup_scatter(
-    ax, data0, data1, handle=None, source=None, zeros=False, oneone=False, linefit=False,  # noqa: E501
-    highlight=False, annotate=False, constraint=None, masking=None, original=None,
-    cumulative=False, alternative=False, weight=False, pctile=None, **kwargs,
-):
-    """
-    Adjust and optionally add content to scatter plots.
-
-    Parameters
-    ----------
-    ax : matplotlib.axes.Axes
-        The axes.
-    data0, data1 : xarray.DataArray
-        The input arguments.
-    handle : matplotlib.collection.Collection
-        The scatter collection handle.
-    source : xarray.Dataset, optional
-        The source dataset possibly required for the constraint.
-
-    Other Parameters
-    ----------------
-    zeros : bool, optional
-        Whether to add dotted lines on zeros.
-    oneone : bool, optional
-        Whether to add a one-one dotted line.
-    linefit : bool, optional
-        Whether to add a least-squares fit line.
-    highlight : bool, optional
-        Whether to highlight positive slopes with red.
-    annotate : bool, optional
-        Whether to add annotations to the scatter markers.
-    constraint : bool or float, optional
-        Whether to plot emergent constraint results.
-    masking : bool, optional
-        Whether to automatically infer observational masking from models.
-    cumulative : bool, optional
-        Whether to compute unconstrained bounds from the native distribution.
-    original : str or bool, optional
-        Whether to include original unconstrained inter-model uncertainty bounds.
-    alternative : bool, optional
-        Whether to include alternative estimate that omits regression uncertainty.
-    weight : bool, optional
-        Whether to weight by institute (set to ``True`` if ``institute='wgt'`` passed).
-    pctile : float, optional
-        Percentile range used for line fit and constraint bounds.
-    **kwargs
-        Passed to annotation or `process_constraint`.
-    """
-    # Add reference one:one line
-    # NOTE: This also disables autoscaling so that line always looks like a diagonal
-    # drawn right across the axes. Also requires same units on x and y axis.
-    kw_constraint = _pop_kwargs(kwargs, process_constraint)  # {{{
-    kw_constraint['source'] = source if masking else None
-    fontsize = kwargs.pop('fontsize', None)  # see also _setup_bars()
-    fontsize = pplt.utils._fontsize_to_pt(fontsize)
-    with pplt.rc.context({} if fontsize is None else {'fontsize': fontsize}):
-        textsize = pplt.utils._fontsize_to_pt('x-small')
-        titlesize = pplt.utils._fontsize_to_pt('med')
-    if zeros:  # disabled by default
-        style = dict(color='k', lw=1 * pplt.rc.metawidth)
-        ax.axhline(0, alpha=0.1, zorder=0, **style)
-        ax.axvline(0, alpha=0.1, zorder=0, **style)
-    if oneone:  # disabled by default
-        style = dict(color='k', dashes=(1, 3), lw=pplt.rc.metawidth)
-        units0 = data0.climo.units
-        units1 = data1.climo.units
-        if units0 == units1:
-            lim = (*ax.get_xlim(), *ax.get_ylim())
-            lim = (min(lim), max(lim))
-            avg = 0.5 * (lim[0] + lim[1])
-            span = lim[1] - lim[0]
-            ones = (avg - 1e3 * span, avg + 1e3 * span)
-            ax.add_artist(mlines.Line2D(ones, ones, **style))
-
-    # Add annotations
-    # NOTE: Using set_in_layout False significantly improves speed since tight bounding
-    # box is faster and looks nicer to allow slight overlap with axes edge.
-    if annotate:  # {{{
-        kw_annotate = {'fontsize': textsize, 'textcoords': 'offset points'}
-        labels = data1.coords.get('annotation', data1.coords[data1.dims[0]]).values
-        labels = [' '.join(lab) if isinstance(lab, tuple) else str(lab) for lab in labels]  # noqa: E501
-        xlim, ylim = ax.get_xlim(), ax.get_ylim()
-        width, _ = ax._get_size_inches()
-        diff = (textsize / 72) * (max(xlim) - min(xlim)) / width
-        xmax = xlim[1] + 5 * diff if ax.get_autoscalex_on() else None
-        ymin = ylim[0] - 1 * diff if ax.get_autoscaley_on() else None
-        ax.format(xmax=xmax, ymin=ymin)  # skip if overridden by user
-        for x, y, label in zip(data0.values, data1.values, labels):
-            xy = (x, y)  # data coordaintes
-            xytext = (2, -2)  # offset coordaintes
-            res = ax.annotate(label, xy, xytext, ha='left', va='top', **kw_annotate)
-            res.set_in_layout(False)
-
-    # Add manual regression line
-    # NOTE: Here climopy automatically reapplies dataarray coordinates to fit line
-    # and lower and upper bounds so do not explicitly need sorted x coordinates.
-    # sign = '(\N{MINUS SIGN})' if slope < 0 else ''  # negative r-squared
-    # label = rf'$r^2={sign}{value:~L.0f}$'
-    # label = rf'r$={np.sign(slope) * rsquare.item() ** 0.5:.2f}$'
-    # color = 'red' if constraint is None else color  # line fit color
-    if linefit or constraint is not None:  # {{{
-        dim = data0.dims and data0.dims[0] or None
-        pct = pctile or 95  # default percentile range
-        result = _get_regression(data0, data1, dim=dim, pctile=pct, weight=weight)
-        slope, _, _, fit, fit_lower, fit_upper, rss, rsq, _ = result
-        value = ureg.Quantity(rsq.item(), '').to('percent')
-        label = rf'$r^2={value:~L.0f}$'
-        label = re.sub(r'(?<!\\)%', r'\%', label)
-        label = label.replace(r'\ ', '')
-        datax = np.sort(data0, axis=0)  # linefit returns result for sorted data
-        color = 'gray8' if constraint is None or not handle else handle[0].get_color()
-        color = 'red8' if highlight and slope > 0 else color  # positive regressions
-        title_kw = {'size': titlesize, 'weight': 'normal'}
-        title_kw.update(kwargs)  # additional keywords
-        ax.use_sticky_edges = False  # show end of line fit shading
-        ax.plot(datax, fit, lw=1.5 * pplt.rc.metawidth, ls='-', a=1.0, c=color)
-        ax.area(datax, fit_lower.squeeze(), fit_upper.squeeze(), lw=0, a=0.3, c=color)
-        ax.format(lrtitle=label, lrtitle_kw=title_kw)
-
-    # Add constraint indicator
-    # NOTE: Previously got cmip5/cmip6 bounds from t-distributions of their standard
-    # deviations but this was needlessly unfavorable. Now use weighted percentile by
-    # sorting and arranging along a 'CDF': https://stackoverflow.com/a/29677616/4970632
-    # NOTE: Here get constrained/unconstrained standard deviation ratio using ratio of
-    # percentile intervals. Should be similar since Monte Carlo sampling used to arrive
-    # at constraint estimate comprises t-distributions with same degrees of freedom.
-    # xorigs = np.percentile(data0.values, 100 * xpctile, method='linear')
-    # yorigs = np.percentile(data1.values, 100 * ypctile, method='linear')
-    if constraint is not None:  # {{{
-        # Process input data
-        pct = pctile or 95  # default percentile range
-        pcts = 0.01 * np.array([50 - 0.5 * pct, 50 + 0.5 * pct])
-        original = 'xy' if original is True else '' if original is False else original
-        original = ''.join('y' if original is None else original)
-        xpctile = (pcts[0], 0.5, pcts[-1]) if 'x' in original else ()
-        ypctile = (pcts[0], 0.5, pcts[-1]) if 'y' in original else ()
-        if weight:
-            wgts = _get_weights(data0, dim='facets')
+        if loc is None:
+            loc = 'right' if len(rows) == 1 else 'bottom'
+        if loc[0] == 't':
+            src = fig if min(rows) == 0 else axs[rows[0], col]
+        elif loc[0] == 'l':
+            src = fig if min(cols) == 0 else axs[row, cols[0]]
+        elif loc[0] == 'b':
+            src = fig if max(rows) == nrows - 1 else axs[rows[1], col]
+        elif loc[0] == 'r':
+            src = fig if max(cols) == ncols - 1 else axs[row, cols[1]]
         else:
-            wgts = xr.ones_like(data0.facets, dtype=float)
-        if not cumulative:
-            dof = wgts.sum() - 1  # standard deviation uncertainty
-            wgts = wgts.drop_vars('facets')  # xarray bug (see above)
-            mean0 = (data0 * wgts).sum() / wgts.sum()
-            mean1 = (data1 * wgts).sum() / wgts.sum()
-            scale0 = np.sqrt((wgts * (data0 - mean0) ** 2 / dof).sum())
-            scale1 = np.sqrt((wgts * (data1 - mean1) ** 2 / dof).sum())
-            xorigs = stats.t(df=dof, loc=mean0, scale=scale0).ppf(xpctile)
-            yorigs = stats.t(df=dof, loc=mean1, scale=scale1).ppf(ypctile)
-        else:
-            idx0, idx1 = np.argsort(data0.values), np.argsort(data1.values)
-            idata0, wgts0 = data0.isel(facets=idx0), wgts.isel(facets=idx0)
-            idata1, wgts1 = data1.isel(facets=idx1), wgts.isel(facets=idx1)
-            cdf0 = (wgts0.cumsum() - 0.5 * wgts0) / wgts0.sum()  # CDF function
-            cdf1 = (wgts1.cumsum() - 0.5 * wgts1) / wgts1.sum()  # CDF function
-            cdf0 = (cdf0 - cdf0[0]) / (cdf0[-1] - cdf0[0])  # 0% minimum 100% maximum
-            cdf1 = (cdf1 - cdf1[0]) / (cdf1[-1] - cdf1[0])  # 0% minimum 100% maximum
-            xorigs = np.interp(xpctile, cdf0, idata0)  # weighted percentile
-            yorigs = np.interp(ypctile, cdf1, idata1)
-        # Process constraint
-        kw_constraint.update(weight=weight, pctile=pctile)
-        xs, ys1, ys2 = process_constraint(data0, data1, constraint, **kw_constraint)
-        xcolor, ycolor = 'cyan7', 'pink7'
-        nbounds = len(xs) // 2  # should be one or two
-        xmins, xmean, xmaxs = xs[:nbounds], xs[nbounds], xs[-nbounds:]
-        nbounds = len(ys1) // 2  # should be one or two
-        ymins1, ymean, ymaxs1 = ys1[:nbounds], ys1[nbounds], ys1[-nbounds:]
-        ymins2, ymean, ymaxs2 = ys2[:nbounds], ys2[nbounds], ys2[-nbounds:]
-        horig, alphas = None, (0.1, 0.2)  # opacities of spanning shading
-        args = ([xmean, xmean], [min(ymins2) - 100, ymean])
-        xobjs = [ax.add_artist(mlines.Line2D(*args, lw=1, color=xcolor, label='observations'))]  # noqa: E501
-        color = 'cyan7' if 'y' in original or not handle else handle[0].get_color()
-        for alph, xmin, xmax in zip(alphas[-nbounds:], xmins, xmaxs[::-1]):
-            xobjs.append(ax.axvspan(xmin, xmax, lw=0, color=xcolor, alpha=alph))
-        for idx, bound in enumerate(xorigs):  # unconstrained x bounds
-            ls, lw = (':', 0.9) if idx == 1 else ('--', 0.7)
-            horig = ax.axvline(bound, ls=ls, lw=lw, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
-        if alternative:  # with and without regression uncertainty
-            ymins, ymaxs = (ymins2[0], ymins1[0]), (ymaxs2[-1], ymaxs1[-1])
-        else:  # with and without bootstrapped model-impled obs uncertainty
-            ymins, ymaxs, alphas = ymins2, ymaxs2[::-1], alphas[-nbounds:]
-        # Add labels and bounds
-        args = ([min(xmins) - 100, xmean], [ymean, ymean])
-        yobjs = [ax.add_artist(mlines.Line2D(*args, lw=1, color=ycolor, label='constrained'))]  # noqa: E501
-        color = ycolor if 'x' in original or not handle else handle[0].get_color()
-        for alph, ymin, ymax in zip(alphas, ymins, ymaxs):
-            yobjs.append(ax.axhspan(ymin, ymax, lw=0, color=ycolor, alpha=alph))
-        for idx, bound in enumerate(yorigs):  # unconstrained y bounds matching color
-            ls, lw = (':', 0.9) if idx == 1 else ('--', 0.7)
-            horig = ax.axhline(bound, ls=ls, lw=0.7, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
-        handle = [tuple(xobjs), tuple(yobjs)] + ([horig] if horig else [])
-        # param = r'\sigma_{\mathrm{constrained}} - \sigma_{\mathrm{unconstrained}}'
-        # param = rf'\dfrac{{{param}}}{{\sigma_{{\mathrm{{unconstrained}}}}}}'
-        param = r'\Delta \mathrm{CI}'
-        ratio = (max(ymaxs2) - min(ymins2)) / (max(yorigs) - min(yorigs)) - 1
-        ratio = ureg.Quantity(ratio, '').to('percent')
-        label = rf'${param}\,=\,{ratio:~L+.1f}$'
-        label = re.sub(r'(?<!\\)%', r'\%', label)
-        label = re.sub(r'(?<!\s)-', '{-}', label)
-        color = 'red7' if ratio > 0 else 'black'
-        title_kw = {'size': titlesize, 'color': color}
-        title_kw.update(kwargs)
-        ax.format(ultitle=label, ultitle_kw=title_kw)
-    return handle
+            src = axs[row, col]  # fallback but should be impossible
+    if isinstance(src, pplt.SubplotGrid):
+        src = axs[0]  # fallback in case empty list
+
+    # Infer settings
+    # TODO: Here 'extendsize' is always accurate since we call .auto_layout(tight=False)
+    # whenever axes are created, but in current proplot branch this is wrong. Should
+    # consider applying .auto_layout(tight=False) after drawing each axes.
+    if loc and loc[0] in 'lr':  # {{{
+        nspan = max(rows) - min(rows) + 1
+        span = (min(rows) + 1, max(rows) + 1) if src is fig else None
+    else:
+        nspan = max(cols) - min(cols) + 1
+        span = (min(cols) + 1, max(cols) + 1) if src is fig else None
+    shrink = 0.5 if nspan > 2 else 0.66
+    adjust = 1.3 if src is fig and nspan > 1 else 1.0
+    offset = 1.10 if axs[0]._name == 'cartesian' else 1.02  # for colorbar and legend
+    factor = cbarwrap or 1.2  # additional scaling
+    xoffset = loc and loc[0] in 'lr' and (rows[1] - rows[0]) % 2
+    yoffset = loc and loc[0] in 'tb' and (cols[1] - cols[0]) % 2
+    xcoords = {'l': 1, 'b': offset, 'r': 0, 't': offset}
+    ycoords = {'l': offset, 'b': 1, 'r': offset, 't': 0}
+    width, height = axs[0]._get_size_inches()
+    if cbarlength:
+        length = cbarlength / (1 if src is fig else adjust * nspan)
+    elif nspan == 1:
+        length = 1
+    elif src is fig:  # shrink along figure
+        length = shrink
+    elif src is not fig:  # extend beyond axes
+        length = adjust * nspan * shrink
+    if src is fig or not xoffset and not yoffset:
+        bbox = None
+        length = (0.5 - length / 2, 0.5 + length / 2)
+    else:
+        bbox = (xcoords[loc[0]], ycoords[loc[0]])
+        length = (offset - length / 2, offset + length / 2)
+    if loc and loc[0] in 'lr':  # get size used for wrapping
+        size = nspan * height
+    else:
+        size = nspan * width
+    if src is fig:  # include space between subplots
+        size += (adjust - 1) * (nspan - 1)
+    if factor:  # NOTE: currently always true
+        size *= factor
+    return src, loc, span, bbox, length, size
 
 
 def _setup_violins(
-    ax, data, handle, line=None, width=None, median=False, horizontal=False, **kwargs
+    locs, data, kw_collection, color=None, horizontal=False, **kwargs,
 ):
-    """
-    Adjust and optionally add content to violin plots.
-
-    Parameters
-    ----------
-    ax : matplotlib.axes.axes
-        The original axes.
-    data : array-like
-        The original violin data.
-    handle : list of matplotlib.patches.Path
-        The violin patches.
-    line : list of matplotlib.lines.Line2D
-        The violin lines.
-
-    Other Parameters
-    ----------------
-    width : float, optional
-        The violin width in data units.
-    median : bool, optional
-        Whether to show the median instead of mean.
-    horizontal : bool, optional
-        Whether the violins were plotted horizontally.
-    **kwargs : optional
-        Additional properties to apply to violins (sequences allowed).
-    """
-    # Apply violin styling
-    # NOTE: Skip applying opacity to edges because faded outline appears conflicting
-    # in combination with white hatching and outline used for non-matching CMIP6.
-    # NOTE: Convert opacity to actual solid color so that overlapping violin shapes
-    # are not transparent and line opacities are not combined with background.
-    # NOTE: Seaborn ignores opacity channel on input color palette so must be
-    # manually applied here. Also apply to lines denoting individual observations
-    # and use manual alpha blending so that violin shapes can overlap without issues.
-    # See: https://github.com/mwaskom/seaborn/issues/622
-    # See: https://stackoverflow.com/q/68731566/4970632
-    # See: https://matplotlib.org/3.1.0/tutorials/colors/colors.html
-    data = getattr(data, 'values', data)  # {{{
-    hbase, lbase, handles, lines, locs = 0, 0, [], [], []
-    for idx in range(data.shape[1]):
-        num = np.sum(np.isfinite(np.unique(data[:, idx])))
-        if num > 0:  # violins plotted
-            locs.append(idx)
-            lines.append(line[lbase:lbase + num] if line else ())
-            handles.append(handle[hbase] if handle and num > 1 else None)
-        hbase += int(num > 1)
-        lbase += num
-    for key in ('alpha', 'hatch', 'linewidth', 'edgecolor'):
-        values = kwargs.get(key, None)
-        if values is None or np.isscalar(values):
-            values = [values] * len(handles)
-        for ihandle, ilines, value in zip(handles, lines, values):
-            if value is None:
-                continue
-            if ihandle:
-                if key != 'alpha':  # update property
-                    ihandle.update({key: value})
-                else:  # manually impose opacity
-                    color = ihandle.get_facecolor().squeeze()[:3]  # singleton array
-                    color = color * value + np.array([1, 1, 1]) * (1 - value)
-                    ihandle.set_facecolor(color)
-            for line in ilines:
-                line_color = line_alpha = False
-                if line_color and key == 'edgecolor':  # apply violin edge color
-                    line.set_color(value)
-                if line_alpha and key == 'alpha':  # apply violin fill opacity
-                    color = np.array(pplt.to_rgb(line.get_color()))
-                    color = color * value + np.array([1, 1, 1]) * (1 - value)
-                    line.set_color(color)
-
-    # Scale widths and add median
-    # TODO: Move this into custom proplot function. Matplotlib and seaborn both
-    # proihbit skipping width scaling, matplotlib seems to use weaker custom gaussian
-    # kde estimator instead of scipy version, and seaborn has major design limitations.
-    # NOTE: Seaborn violin plot 'width' and 'count' both scale by maximum density per
-    # violin and 'area' by maximum density across all violins. Otherwise the default
-    # scipy kde gaussian result evaluates to one when integrated over its domain in
-    # data units. To restore that behavior, and thus have equal area violins across
-    # many subplots, we undo the scaling by performing the integral ourselves.
-    axis = 'y' if horizontal else 'x'  # {{{
-    adjust = data.shape[1] / len(handles)  # treat violins as if separated by 1 x-step
-    width = width or KWARGS_VIOLIN.get('width', 1.0)  # scaled width preserving area
-    scatter = 'scatterx' if horizontal else 'scatter'
-    for i, (ihandle, ilines, iloc) in enumerate(zip(handles, lines, locs)):
-        zorder = 1 + (i + 1) / len(handles)
-        if not ihandle:
-            continue
-        polys = ihandle.get_paths()[0].to_polygons()[0]
-        grids = polys[:, 1 - int(horizontal)]  # gridpoints for gaussian kde sample
-        kdefit = polys[:, int(horizontal)]  # symmetric gaussian kde sample points
-        span = np.max(grids) - np.min(grids)
-        center = np.mean(kdefit)  # central coordinate of symmetric gaussian kde
-        scale = span * np.mean(np.abs(kdefit - center))  # integral of pdf over shape
-        polys[:, int(horizontal)] = center + adjust * width * (kdefit - center) / scale
-        ihandle.set_verts([polys])
-        ihandle.set_zorder(zorder)
-        for line in ilines:
-            points = getattr(line, f'get_{axis}data')()
-            points = center + adjust * width * (points - center) / scale
-            getattr(line, f'set_{axis}data')(points)
-            line.set_solid_capstyle('butt')  # prevent overlapping on violin edges
-            line.set_zorder(zorder)
-        cmd = np.nanmedian if median else np.nanmean
-        point = cmd(data[:, iloc])
-        getattr(ax, scatter)(center, point, zorder=zorder + 0.001, **KWARGS_CENTER)
-    return handles  # possibly adjusted handles
-
-
-def _violin_data(locs, data, kw_collection, color=None, horizontal=False, **kwargs):
     """
     Get data array and keyword arguments suitable for seaborn `violinplot`.
 
@@ -1977,7 +1979,7 @@ def _violin_data(locs, data, kw_collection, color=None, horizontal=False, **kwar
     ticks = np.array(kw_collection.axes.get(f'{axis}ticks', 1))  # see _merge_dists
 
     # Concatenate array and update keyword args
-    # WARNING: Critical to keep 'components' because formatting in _setup_axes despends
+    # WARNING: Critical to keep 'components' because formatting in _format_axes despends
     # on whether this coordinate is present, and critical to apply 'command' to 'other'
     # so can still group guides with former but re-apply e.g. opacity with latter.
     # NOTE: This keeps requires to_pandas() on output, and tick locator has to be
@@ -2269,12 +2271,12 @@ def general_plot(
             coords = _get_annotations(arguments[0][-1])
             arguments[0][-1].coords.update(coords)
         kw_objects = dict(fig=fig, gs=gs, geom=(grows, gcols, num), texts=itexts, title=title)  # noqa: E501
-        fig, gs, ax = _init_objects(arguments, kws_collection, **kw_objects)
+        fig, gs, ax = _setup_axes(arguments, kws_collection, **kw_objects)
         parent = child = ax  # possibly duplicate axes
 
         # Generate and queue commands
-        # TODO: Auto-assign line colors here for consistency with _init_command() and
-        # _props_command(). Currently use ad hoc method in figure generating functions.
+        # TODO: Auto-assign line colors here for consistency with _setup_command() and
+        # _setup_defaults(). Currently use ad hoc method in figure generating functions.
         icycles = list(filter(None, icycles))  # {{{
         icycle = icycles and pplt.get_colors(icycles[-1]) or CYCLE_DEFAULT
         iaxis = 'y' if ('plev' in dims) ^ bool(transpose) else 'x'
@@ -2289,13 +2291,13 @@ def general_plot(
                 parent.format(**{f'{iaxis}color': icolors and icolors[-1] or 'k'})
                 child = getattr(parent, f'alt{iaxis}')(**{f'{iaxis}color': icolor})
             kw_other = kw_collection.other.copy()
-            kw_init = _pop_kwargs(kw_other, _init_command)
+            kw_init = _pop_kwargs(kw_other, _setup_command)
             other = kw_other.get('other')  # sort using other bars
             if other and compare and other in groups_compare:
                 kw_init['sortby'] = groups_compare[other]
             kw_init.setdefault('shading', not idx)
             kw_init.setdefault('contour', contour)
-            command, guide, args, kw_collection = _init_command(args, kw_collection, **kw_init)  # noqa: E501
+            command, guide, args, kw_collection = _setup_command(args, kw_collection, **kw_init)  # noqa: E501
             props = {key: getattr(val, 'name', val) for key, val in kw_collection.command.items()}  # noqa: E501
             coords = _get_scalars(*args, units=True, tuples=True)
             if groupnames is True:
@@ -2329,7 +2331,7 @@ def general_plot(
     for num, (identifier, values) in enumerate(groups_commands.items()):
         # Combine plotting and guide arguments
         # NOTE: Here 'colorbar' and 'legend' keywords are automatically added to
-        # plotting command keyword arguments by _init_command.
+        # plotting command keyword arguments by _setup_command.
         # NOTE: Here 'argskip' is isued to skip arguments with vastly different
         # ranges when generating levels that annotate multiple different subplots.
         # WARNING: Use 'step' for determining default colorbar levels and 'locator'
@@ -2420,7 +2422,7 @@ def general_plot(
                 if 'violin' in command:
                     handle = result = None  # seaborn violinplot returns ax! ugly!
                     sns.violinplot(*args, ax=ax, **kw_command)
-                else:  # disable autoformat, use _setup_axes instead
+                else:  # disable autoformat, use _format_axes instead
                     cmd = getattr(ax, command)
                     handle = result = cmd(*args, autoformat=False, **kw_command)
             if command == 'contour':  # pick last contour to avoid negative dashes
@@ -2437,7 +2439,7 @@ def general_plot(
                 handle = [obj for obj in ax.collections if isinstance(obj, mcollections.PolyCollection)]  # noqa: E501
 
             # Update and setup plots
-            # WARNING: Critical to call format before _setup_axes so default label
+            # WARNING: Critical to call format before _format_axes so default label
             # and locator corrections can be overridden by user input.
             group, other = kw_other.get('group'), kw_other.get('other')  # {{{
             axis, lons, lats = 'x' if 'x' in command else 'y', (130, 280), (-60, 60)
@@ -2446,28 +2448,28 @@ def general_plot(
             ax.format(**{key: val for key, val in kw_axes.items() if 'proj' not in key})
             if ax._name == 'cartesian':  # WARNING: critical to call this first
                 kwarg = _pop_kwargs({**kw_other, **kw_axes}, 'zeros')
-                xunits, yunits = _setup_axes(ax, *args, command=command, **kwarg)
+                xunits, yunits = _format_axes(ax, *args, command=command, **kwarg)
                 groups_xunits.setdefault(xunits, []).append(ax)
                 groups_yunits.setdefault(yunits, []).append(ax)
             if 'violin' in command:  # process violin
                 keys = ('alpha', 'hatch', 'linewidth', 'edgecolor')
-                kwarg = _pop_kwargs({**kw_other}, keys, _setup_violins)
+                kwarg = _pop_kwargs({**kw_other}, keys, _format_violins)
                 line = [line for line in ax.lines if line not in prevlines]
-                handle = _setup_violins(ax, data, handle, line, **kwarg)
+                handle = _format_violins(ax, data, handle, line, **kwarg)
             if 'bar' in command:  # ensure padding around bar edges
-                keys = ('fontsize', _setup_bars)
+                keys = ('fontsize', _format_bars)
                 kwarg = _pop_kwargs({**kw_axes, **kw_other}, *keys)
                 errdata = kw_command.get('bardata', None)
-                handle = _setup_bars(ax, args, errdata, handle, **kwarg)
+                handle = _format_bars(ax, args, errdata, handle, **kwarg)
 
             # Vector plot modifications
             # NOTE: This optionally adds constraints, one-one line, and other
             # annotations and optionally scales latitude axis to ignore poles.
             if 'scatter' in command:  # {{{
-                keys = ('fontsize', _setup_scatter, process_constraint)
+                keys = ('fontsize', _format_scatter, process_constraint)
                 kwarg = _pop_kwargs({**kw_axes, **kw_other}, *keys)
                 oneone = oneone or kw_other.get('oneone', False)
-                handle = _setup_scatter(ax, *args, handle, source=dataset, **kwarg)
+                handle = _format_scatter(ax, *args, handle, source=dataset, **kwarg)
             if 'line' in command and autoscale:
                 arg = data.values.copy()
                 arg[~np.isfinite(arg)] = np.nan
@@ -2547,7 +2549,7 @@ def general_plot(
         axs, args, handles, kws_guide, _ = zip(*tuples)
         sort = any(arg.sizes.get('facets', None) for arg in args)  # only for 'version'
         if all(handles) and all('label' in arg.coords for arg in args):
-            handles, labels, kw_update = _merge_handles(args, handles, sort=sort)
+            handles, labels, kw_update = _merge_guides(args, handles, sort=sort)
         elif 'scatter' in command and handles and isinstance(handles[0], list):
             handles, labels, kw_update = handles[:1], [None], {}
         else:  # e.g. scatter
@@ -2558,7 +2560,7 @@ def general_plot(
         if loc is False:  # e.g. skip legend
             continue
         kw = dict(cbarwrap=cbarwrap, cbarlength=cbarlength, figurespan=figurespan)
-        props = _props_guide(*axs, loc=loc, **kw)
+        props = _setup_guide(*axs, loc=loc, **kw)
         groups = groups_colorbars if guide == 'colorbar' else groups_legends
         for ihandle, ilabel in zip(handles, labels):
             if ihandle is None:

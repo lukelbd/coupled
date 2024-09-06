@@ -176,7 +176,7 @@ KWARGS_PLEV = {
 
 # Default extra plotting keyword arguments
 KWARGS_ANNOTATE = {  # annotation text
-    'color': 'gray7',
+    'color': 'gray8',
     'alpha': 1.0,
     'textcoords': 'offset points',
 }
@@ -417,20 +417,23 @@ def _get_institutes(data):
     wgts : numpy.ndarray
         The model count weights.
     """
-    if 'facets' in data.coords:
+    size = data.sizes.get('facets', 1)
+    flags = np.empty(size, dtype=bool)
+    if 'facets' in data.sizes and 'facets' in data.coords:  # e.g. 'components'
+        _, isflag = _get_filters(data.facets.values, institute='flagship')
         wgts = _get_weights(data, dim='facets')
-        _, filt = _get_filters(data.facets.values, institute='flagship')
-        flags, names = [], data.indexes['facets'].names
-        for facet in data.facets.values:
-            if 'project' not in names:
+        for idx, facet in enumerate(data.facets.values):
+            if 'project' not in data.indexes['facets'].names:
                 facet = (data.coords['project'].item().upper(), *facet)
-            flags.append(filt(tuple(facet)))
+            flags[idx] = isflag(tuple(facet))
     else:  # e.g. scalar 'institute' or vector 'components'
-        size = data.sizes.get('facets', 1)
-        coord = data.coords.get('institute', np.array([None]))
-        wgts = size * [1]  # used for e.g. scatter scaling
-        flags = size * [coord.item() == 'flagship'] if coord.size == 1 else coord.values
-    return np.array(flags), np.array(wgts)
+        inst = data.coords.get('institute', np.array([None]))
+        wgts = np.repeat(1, size)
+        if inst.size == 1:  # user passed institute='flagship'
+            flags[:] = inst.item() == 'flagship'
+        else:  # concatenated institute options
+            flags[:] = [val == 'flagship' for val in inst.values]
+    return flags, wgts
 
 
 def _get_projects(data):
@@ -447,18 +450,21 @@ def _get_projects(data):
     projects : numpy.ndarray
         The projects.
     """
-    if 'facets' in data.coords:  # infer from facets
-        filt65, _ = _get_filters(data.facets.values, project='cmip65')
-        filt66, _ = _get_filters(data.facets.values, project='cmip66')
-        projects = [
-            'cmip66' if filt66(facet) else 'cmip65' if filt65(facet) else 'cmip5'
-            for facet in data.facets.values
-        ]
+    if 'facets' in data.sizes and 'facets' in data.coords:  # infer from facets
+        proj65, _ = _get_filters(data.facets.values, project='cmip65')
+        proj66, _ = _get_filters(data.facets.values, project='cmip66')
+        projs = np.empty(data.facets.size, dtype='<U6')  # unicode string
+        for idx, facet in enumerate(data.facets.values):
+            num = 66 if proj66(facet) else 65 if proj65(facet) else 5
+            projs[idx] = f'cmip{num}'
     else:  # e.g. scalar 'project' or vector 'components'
         size = data.sizes.get('facets', 1)
         coord = data.coords.get('project', np.array([None]))
-        projects = size * [coord.item()] if coord.size == 1 else coord.values
-    return np.array(projects)
+        if coord.size == 1:
+            projs = np.repeat(coord.item(), size)
+        else:
+            projs = coord.values.copy()
+    return projs
 
 
 def _get_scalars(*args, units=False, tuples=False, pairs=False):
@@ -656,14 +662,14 @@ def _props_command(
     # WARNING: Previously tried np.repeat([(0, 0, 150)], data.size) for periods
     # but expanded the values and resulted in N x 3. Stick to lists instead.
     def _get_lists(values, options, default=None):  # noqa: E306
-        values = list(values)  # from arbitrary iterable
+        values = list(values)  # from array iterable
         if len(values) == 1:
             values = [values[0] for _ in range(data.size)]
         if callable(options):  # function options e.g. scatter weights
             result = [value if value is None else options(value) for value in values]
         else:  # dictionary options
             result = [options.get(value, default) for value in values]
-        if len(set(result)) <= 1:
+        if all(value == result[0] for value in result):  # avoid hashable set() errors
             result = [default] * len(values)
         return result
 
@@ -712,9 +718,10 @@ def _props_command(
     exclude = ('project', 'experiment', 'start', 'stop')
     exclude += () if len(set(indices)) == 1 else ('style',)
     index = data.indexes.get(data.dims and data.dims[0], pd.Index([]))
-    for key in index:  # iterate over multi-index values
-        other = tuple(key for name, key in zip(index.names, key) if name not in exclude)
-        others.append(other[-1])  # maximum of single value
+    for idx in index:  # iterate over multi-index values
+        idxs = dict(zip(index.names, np.atleast_1d(idx)))
+        keys = tuple(key for name, key in idxs.items() if name not in exclude)
+        others.append(keys[-1])  # maximum of single value
 
     # General settings associated with coordinates
     # NOTE: Here 'cycle' used for groups without other settings by default.
@@ -757,8 +764,6 @@ def _props_command(
             base, cold, warm, neutral = full, early, late, ()
         else:  # full comparison
             base, cold, warm, neutral = control, early, (*late, *full), ()
-        # colors = dict(zip(('gray6', 'cyan7', 'pink7'), (base, cold, warm)))
-        # colors = dict(zip(('gray7', 'cyan7', 'pink7'), (base, cold, warm)))
         colors = (('gray7', 'cyan7', 'pink7', 'yellow7'), (base, cold, warm, neutral))
         colors = {key: color for color, keys in zip(*colors) for key in keys}
     else:  # automatic colors based on inner variables
@@ -830,8 +835,8 @@ def _init_command(
     # WARNING: Critical to get properties before sorting below or
     # else flagship model designation is not detected correctly.
     hatch = kw_patch = kw_scatter = {}  # {{{
-    ignore = {'facets', 'version', 'components'}
-    *_, data = args  # possibly ignore coordinate arrays
+    ignore = {'time', 'facets', 'version', 'components'}
+    *_, data = args  # ignore constraint and regression scatter
     if dims := sorted(data.sizes.keys() - ignore):
         # Spatial plots with shading
         # TODO: Support hist and hist2d plots in addition to scatter and barh
@@ -892,7 +897,7 @@ def _init_command(
             if 'color' in kw_collection.command:  # no manual color/auto autocolor
                 defaults['negpos'] = data.name[-3:] not in ('ecs',)
         elif not dists and 'violin' not in command and 'scatter' not in command:
-            if all(c is not None for c in colors):
+            if all(c is not None for c in colors):  # TODO: figure out when used
                 defaults['color'] = colors  # }}}
 
     # Update guide keywords
@@ -1125,7 +1130,7 @@ def _merge_dists(
         # TODO: Support *difference between slopes* instead of slopes of difference
         # and support user-input 'pctile' as with reduce_facets()?
         args, boxdata, bardata, annotations = [], [], [], []  # {{{
-        units = [data.climo.units for *_, data in arguments]
+        index, units = pd.Index(()), [data.climo.units for *_, data in arguments]
         weight = kw_collection.other.get('weight', False)
         kw_collection.command.setdefault('width', 1.0)  # ignore staggered bars
         kw_collection.command['absolute_width'] = True
@@ -1145,10 +1150,14 @@ def _merge_dists(
                 data.attrs['units'] = f'{iargs[1].units} / ({iargs[0].units})'
                 data.attrs['short_name'] = 'regression coefficient'
             for key in keys:
-                if any(key in arg.sizes for arg in iargs):  # non-scalar
-                    continue
-                if key in ('facets', 'version'):  # multi-index
-                    continue
+                if any(key in arg.sizes for arg in iargs):
+                    continue  # non-scalar
+                if key in ('facets', 'version'):
+                    continue  # multi-index
+                if any(key in arg.indexes.get('facets', index).names for arg in iargs):
+                    continue  # xarray bug: https://github.com/pydata/xarray/issues/7695
+                if any(key in arg.indexes.get('version', index).names for arg in iargs):
+                    continue  # xarray bug: https://github.com/pydata/xarray/issues/7695
                 coords = [arg.coords[key].item() for arg in iargs if key in arg.coords]
                 dtype = np.asarray(coords[0]).dtype  # see process_data()
                 isnan = np.issubdtype(dtype, float) and np.isnan(coords[0])
@@ -1488,7 +1497,9 @@ def _setup_axes(ax, *args, command=None, zeros=None):
     return units
 
 
-def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=False):
+def _setup_bars(
+    ax, args, errdata=None, handle=None, horizontal=False, annotate=False, **kwargs,
+):
     """
     Adjust and optionally add content to bar plots.
 
@@ -1509,6 +1520,8 @@ def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=
         Whether the bars were plotted horizontally.
     annotate : bool, optional
         Whether to add annotations to the bars.
+    **kwargs : optional
+        Passed to text annotations.
     """
     # Plot thick outline bars on top (flagship models) and remove alpha from edge
     # NOTE: Skip applying opacity to edges because faded outline appears conflicting
@@ -1540,12 +1553,13 @@ def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=
         s, width, height, slice_ = 'y', width, height, slice(None)
     else:
         s, width, height, slice_ = 'x', height, width, slice(None, None, -1)
+    fontsize = kwargs.pop('fontsize', pplt.rc.fontsize)
+    fontsize = pplt.utils._fontsize_to_pt(fontsize)
     space = width / (max(locs) - min(locs) + 2)  # +2 accounts for padding on ends
     space = pplt.units(space, 'in', 'pt')
-    scales = pplt.arange(0.75, 1.0, 0.025)  # automatically scale in this range
-    sizes = nwidth * pplt.rc.fontsize * scales
-    fontscale = scales[np.argmin(np.abs(sizes - space))]
-    fontsize = pplt.rc.fontsize * fontscale
+    nums = pplt.arange(0.75, 1.0, 0.025)  # automatically scale in this range
+    sizes = nwidth * fontsize * nums
+    fontsize *= nums[np.argmin(np.abs(sizes - space))]
 
     # Adjust axes limits
     # NOTE: This also asserts that error bars without labels are excluded from
@@ -1575,18 +1589,18 @@ def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=
     # NOTE: Using set_in_layout False significantly improves speed since tightbbox is
     # faster and looks nicer to allow overlap into margin without affecting the space.
     if annotate:  # {{{
+        kw_annotate = {'fontsize': fontsize, **KWARGS_ANNOTATE}
+        kw_annotate.update(kwargs)  # optional additional arguments
         for loc, point, label in zip(locs, points, labels):
             # rotation = 90
             rotation = 0 if '$' in label else 90  # assume math does not need rotation
-            kw_annotate = {'fontsize': fontsize, **KWARGS_ANNOTATE}
             if not horizontal:
                 va = 'bottom' if above else 'top'
                 kw_annotate.update({'ha': 'center', 'va': va, 'rotation': rotation})
             else:
                 ha = 'left' if above else 'right'
                 kw_annotate.update({'ha': ha, 'va': 'center', 'rotation': 0})
-            # offset = 0.2 * fontscale * pplt.rc.fontsize
-            offset = 0.4 * fontscale * pplt.rc.fontsize
+            offset = 0.4 * fontsize  # offset = 0.2 * fontsize
             xydata = (loc, point)[slice_]  # position is 'y' if horizontal
             xytext = (0, offset * (1 if above else -1))[slice_]  # as above
             res = ax.annotate(label, xydata, xytext, **kw_annotate)
@@ -1595,8 +1609,9 @@ def _setup_bars(ax, args, errdata=None, handle=None, horizontal=False, annotate=
 
 
 def _setup_scatter(
-    ax, data0, data1, handle=None, zeros=False, oneone=False, linefit=False, annotate=False,  # noqa: E501
-    constraint=None, original=None, cumulative=False, alternative=False, weight=False, pctile=None, **kwargs,  # noqa: E501
+    ax, data0, data1, handle=None, source=None, zeros=False, oneone=False, linefit=False,  # noqa: E501
+    highlight=False, annotate=False, constraint=None, masking=None, original=None,
+    cumulative=False, alternative=False, weight=False, pctile=None, **kwargs,
 ):
     """
     Adjust and optionally add content to scatter plots.
@@ -1609,6 +1624,8 @@ def _setup_scatter(
         The input arguments.
     handle : matplotlib.collection.Collection
         The scatter collection handle.
+    source : xarray.Dataset, optional
+        The source dataset possibly required for the constraint.
 
     Other Parameters
     ----------------
@@ -1618,10 +1635,14 @@ def _setup_scatter(
         Whether to add a one-one dotted line.
     linefit : bool, optional
         Whether to add a least-squares fit line.
+    highlight : bool, optional
+        Whether to highlight positive slopes with red.
     annotate : bool, optional
         Whether to add annotations to the scatter markers.
     constraint : bool or float, optional
         Whether to plot emergent constraint results.
+    masking : bool, optional
+        Whether to automatically infer observational masking from models.
     cumulative : bool, optional
         Whether to compute unconstrained bounds from the native distribution.
     original : str or bool, optional
@@ -1633,12 +1654,18 @@ def _setup_scatter(
     pctile : float, optional
         Percentile range used for line fit and constraint bounds.
     **kwargs
-        Passed to `process_constraint`.
+        Passed to annotation or `process_constraint`.
     """
     # Add reference one:one line
     # NOTE: This also disables autoscaling so that line always looks like a diagonal
     # drawn right across the axes. Also requires same units on x and y axis.
     kw_constraint = _pop_kwargs(kwargs, process_constraint)  # {{{
+    kw_constraint['source'] = source if masking else None
+    fontsize = kwargs.pop('fontsize', None)  # see also _setup_bars()
+    fontsize = pplt.utils._fontsize_to_pt(fontsize)
+    with pplt.rc.context({} if fontsize is None else {'fontsize': fontsize}):
+        textsize = pplt.utils._fontsize_to_pt('x-small')
+        titlesize = pplt.utils._fontsize_to_pt('med')
     if zeros:  # disabled by default
         style = dict(color='k', lw=1 * pplt.rc.metawidth)
         ax.axhline(0, alpha=0.1, zorder=0, **style)
@@ -1659,12 +1686,12 @@ def _setup_scatter(
     # NOTE: Using set_in_layout False significantly improves speed since tight bounding
     # box is faster and looks nicer to allow slight overlap with axes edge.
     if annotate:  # {{{
-        kw_annotate = {'fontsize': 'x-small', 'textcoords': 'offset points'}
+        kw_annotate = {'fontsize': textsize, 'textcoords': 'offset points'}
         labels = data1.coords.get('annotation', data1.coords[data1.dims[0]]).values
         labels = [' '.join(lab) if isinstance(lab, tuple) else str(lab) for lab in labels]  # noqa: E501
         xlim, ylim = ax.get_xlim(), ax.get_ylim()
         width, _ = ax._get_size_inches()
-        diff = (pplt.rc.fontsize / 72) * (max(xlim) - min(xlim)) / width
+        diff = (textsize / 72) * (max(xlim) - min(xlim)) / width
         xmax = xlim[1] + 5 * diff if ax.get_autoscalex_on() else None
         ymin = ylim[0] - 1 * diff if ax.get_autoscaley_on() else None
         ax.format(xmax=xmax, ymin=ymin)  # skip if overridden by user
@@ -1682,8 +1709,9 @@ def _setup_scatter(
     # label = rf'r$={np.sign(slope) * rsquare.item() ** 0.5:.2f}$'
     # color = 'red' if constraint is None else color  # line fit color
     if linefit or constraint is not None:  # {{{
-        pctile = pctile or 95  # default percentile range
-        result = _get_regression(data0, data1, pctile=pctile, weight=weight)
+        dim = data0.dims and data0.dims[0] or None
+        pct = pctile or 95  # default percentile range
+        result = _get_regression(data0, data1, dim=dim, pctile=pct, weight=weight)
         slope, _, _, fit, fit_lower, fit_upper, rss, rsq, _ = result
         value = ureg.Quantity(rsq.item(), '').to('percent')
         label = rf'$r^2={value:~L.0f}$'
@@ -1691,10 +1719,13 @@ def _setup_scatter(
         label = label.replace(r'\ ', '')
         datax = np.sort(data0, axis=0)  # linefit returns result for sorted data
         color = 'gray8' if constraint is None or not handle else handle[0].get_color()
+        color = 'red8' if highlight and slope > 0 else color  # positive regressions
+        title_kw = {'size': titlesize, 'weight': 'normal'}
+        title_kw.update(kwargs)  # additional keywords
         ax.use_sticky_edges = False  # show end of line fit shading
-        ax.plot(datax, fit, ls='-', lw=1.5 * pplt.rc.metawidth, c=color)
+        ax.plot(datax, fit, lw=1.5 * pplt.rc.metawidth, ls='-', a=1.0, c=color)
         ax.area(datax, fit_lower.squeeze(), fit_upper.squeeze(), lw=0, a=0.3, c=color)
-        ax.format(lrtitle=label, lrtitle_kw={'size': 'med', 'weight': 'normal'})
+        ax.format(lrtitle=label, lrtitle_kw=title_kw)
 
     # Add constraint indicator
     # NOTE: Previously got cmip5/cmip6 bounds from t-distributions of their standard
@@ -1707,18 +1738,19 @@ def _setup_scatter(
     # yorigs = np.percentile(data1.values, 100 * ypctile, method='linear')
     if constraint is not None:  # {{{
         # Process input data
-        pctile = pctile or 95  # default percentile range
-        pctiles = 0.01 * np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
+        pct = pctile or 95  # default percentile range
+        pcts = 0.01 * np.array([50 - 0.5 * pct, 50 + 0.5 * pct])
         original = 'xy' if original is True else '' if original is False else original
         original = ''.join('y' if original is None else original)
-        xpctile = (pctiles[0], 0.5, pctiles[-1]) if 'x' in original else ()
-        ypctile = (pctiles[0], 0.5, pctiles[-1]) if 'y' in original else ()
+        xpctile = (pcts[0], 0.5, pcts[-1]) if 'x' in original else ()
+        ypctile = (pcts[0], 0.5, pcts[-1]) if 'y' in original else ()
         if weight:
             wgts = _get_weights(data0, dim='facets')
         else:
             wgts = xr.ones_like(data0.facets, dtype=float)
         if not cumulative:
             dof = wgts.sum() - 1  # standard deviation uncertainty
+            wgts = wgts.drop_vars('facets')  # xarray bug (see above)
             mean0 = (data0 * wgts).sum() / wgts.sum()
             mean1 = (data1 * wgts).sum() / wgts.sum()
             scale0 = np.sqrt((wgts * (data0 - mean0) ** 2 / dof).sum())
@@ -1747,7 +1779,7 @@ def _setup_scatter(
         horig, alphas = None, (0.1, 0.2)  # opacities of spanning shading
         args = ([xmean, xmean], [min(ymins2) - 100, ymean])
         xobjs = [ax.add_artist(mlines.Line2D(*args, lw=1, color=xcolor, label='observations'))]  # noqa: E501
-        color = xcolor if 'y' in original or not handle else handle[0].get_color()
+        color = 'cyan7' if 'y' in original or not handle else handle[0].get_color()
         for alph, xmin, xmax in zip(alphas[-nbounds:], xmins, xmaxs[::-1]):
             xobjs.append(ax.axvspan(xmin, xmax, lw=0, color=xcolor, alpha=alph))
         for idx, bound in enumerate(xorigs):  # unconstrained x bounds
@@ -1776,7 +1808,8 @@ def _setup_scatter(
         label = re.sub(r'(?<!\\)%', r'\%', label)
         label = re.sub(r'(?<!\s)-', '{-}', label)
         color = 'red7' if ratio > 0 else 'black'
-        title_kw = {'size': 'med', 'color': color}
+        title_kw = {'size': titlesize, 'color': color}
+        title_kw.update(kwargs)
         ax.format(ultitle=label, ultitle_kw=title_kw)
     return handle
 
@@ -1806,8 +1839,8 @@ def _setup_violins(
         Whether to show the median instead of mean.
     horizontal : bool, optional
         Whether the violins were plotted horizontally.
-    **kwargs
-        Additional (optionally vector) properties to apply to violins.
+    **kwargs : optional
+        Additional properties to apply to violins (sequences allowed).
     """
     # Apply violin styling
     # NOTE: Skip applying opacity to edges because faded outline appears conflicting
@@ -2023,7 +2056,7 @@ def general_plot(
     Parameters
     ----------
     dataset : xarray.Dataset
-        A dataset generated by `open_bulk`.
+        A dataset generated by `open_datasets`.
     *args : 2-tuple or list of 2-tuple
         Tuples containing the ``(name, kwargs)`` passed to ``ClimoAccessor.get``
         used to generate data in rows and columns. See `parse_specs` for details.
@@ -2412,29 +2445,29 @@ def general_plot(
             geographic = set(getattr(args[-1], 'dims', ())) == {'lon', 'lat'}
             ax.format(**{key: val for key, val in kw_axes.items() if 'proj' not in key})
             if ax._name == 'cartesian':  # WARNING: critical to call this first
-                kwarg = _pop_kwargs(kw_other.copy(), 'zeros')
+                kwarg = _pop_kwargs({**kw_other, **kw_axes}, 'zeros')
                 xunits, yunits = _setup_axes(ax, *args, command=command, **kwarg)
                 groups_xunits.setdefault(xunits, []).append(ax)
                 groups_yunits.setdefault(yunits, []).append(ax)
-            if 'bar' in command:  # ensure padding around bar edges
-                keys = (_setup_bars,)
-                kwarg = _pop_kwargs(kw_other.copy(), *keys)
-                errdata = kw_command.get('bardata', None)
-                handle = _setup_bars(ax, args, errdata, handle, **kwarg)
             if 'violin' in command:  # process violin
                 keys = ('alpha', 'hatch', 'linewidth', 'edgecolor')
-                kwarg = _pop_kwargs(kw_other.copy(), keys, _setup_violins)
+                kwarg = _pop_kwargs({**kw_other}, keys, _setup_violins)
                 line = [line for line in ax.lines if line not in prevlines]
                 handle = _setup_violins(ax, data, handle, line, **kwarg)
+            if 'bar' in command:  # ensure padding around bar edges
+                keys = ('fontsize', _setup_bars)
+                kwarg = _pop_kwargs({**kw_axes, **kw_other}, *keys)
+                errdata = kw_command.get('bardata', None)
+                handle = _setup_bars(ax, args, errdata, handle, **kwarg)
 
             # Vector plot modifications
             # NOTE: This optionally adds constraints, one-one line, and other
             # annotations and optionally scales latitude axis to ignore poles.
             if 'scatter' in command:  # {{{
-                keys = (_setup_scatter, process_constraint)
-                kwarg = _pop_kwargs(kw_other.copy(), *keys)
+                keys = ('fontsize', _setup_scatter, process_constraint)
+                kwarg = _pop_kwargs({**kw_axes, **kw_other}, *keys)
                 oneone = oneone or kw_other.get('oneone', False)
-                handle = _setup_scatter(ax, *args, handle, **kwarg)
+                handle = _setup_scatter(ax, *args, handle, source=dataset, **kwarg)
             if 'line' in command and autoscale:
                 arg = data.values.copy()
                 arg[~np.isfinite(arg)] = np.nan
@@ -2459,7 +2492,7 @@ def general_plot(
                 iargs = [arg.sel(lon=slice(*lons), lat=slice(*lats)) for arg in iargs]
                 value, defaults = _reduce_datas(*iargs, compare, dim=dims, ocean=True)
                 keys, kwarg = ('project', 'start', 'stop', 'period'), dict((*group, *other))  # noqa: E501
-                msg = ' '.join(f'{key}={val}' for key, val in kwarg.items() if key in keys)  # noqa: E501
+                msg = get_labels([(kwarg,)], restrict=keys, identical=True)
                 print(f' {msg}: {compare} {value.item():.3f} {value.units}', end='')
             if contrast and geographic and other in groups_compare:
                 units = format_units(value.attrs.get('units', ''))

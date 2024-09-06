@@ -6,6 +6,7 @@ import collections
 import inspect
 import itertools
 import re
+import time  # noqa: F401
 
 import climopy as climo  # noqa: F401
 import numpy as np
@@ -166,6 +167,7 @@ GENERAL_LABELS = {
     ('initial', 'jan'): None,  # avoid adding labels to merged distributions
     ('period', 'full'): None,
     ('period', '20yr'): None,
+    ('period', '23yr'): None,
     ('period', '50yr'): None,
     ('remove', 'climate'): None,
     ('remove', 'average'): None,
@@ -470,12 +472,14 @@ def _expand_lists(*args):
     return args
 
 
-def _expand_parts(value):
+def _expand_parts(key, value):
     """
-    Expand reduction keyword arguments.
+    Expand reduction value along mathematical operations.
 
     Parameters
     ----------
+    key : str
+        The reduction key.
     value : object
         The reduction value.
     """
@@ -483,8 +487,10 @@ def _expand_parts(value):
     # pairs [('20', '150'), ('-', '-'), ('0', '20')] for better processing.
     parts, values = [], value if isinstance(value, tuple) else (value,)
     for value in values:
-        iparts = []  # support 'startstop' anomaly tuples e.g. startstop=(20-0, 150-20)
-        for part in (REGEX_SPLIT.split(value) if isinstance(value, str) else (value,)):
+        iparts, ivalues = [], (value,)  # support 'startstop' anomaly tuples
+        if isinstance(value, str) and key not in ('model', 'institute'):
+            ivalues = REGEX_SPLIT.split(value)
+        for part in ivalues:
             if not isinstance(part, str):
                 pass
             elif part.lower() == 'none':
@@ -519,21 +525,18 @@ def _group_parts(kwargs, keep_operators=False):
     # keep same number of operators (so numerator and denominator have same number
     # and thus can be combined) but replace with just '+' i.e. a dummy average.
     kwargs = kwargs.copy()
+    experiment = kwargs.get('experiment')
     if 'stop' in kwargs:
         kwargs.setdefault('start', None)
     if 'start' in kwargs:
         kwargs.setdefault('stop', None)
     if 'start' in kwargs and 'stop' in kwargs:
         start, stop = kwargs.pop('start'), kwargs.pop('stop')
-        if kwargs.get('experiment') == 'picontrol':
+        if keep_operators and experiment == 'picontrol':
             num1 = sum(map(start.count, '+-')) if isinstance(start, str) else 0
             num2 = sum(map(stop.count, '+-')) if isinstance(stop, str) else 0
-            if keep_operators:
-                start = '+'.join(itertools.repeat('0', num1 + 1))
-                stop = '+'.join(itertools.repeat('150', num2 + 1))
-            else:
-                start = None
-                stop = None
+            start = '+'.join(itertools.repeat(f'{start or 0}', num1 + 1))
+            stop = '+'.join(itertools.repeat(f'{stop or 150}', num2 + 1))
         kwargs['startstop'] = (start, stop)
     return kwargs
 
@@ -763,14 +766,17 @@ def get_label(key, value, mode=None, dataset=None, experiment=True):
         raise ValueError(f'Invalid label mode {mode!r}.')
     translate_operator = {'+': 'plus', '-': 'minus', '*': 'times', '/': 'over'}
     translate_part = translates.get(mode, {})
+    options = [key for idx in dataset.indexes.values() for key in idx.names]
     parts = []
-    for part in (value,) if key in ('model', 'institute') else _expand_parts(value):
+    for part in _expand_parts(key, value):
         if key == 'name':  # retrieve without calculating using get_result(attr=attr)
             if part and '|' in part:
                 *_, part = part.split('|')  # numerator in pattern regression
             part = ALIAS_VARIABLES.get(part, part)
             if part and part in translate_operator:
                 label = part if mode == 'path' else translate_operator[part]
+            elif part in (*options, *dataset.coords):
+                label = part  # e.g. get_label('name', 'experiment')
             elif mode == 'path':
                 label = VARIABLE_ALIASES.get(part, part)
             elif mode == 'short':
@@ -1036,20 +1042,19 @@ def parse_spec(dataset, spec, **kwargs):
           * ``attrs``: Added to `.attrs` for use in resulting plot labels.
           * ``other``: Custom keyword arguments for plotting options.
     """
-    # NOTE: For subsequent processing we put the variables being combined (usually one)
-    # inside process 'name' key. This helps when merging variable specifications
-    # between row and column specs and between tuple-style specs (see parse_specs).
-    # WARNING: Critical to always parse facet and version levels since figures.py will
-    # auto apply these coordinates even if not present e.g. for bootstrap datasets. Then
-    # have process.py ignore them when version is not present.
-    from .general import _merge_dists, _init_command, _props_command
-    from .general import _setup_axes, _setup_bars, _setup_scatter  # noqa: E501
+    # Initial stuff
+    # NOTE: This only works for optional keyword arguments with explicit defaults
+    # and only for methods that have not been obfuscated (see _format_signature).
+    from .general import _merge_dists, _init_command, _props_command  # {{{
+    from .general import _setup_axes, _setup_bars, _setup_scatter
     from .process import get_result, process_constraint
     from .reduce import reduce_facets, _reduce_data, _reduce_datas
-    sizes = [k + s for k in ('', 'ax', 'ref', 'fig') for s in ('', 'num', 'width', 'height', 'aspect')]  # noqa: E501
-    spaces = [k + s for k in ('span', 'share', 'align') for s in ('', 'x', 'y')]
+    formats = tuple(pplt.Axes._format_signatures.values())
     others = (_merge_dists, _init_command, _props_command)
     setups = _setup_axes, _setup_bars, _setup_scatter
+    spaces = [k + s for k in ('span', 'share', 'align') for s in ('', 'x', 'y')]
+    sizes = [k + s for k in ('', 'ax', 'ref', 'fig') for s in ('', 'num', 'width', 'height', 'aspect')]  # noqa: E501
+    props = ('c', 'lw', 'color', 'linewidth', 'facecolor', 'edgecolor', 'a', 'alpha')
     if spec is None:
         name, kw = None, {}
     elif isinstance(spec, str):
@@ -1060,19 +1065,23 @@ def parse_spec(dataset, spec, **kwargs):
         name, kw = spec
     kw = {**kwargs, **kw}  # prefer spec arguments
     name = name or kw.pop('name', None)  # see below
-    settings = ('c', 'lw', 'color', 'linewidth', 'color', 'facecolor', 'edgecolor', 'a', 'alpha')  # noqa: E501
-    institute = kw.get('institute', None)
+
+    # Get keyword arguments
+    # WARNING: Critical to always parse facet and version levels since figures.py will
+    # auto apply these coordinates even if not present e.g. for bootstrap datasets. Then
+    # have process.py ignore them when version is not present.
+    internal = '23yr' if '23yr' in getattr(dataset, 'period', []) else '20yr'
+    institute = kw.get('institute', None)  # {{{
     bootstrap = kw.pop('bootstrap', None)  # TODO: remove kludge?
     experiment = kw['experiment'] or 'abrupt4xco2' if 'experiment' in kw else None
     kw.update({'institute': None} if institute == 'wgt' else {})
-    formats = tuple(pplt.Axes._format_signatures.values())
     kw_process = _pop_kwargs(kw, dataset, get_result, reduce_facets, _reduce_data, _reduce_datas)  # noqa: E501
     kw_attrs = _pop_kwargs(kw, 'short_name', 'long_name', 'standard_name', 'units')
     kw_grid = _pop_kwargs(kw, pplt.GridSpec._update_params)  # overlaps kw_figure
     kw_figure = _pop_kwargs(kw, *spaces, *sizes, pplt.Figure._format_signature)
     kw_axes = _pop_kwargs(kw, *formats, pplt.Figure._parse_proj)
     kw_other = _pop_kwargs(kw, *setups, *others, process_constraint)
-    kw_command = _pop_kwargs(kw, 'cmap', 'cycle', 'extend', *settings)
+    kw_command = _pop_kwargs(kw, 'cmap', 'cycle', 'extend', *props)
     kw_config = _pop_kwargs(kw, tuple(_rc_nodots))  # overlaps kw_command (see above)
     kw_guide = _pop_kwargs(kw, pplt.Axes._add_legend, pplt.Axes._add_colorbar)
     kw_legend = {**kw_guide, **_pop_kwargs(kw, 'legend', pplt.Axes._add_legend)}
@@ -1080,12 +1089,17 @@ def parse_spec(dataset, spec, **kwargs):
     kw_axes.update(kw_config)  # configuration settings
     kw_figure.update(kw_config)  # configuration settings
     kw_command.update(kw)  # unknown kwargs passed to command
+
+    # Repair variable spes
+    # NOTE: For subsequent processing we put the variables being combined (usually one)
+    # inside process 'name' key. This helps when merging variable specifications
+    # between row and column specs and between tuple-style specs (see parse_specs).
     if institute == 'wgt':
         kw_other['weight'] = kw_process['weight'] = True
     if name is not None:
         kw_process['name'] = name
     if bootstrap is not None and experiment == 'picontrol':
-        kw_process['period'] = '20yr' if bootstrap else 'full'  # overwrite control
+        kw_process['period'] = internal if bootstrap else 'full'  # overwrite control
     elif bootstrap is not None and experiment == 'abrupt4xco2':
         kw_process['period'] = kw_process.get('period', 'full')  # avoid using control
     if 'width' in kw_figure:  # bar widths
@@ -1223,7 +1237,7 @@ def parse_specs(
         # Generate variable specifiers
         # NOTE: Several plotted values per subplot can be indicated in either the
         # row or column list, and the specs from the other list are repeated below.
-        ikws_row, ikws_col = _expand_lists(ikws_row, ikws_col)
+        ikws_row, ikws_col = _expand_lists(ikws_row, ikws_col)  # {{{
         ikws_process, ikws_collection = [], []
         for idx, (jkws_row, jkws_col) in enumerate(zip(ikws_row, ikws_col)):
             # Combine row and column keywords
@@ -1303,25 +1317,31 @@ def parse_specs(
     # Infer figure label and grid labels
     # NOTE: Here only return tuple gridlabels if more than one are present
     # TODO: Copy below algorithm used to determine column count to general_plot()
-    ncols = len(colspecs) if len(colspecs) > 1 else len(rowspecs) if len(rowspecs) > 1 else 3  # noqa: E501
-    figwidth = ncols * refwidth + 0.3 * refwidth * (ncols - 1)
-    kw_label = dict(refwidth=figwidth, heading=True, identical=True, short=False)
-    figlabel = get_labels(*kws_process, **kw_label, **kw_shared)
-    pathspecs = [dspec for ikws_process in kws_process for dspec in ikws_process]
-    pathlabel = get_path(dataset, *pathspecs)
-    kw_split = dict(fontsize=pplt.rc.fontlarge, refwidth=refwidth, shift=True)
+    if len(colspecs) > 1:  # {{{
+        ncols = len(colspecs)
+    elif len(rowspecs) > 1:
+        ncols = len(rowspecs)
+    else:
+        ncols = 3
+    figwidth = ncols * refwidth + 0.3 * refwidth * (ncols - 1)  # approximate width
+    kw_figure = dict(refwidth=figwidth, heading=True, identical=True, short=False)
+    kw_split = dict(fontsize=pplt.rc.fontlarge, refwidth=refwidth, shift=True, scale=kw_shared['scale'])  # noqa: E501
+    kw_spec = dict(identical=False, short=False, refwidth=np.inf)
+    figlabel = get_labels(*kws_process, **kw_figure, **kw_shared)
+    pathlabel = get_path(dataset, *(spec for ikws in kws_process for spec in ikws))
     if len(rowspecs) == 1 and len(colspecs) == 1:
         gridlabels = None
     elif len(rowspecs) > 1 and len(colspecs) > 1:
         gridlabels = tuple(gridlabels)  # NOTE: tuple critical for general_plot
     elif len(rowspecs) > 1:
-        gridlabels = [_split_label(label, **kw_split, **kw_shared) for label in gridlabels[0]]  # noqa: E501
+        gridlabels = [_split_label(label, **kw_split) for label in gridlabels[0]]
     else:
-        gridlabels = [_split_label(label, **kw_split, **kw_shared) for label in gridlabels[1]]  # noqa: E501
-    print('Variables:', end=' ')
-    for idx, kws in kws_grid.items():
-        print(f'(Group {idx + 1})', end=' ')
-        kw_print = dict(identical=False, short=False, refwidth=np.inf)
-        labels = get_labels(*kws.values(), **kw_print, **kw_shared)
-        print(*(f'(Row {row} Col {col}) {label!r}' for (row, col), label in zip(kws, labels)), end=' ')  # noqa: E501
+        gridlabels = [_split_label(label, **kw_split) for label in gridlabels[1]]
+    print('Specs:', end=' ')
+    for grp, kws in kws_grid.items():
+        print(f'(Group {grp + 1})', end=' ')
+        indexes = [f'(Row {row} Col {col})' for row, col in kws]
+        labels = get_labels(*kws.values(), **kw_spec, **kw_shared)
+        labels = [f'{index} {label!r}' for index, label in zip(indexes, labels)]
+        print(*labels, end='\n' if grp == max(kws_grid) else ' ')
     return kws_process, kws_collection, figlabel, pathlabel, gridlabels

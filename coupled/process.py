@@ -108,6 +108,8 @@ def _get_parts(
     options : dict
         The combination options.
     """
+    # TODO: Fix possible bug where (e.g.) file with shortwave longwave cloud effect
+    # but no full cloud effect fails to read components, instead builds from net/cs.
     # NOTE: This is ad hoc implementation of cfvariable-like scheme for quickly
     # retrieving names. In future should implement these as derivations with standard
     # cfvariable properties and recursively combine / check for availability using
@@ -120,7 +122,9 @@ def _get_parts(
         head = wav = net = bnd = sky = param = 'NA'
     if not name:  # user-input only
         parts = parts or ()
-    elif 'rluscs' in name or 'rsdtcs' in name:
+    elif 'rluscs' in name:
+        parts = (name[:-2],)  # all-sky same as clear-sky
+    elif 'rsdtcs' in name:
         parts = (name[:-2],)  # all-sky same as clear-sky
     elif 'total' in name:
         parts = trans('total', 'lse', 'dse', 'ocean')
@@ -133,7 +137,7 @@ def _get_parts(
         search, replace = 'sensible', 'dry'
     elif name == 'tdev':  # TODO: define other 'relative' variables?
         parts, relative = ('tstd',), (True,)  # TODO: revisit labels
-        attrs.update(units='K', long_name='temperature anomaly', short_name='anomaly')  # noqa: E501
+        attrs.update(units='K / sigma', long_name='temperature deviation', short_name='deviation')  # noqa: E501
     elif name == 'tabs':  # warming pattern for scaled sensitivity
         parts, product = ('tpat', 'ecs'), (True,)  # TODO: revisit
         attrs.update(units='K', long_name='temperature response', short_name='response')  # noqa: E501
@@ -163,6 +167,10 @@ def _get_parts(
         parts = trans(regex, r'cl\2\3\4\5\6', r'\2\3\4\5\6')
         search, replace = 'cloud', 'non-cloud'
         signs = (-1, 1)
+    elif head == 'msk':  # cloud masking = cloud minus cloud effect
+        parts = trans(regex, r'cl\2\3\4\5\6', r'\2\3\4\5ce')
+        search, replace = 'cloud', 'cloud masking'
+        signs = (1, -1)
     elif sky == 'ce':  # raw cloud effect
         parts = trans(regex, r'\1\2\3\4\5cs', r'\1\2\3\4\5')
         search, replace = 'clear-sky', 'cloud effect'
@@ -202,7 +210,7 @@ def _get_parts(
     return parts, options
 
 
-def _get_result(parts, combine=True, hemisphere=None, **kwargs):
+def _get_result(parts, operate=True, hemisphere=None, **kwargs):
     """
     Get the data array associated with the input parts.
 
@@ -210,8 +218,8 @@ def _get_result(parts, combine=True, hemisphere=None, **kwargs):
     ----------
     parts : namedtuple
         The (possibly nested) components and instructions returned by `_get_parts`.
-    combine : str, optional
-        Whether to combine the arrays or just return the first component.
+    operate : str, optional
+        Whether to carry out required operations or just return the first component.
     hemisphere : bool or str, optional
         The hemisphere to optionally select.
     **kwargs
@@ -232,8 +240,8 @@ def _get_result(parts, combine=True, hemisphere=None, **kwargs):
     for part in parts.parts:
         data = part
         if isinstance(part, tuple):  # recurse
-            data = _get_result(part, combine=combine, **kwargs)
-        elif not combine:  # skip reduce
+            data = _get_result(part, operate=operate, **kwargs)
+        elif not operate:  # skip reduce
             data = part if isinstance(part, xr.DataArray) else xr.DataArray([], name=name)  # noqa: E501
         else:  # apply reduce
             data = reduce_general(data, **kwargs)
@@ -246,17 +254,17 @@ def _get_result(parts, combine=True, hemisphere=None, **kwargs):
             if 'lev' in data.coords:
                 data = data.rename(lev='plev')
         datas.append(data)
-    if combine:
+    if operate:
         datas, signs = datas, parts.signs
     else:
         datas, signs = datas[:1], parts.signs[:1]
-    if not combine or not parts.relative:
+    if not operate or not parts.relative:
         bases = (1 if parts.product else 0,) * len(signs)
     else:
         bases = [data.climo.average('area') for data in datas]
     iter_ = zip(datas, signs, bases, strict=True)
     with xr.set_options(keep_attrs=True):
-        if not combine or len(datas) == 1 and signs[0] == 1 and not parts.relative:
+        if not operate or len(datas) == 1 and signs[0] == 1 and not parts.relative:
             data = datas[0]
         elif parts.product:  # get products or ratios
             data = math.prod(data ** sign / base for data, sign, base in iter_)
@@ -265,6 +273,9 @@ def _get_result(parts, combine=True, hemisphere=None, **kwargs):
     data = data.copy(deep=False)  # update attributes on derived variable
     data.name = name
     data.attrs.update(parts.attrs)
+    data.attrs.setdefault('units', '')  # missing units
+    data.attrs.setdefault('short_name', name)  # e.g. 'model'
+    data.attrs.setdefault('long_name', name)  # e.g. 'model'
     for key in ('long_name', 'short_name', 'standard_name'):
         value = data.attrs.get(key, None)
         if parts.search and isinstance(value, str):
@@ -272,7 +283,7 @@ def _get_result(parts, combine=True, hemisphere=None, **kwargs):
     return data
 
 
-def get_parts(dataset, name, scaled=False, **kwargs):
+def get_parts(dataset, name, scaled=None, **kwargs):
     """
     Return the components needed to build the requested variable.
 
@@ -298,28 +309,32 @@ def get_parts(dataset, name, scaled=False, **kwargs):
     # add explicit indicator if '2x' or '4x' is specified. Preserve default of always
     # *displaying* the unscaled experiment results by translating 'erf' or 'ecs' below.
     from .feedbacks import ALIAS_VARIABLES as aliases
+    from .feedbacks import REGEX_FLUX as regex
     name = aliases.get(name, name)
-    scaled = scaled or 'ecs' not in name and 'erf' not in name
+    names = [key for idx in dataset.indexes.values() for key in idx.names]
     absolute = not any(name[:3] == 'pl*' for name in dataset)
-    if scaled and name in dataset or name in dataset.climo:
+    kwargs.update(scaled=scaled, absolute=absolute)
+    if not scaled:  # scaling not necessary
+        scaled = 'ecs' not in name and 'erf' not in name
+    if scaled and name in dataset or name in names or name in dataset.climo:
         parts, options = _get_parts(parts=[name], **kwargs)  # manual parts
     else:  # automatic parts
-        parts, options = _get_parts(name, scaled=scaled, absolute=absolute, **kwargs)
+        parts, options = _get_parts(name, **kwargs)
     if name not in dataset and name in dataset.climo:
         attrs = ('short_name', 'long_name', 'standard_units')
         attrs = {attr: getattr(vreg[name], attr) for attr in attrs}
         options['attrs'].update(attrs)
-    from .feedbacks import REGEX_FLUX as regex
     fluxes = ', '.join(s for s in dataset.data_vars if regex.search(s))
     results = []
     for part in parts:
+        scaled = name != 'tabs'
         deps = VARIABLE_DEPENDENCIES.get(name, ())
-        if part in dataset:  # note 'tabs' not saved
+        if part in dataset or part in names:  # note 'tabs' not saved
             part = dataset[part]
         elif part in dataset.climo:  # climopy derivation
             part = dataset.drop_vars(dataset.data_vars.keys() - set(deps))
         elif part != name or not scaled:  # valid derivation
-            part = get_parts(dataset, part, scaled=name != 'tabs')
+            part = get_parts(dataset, part, scaled=scaled)
         else:  # print available
             raise KeyError(f'Required variable {name} not found. Options are: {fluxes}.')  # noqa: E501
         results.append(part)
@@ -330,17 +345,15 @@ def get_parts(dataset, name, scaled=False, **kwargs):
 
 
 def get_result(
-    *args, attr=None, spatial=None, hemi=None, hemisphere=None, quantify=False, standardize=True, **kwargs,  # noqa: E501
+    *args, spatial=None, hemi=None, hemisphere=None, quantify=False, standardize=True, **kwargs,  # noqa: E501
 ):
     """
     Return the requested variable or attribute.
 
     Parameters
     ----------
-    *args : namedtuple
-        The variable arguments. If not a `namedtuple` then passed to `get_parts`.
-    attr : str, optional
-        The attribute to retrieve. Can be passed as the final positional argument.
+    *args : namedtuple or xarray.Dataset, str
+        The `get_parts` `namedtuple` (or dataset plus variable name) and attribute.
     spatial : str, optional
         The spatial reduction option.
     hemi, hemisphere : str, optional
@@ -360,28 +373,28 @@ def get_result(
     # selections first (e.g. points, maxima), 4) combining variables (e.g. products,
     # sums), then 5) more complex coordinate operations (e.g. averages, integrals). And
     # optionally order operations around non-linear variable or coordinate operations.
-    if not args or len(args) > 3:
-        raise TypeError(f'Expected 1 to 3 positional arguments but got {len(args)}.')  # noqa: E501
-    if len(args) == 1 and not isinstance(args[0], tuple):
-        raise TypeError('Input argument must be namedtuple returned by get_parts().')
-    kwargs['hemi'] = hemi or hemisphere  # permit either
-    kwargs['quantify'] = quantify  # detectable with _pop_kwargs
-    kwargs['standardize'] = standardize  # detectable with _pop_kwargs
-    nargs = isinstance(args[0], xr.Dataset) + 1
-    args, attrs = args[:nargs], args[nargs:]
-    parts = args[0] if nargs == 1 else get_parts(*args)
-    attr = attr or attrs and attrs[0] or None
-    data = _get_result(parts, combine=attr is None, **kwargs)
+    start, stop = kwargs.get('start', 0), kwargs.get('stop', 150)
+    kwargs.update(hemi=hemi or hemisphere, quantify=quantify, standardize=standardize)
+    if args and isinstance(args[0], xr.Dataset):
+        args = (get_parts(*args[:2]), *args[2:])
+    if len(args) == 1:
+        part, attr = *args, None
+    elif len(args) == 2:
+        part, attr = args
+    else:
+        raise TypeError(f'Expected one to three input arguments but got {len(args)}.')
+    if isinstance(part, tuple):
+        data = _get_result(part, operate=attr is None, **kwargs)
+    else:
+        raise TypeError(f'Invalid input arguments {args!r}. Should be data or tuple.')
+    kw_control = {'start': 0, 'stop': 150} if 'version' in data.coords else {}
+    kw_abrupt = {'start': start, 'stop': stop} if 'version' in data.coords else {}
     if spatial is not None:  # only apply custom spatial correlation
-        val0, val1 = kwargs.get('start', 0), kwargs.get('stop', 150)
-        kw0 = {'start': 0, 'stop': 150} if 'version' in data.coords else {}
-        kw1 = {'start': val0, 'stop': val1} if 'version' in data.coords else {}
-        data0 = data.sel(experiment='picontrol', **kw0)
-        data1 = data.sel(experiment='abrupt4xco2', **kw1)
+        data0 = data.sel(experiment='picontrol', **kw_control)
+        data1 = data.sel(experiment='abrupt4xco2', **kw_abrupt)
         data, attrs = _reduce_datas(data0, data1, dim='area', method=spatial)
-        data.attrs.update({**data.attrs, **attrs})
-        del data.attrs['name']  # only used in reduce_facets()
-    if attr == 'units':
+        data.attrs.update({key: val for key, val in attrs.items() if key != 'name'})
+    if attr and attr == 'units':
         result = data.climo.units
     elif attr:
         result = data.attrs.get(attr, '')
@@ -393,8 +406,9 @@ def get_result(
 
 
 def process_constraint(
-    data0, data1, constraint=None, constraint_kw=None, observed=None, extended=None, perturb=False,  # noqa: E501
-    noresid=False, noerror=False, internal=False, graphical=False, pctile=None, N=None, **kwargs,  # noqa: E501
+    data0, data1, constraint=None, constraint_kw=None, observed=None, extended=None,
+    perturb=False, noresid=False, noerror=False, pctile=None, N=None,
+    internal=False, graphical=False, source=None, **kwargs,
 ):
     """
     Return percentile bounds for observational constraint.
@@ -411,12 +425,21 @@ def process_constraint(
         The keyword arguments passed to the loading function.
     observed : int, optional
         The number of years to use for observational uncertainty.
+    extended : int, optional
+        The number of additional years to apply shading.
     perturb : bool, optional
         Whether to perturb the model data with its own uncertainty.
     noresid : bool, optional
         Whether to ignore the regression residuals.
     noerror : bool, optional
         Whether to ignore the regression standard error.
+    pctile : float, default: 95
+        The emergent constraint percentile bounds to be returned.
+    N : int, default: 1000000
+        The number of bootstrapped samples to carry out.
+
+    Other Parameters
+    ----------------
     internal : bool or int, optional
         Whether to include model-estimated observed uncertainty due to variability. If
         ``True`` then ``20`` is used. If passed the bounds are with and without model
@@ -425,10 +448,8 @@ def process_constraint(
         Whether to use graphical intersections instead of residual bootstrapping. If
         ``False`` then constrained uncertainty estimated by adding t-distribution with
         standard error calculated from residuals of regression relationship.
-    pctile : float, default: 95
-        The emergent constraint percentile bounds to be returned.
-    N : int, default: 1000000
-        The number of bootstrapped samples to carry out.
+    source : xarray.Dataset, optional
+        The source dataset used for inferring masking (if necessary).
     **kwargs
         Passed to `_get_regression`.
 
@@ -441,13 +462,12 @@ def process_constraint(
     result2 : 3-tuple
         The emergent constraint accounting for regression uncertainty.
     """
-    # Get settings and observational data
+    # Initial stuff
     # TODO: Use estimates from global average model feedbacks
-    from .datasets import open_scalar
     from .reduce import _get_regression
     np.random.seed(51423)  # see: https://stackoverflow.com/a/63980788/4970632
-    N = N or 10000000  # samples to draw
-    historical = 24  # historical observation years
+    N = N or 10000000
+    historical = 24.4  # March 2000 to June 2024
     constraint = 'cre' if constraint is None or constraint is True else constraint
     observed = observed or historical
     internal = observed if internal is None or internal is True else internal
@@ -455,15 +475,34 @@ def process_constraint(
     pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
     keys = ('initial', 'detrend', 'remove', 'correct')
     name = constraint if isinstance(constraint, str) else 'cre'
-    kernels = (data0.name or '')[:2] == 'cl'
-    observed_kw = {key: data0.coords[key].item() for key in keys if key in data0.coords}
-    observed_kw.update(constraint_kw or {})
-    observed_kw.update({'statistic': ['slope', 'sigma', 'dof']})
-    observed_kw.update({'source': 'external'} if kernels else {})
-    if isinstance(constraint, str):  # TODO: use generalized estimates
-        suffix = 'he' if kernels else None
+    cloud, masks = (data0.name or '')[:2] == 'cl', ()
+    scalar_kw = {key: data0.coords[key].item() for key in keys if key in data0.coords}
+    scalar_kw.update(constraint_kw or {})
+    scalar_kw.update({'statistic': ['slope', 'sigma', 'dof']})
+    if source is None and cloud:
+        suffix, scalar_kw['source'] = 'cld', 'external'  # see observed/feedbacks.py
+    elif not cloud or source is not None:  # possibly auto-infer masking
+        suffix, masks = 'cre', ('mask', 'swmask', 'lwmask') if cloud else ()
+    else:
+        raise ValueError(f'Source dataset required for constraint {data0.name!r}.')
+
+    # Get constraint data
+    # TODO: Use generalized constraint estimates
+    if isinstance(constraint, str):
+        from .feedbacks import REGEX_FLUX as regex
+        from .datasets import open_scalar
         scalar = open_scalar(ceres=True, suffix=suffix)  # TODO: update this
-        scalar = get_result(scalar, constraint, **observed_kw)
+        project = data0.coords.get('project') or xr.DataArray('CMIP6')
+        kw_mask = dict(area='avg', experiment='picontrol', project=project.item())
+        kw_mean = dict(method='avg', weight=kwargs.get('weight'), skipna=True)
+        for imask in masks:  # masking components
+            print(f'Computing cloud masking: {imask!r}')
+            (mask,), *_ = reduce_facets(get_result(source, imask, **kw_mask), **kw_mean)
+            icld = re.sub(regex, r'cl\2\3\4\5\6', mask.name).strip('_')
+            icre = re.sub(regex, r'\2\3\4\5ce', mask.name).strip('_')
+            scalar[icld] = scalar[icre].copy(deep=True)
+            scalar[icld].loc[{'statistic': 'slope'}] += mask.item()
+        scalar = get_result(scalar, constraint, **scalar_kw)
         constraint = scalar.values.tolist()
     if not np.iterable(constraint) or len(constraint) != 3:
         raise ValueError(f'Invalid constraint {constraint}. Must be (slope, sigma, dof).')  # noqa: E501
@@ -494,9 +533,9 @@ def process_constraint(
         observations = np.array([xmin1, xmin2, xmean, xmax2, xmax1])
     if internal:
         internal = 20 if internal is True else internal
-        internal_kw = dict(**observed_kw, experiment='picontrol')
+        internal_kw = dict(**scalar_kw, experiment='picontrol')
         internal_kw.update(period=f'{internal}yr', error='internal', statistic='sigma')
-        dataset = open_scalar(ceres=True)
+        dataset = open_scalar(ceres=True, suffix='cre')
         iscales = get_result(dataset, name, **internal_kw)
         iscale = iscales.mean().item()
         xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
@@ -625,7 +664,7 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
         kw_data = _group_parts(kw_data, keep_operators=True)
         for key, value in kw_data.items():
             sels = ['+']
-            for part in _expand_parts(value):
+            for part in _expand_parts(key, value):
                 if part is None:
                     sel = None
                 elif np.iterable(part) and part[:1] in ('+', '-', '*', '/'):

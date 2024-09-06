@@ -59,7 +59,7 @@ FACETS_LEVELS = (
 )
 
 # Version settings
-VERSION_NAME = 'eeedback settings'
+VERSION_NAME = 'feedback settings'
 VERSION_LEVELS = (
     'source',
     'style',
@@ -142,14 +142,14 @@ def open_scalar(path=None, ceres=False, suffix=None):
         The source feedback path.
     ceres : bool, optional
         Whether to load global CERES or CMIP feedbacks.
-    suffix : str, optional
-        The optional dataset suffix.
+    suffix : str or sequence, optional
+        The optional source or variable name suffix.
     """
     from .feedbacks import _update_attrs
-    suffix = suffix and f'-{suffix}' or ''
-    source = 'CERES' if ceres else 'CMIP'
+    source = 'CERES' if ceres else 'CMIP[56]'
+    suffix = suffix and f'_{suffix}' or ''
     base = Path('~/data/global-feedbacks').expanduser()
-    file = f'feedbacks_{source}*_global{suffix}.nc'
+    file = f'feedbacks_{source}_global{suffix}.nc'
     if isinstance(path, str) and '/' not in path:
         path = base / path
     elif path:
@@ -160,11 +160,14 @@ def open_scalar(path=None, ceres=False, suffix=None):
         paths = tuple(path.glob(file))
     else:  # output
         paths = (path,)
-    datas = tuple(xr.open_dataset(path) for path in paths)
+    if not paths:
+        raise ValueError(f'Pattern {file!r} returned no matches.')
+    datas = [xr.open_dataset(path) for path in paths]
+    kwarg = dict(coords='minimal', compat='override', combine_attrs='override')
     if len(datas) == 1:  # e.g. ceres dataset
         data = datas[0]
     else:  # e.g. cmip5 and cmip6 datasets (list needed)
-        data = xr.combine_nested(list(datas), 'facets')
+        data = xr.concat(datas, dim='facets', **kwarg)
     if 'period' in data.coords:
         data = data.assign_coords(period=data.period.str.replace('150yr', 'full'))
     names = [key for key, coord in data.coords.items() if coord.dims == ('facets',)]
@@ -300,6 +303,11 @@ def open_dataset(
         combine_attrs='override',
     )
     print('Standardizing result.')
+    if 'project' in dataset.data_vars:  # xarray bug: https://github.com/pydata/xarray/issues/7695  # noqa: E501
+        index = dataset.indexes['facets']
+        array = xr.DataArray(index, dims='facets', name='facets')
+        dataset = dataset.drop_vars({'facets', *index.names} & dataset.keys())
+        dataset = dataset.assign_coords(facets=array)
     if 'version' in dataset.dims:
         dataset = dataset.transpose('version', ...)
     if standardize:

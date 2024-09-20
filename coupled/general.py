@@ -725,8 +725,9 @@ def _format_bars(
 
 
 def _format_scatter(
-    ax, data0, data1, handle=None, source=None, zeros=False, oneone=False, linefit=False,  # noqa: E501
-    highlight=False, annotate=False, constraint=None, masking=None, original=None,
+    ax, data0, data1, handle=None, dataset=None, zeros=False, oneone=False,
+    linefit=False, correlation=False, bounds=False, highlight=False,
+    annotate=False, constraint=None, masking=None, original=None,
     cumulative=False, alternative=False, weight=False, pctile=None, **kwargs,
 ):
     """
@@ -740,8 +741,8 @@ def _format_scatter(
         The input arguments.
     handle : matplotlib.collection.Collection
         The scatter collection handle.
-    source : xarray.Dataset, optional
-        The source dataset possibly required for the constraint.
+    dataset : xarray.Dataset, optional
+        The original dataset possibly required for the constraint.
 
     Other Parameters
     ----------------
@@ -751,6 +752,10 @@ def _format_scatter(
         Whether to add a one-one dotted line.
     linefit : bool, optional
         Whether to add a least-squares fit line.
+    correlation : bool, optional
+        Whether to show correlation instead of r-squared.
+    bounds : bool, optiona
+        Whether to show slope and bounds instead of r-squared.
     highlight : bool, optional
         Whether to highlight positive slopes with red.
     annotate : bool, optional
@@ -776,7 +781,7 @@ def _format_scatter(
     # NOTE: This also disables autoscaling so that line always looks like a diagonal
     # drawn right across the axes. Also requires same units on x and y axis.
     kw_constraint = _pop_kwargs(kwargs, process_constraint)  # {{{
-    kw_constraint['source'] = source if masking else None
+    kw_constraint['dataset'] = dataset if masking else None
     fontsize = kwargs.pop('fontsize', None)  # see also _format_bars()
     fontsize = pplt.utils._fontsize_to_pt(fontsize)
     with pplt.rc.context({} if fontsize is None else {'fontsize': fontsize}):
@@ -820,28 +825,33 @@ def _format_scatter(
     # Add manual regression line
     # NOTE: Here climopy automatically reapplies dataarray coordinates to fit line
     # and lower and upper bounds so do not explicitly need sorted x coordinates.
-    # sign = '(\N{MINUS SIGN})' if slope < 0 else ''  # negative r-squared
     # label = rf'$r^2={sign}{value:~L.0f}$'
-    # label = rf'r$={np.sign(slope) * rsquare.item() ** 0.5:.2f}$'
     # color = 'red' if constraint is None else color  # line fit color
-    if linefit or constraint is not None:  # {{{
+    if linefit or bounds or correlation or constraint is not None:  # {{{
         dim = data0.dims and data0.dims[0] or None
-        pct = pctile or 95  # default percentile range
+        pct = pctile or (99 if bounds and dim == 'time' else 95)  # default range
         result = _get_regression(data0, data1, dim=dim, pctile=pct, weight=weight)
-        slope, _, _, fit, fit_lower, fit_upper, rss, rsq, _ = result
-        value = ureg.Quantity(rsq.item(), '').to('percent')
-        label = rf'$r^2={value:~L.0f}$'
-        label = re.sub(r'(?<!\\)%', r'\%', label)
-        label = label.replace(r'\ ', '')
+        slope, slope1, slope2, fit, fit1, fit2, *_, rsq, _ = result
+        delta = 0.5 * (slope2 - slope1)  # confidence interval
+        corr = np.sqrt(rsq.item())  # correlation coefficient
+        rsq = ureg.Quantity(rsq.item(), '').to('percent')
+        loc = 'll' if bounds and dim == 'time' else 'lr'  # label location
+        sym = r'\lambda' if dim == 'time' else r'\beta_{\lambda}'
+        sign = '{-}' if slope < 0 else ''  # negative r-squared
+        bnds = format(abs(slope.item()), '.1f' if dim == 'time' else '.2f')
+        bnds = rf'{sym}={sign}{bnds}\pm{delta.item():.2f}'
+        stat = rf'r={sign}{corr:.2f}' if correlation else rf'r^2={rsq:~L.0f}'
+        stat = re.sub(r'(?<!\\)%', r'\%', stat).replace(r'\ ', '')
+        text = f'$\\,{stat}$\n$\\,{bnds}$' if bounds else f'${stat}$'
         datax = np.sort(data0, axis=0)  # linefit returns result for sorted data
         color = 'gray8' if constraint is None or not handle else handle[0].get_color()
         color = 'red8' if highlight and slope > 0 else color  # positive regressions
-        title_kw = {'size': titlesize, 'weight': 'normal'}
+        title_kw = {'size': titlesize, 'weight': 'normal', 'linespacing': 0.8}
         title_kw.update(kwargs)  # additional keywords
         ax.use_sticky_edges = False  # show end of line fit shading
         ax.plot(datax, fit, lw=1.5 * pplt.rc.metawidth, ls='-', a=1.0, c=color)
-        ax.area(datax, fit_lower.squeeze(), fit_upper.squeeze(), lw=0, a=0.3, c=color)
-        ax.format(lrtitle=label, lrtitle_kw=title_kw)
+        ax.area(datax, fit1.squeeze(), fit2.squeeze(), lw=0, a=0.3, c=color)
+        ax.format(**{f'{loc}title': text, f'{loc}title_kw': title_kw})
 
     # Add constraint indicator
     # NOTE: Previously got cmip5/cmip6 bounds from t-distributions of their standard
@@ -1040,9 +1050,114 @@ def _format_violins(
     return handles  # possibly adjusted handles
 
 
-def _merge_dists(
-    dataset, arguments, kws_collection, intersect=False, correlation=False, horizontal=False,  # noqa: E501
-    outers=None, inners=None, restrict=None, scale=None, offset=None, missing=None,
+def _merge_dists(*args):
+    """
+    Merge distributions in preparation for violin plots.
+
+    Parameters
+    ----------
+    *args : xarray.DataArray
+        The distributions to be merged.
+
+    Returns
+    -------
+    *results
+        The resulting distributions.
+    """
+    # Get violin data. To facillitate putting feedbacks and sensitivity in
+    # same panel, scale 4xCO2 values into 2xCO2 values. Also detect e.g.
+    # internal sensitivitye stimates and set all values to zero.
+    non_feedback = (ureg.K, ureg.K / ureg.K, ureg.W / ureg.m ** 2)
+    units = [data.climo.units for data in args]
+    result = []
+    for data, unit in zip(args, units):
+        if units in non_feedback and data.name not in ('ts', 'tstd', 'tdev'):
+            data = 0.5 * data  # halve the spread
+            data.attrs.clear()  # defer to feedback labels
+            if np.all(np.abs(data) < 0.1):  # pre-industrial forcing/sensitivity
+                data = xr.zeros_like(data)
+            elif ureg.parse_units('W m^-2 K^-1') in units:
+                data = data - 4  # adjust abrupt4xco2 ecs or erf to 2xco2
+        result.append(data)
+    return result
+
+
+def _merge_pairs(*args, correlation=False, **kwargs):
+    """
+    Merge pairs of distributions in preparation for bar plots.
+
+    Parameters
+    ----------
+    *args : 2-tuple of xarray.DataArray
+        The distribution pairs to be merged.
+    correlation : bool, optional
+        Whether to show correlation coefficients.
+    **kwargs
+        Passed to `_get_regression`.
+
+    Returns
+    -------
+    results : tuple of xarray.DataArray
+        The resulting regressions or correlations.
+    boxes : tuple of xarray.DataArray
+        The uncertainty bounds for thick whisker boxes.
+    bars : tuple of xarray.DataArray
+        The uncertainty bounds for thin whisker bars.
+    annotations : tuple of str
+        The annotations to use for concatenation.
+    """
+    non_feedback = (ureg.K, ureg.K / ureg.K, ureg.W / ureg.m ** 2)
+    # Get regression data. To facillitate putting feedback and sensitivity
+    # regression coefficients in same panel, scale 4xCO2 values into 2xCO2 values.
+    # TODO: Support *difference between slopes* instead of slopes of difference
+    # and support user-input 'pctile' as with reduce_facets()?
+    results, boxes, bars, annotations = [], [], [], []
+    kw_regress = {**kwargs, 'pctile': (50, 95)}
+    kw_regress['stat'] = 'corr' if correlation else 'slope'
+    index, units = pd.Index(()), [arg.climo.units for *_, arg in args]
+    for datas, iunits in zip(args, units):  # merge into slope estimators
+        dim = datas[0].dims[0]  # currently always 'facets'
+        keys = sorted(set(key for arg in datas for key in arg.coords))
+        data, data1, data2, *_, rsq, _ = _get_regression(*datas, dim=dim, **kw_regress)
+        if iunits in non_feedback:  # defer to feedback labels
+            data.attrs.clear()
+        if iunits in non_feedback and not correlation:  # adjust to 2xco2 scaling
+            data, data1, data2 = 0.5 * data, 0.5 * data1, 0.5 * data2
+        for key in keys:
+            if any(key in idata.sizes for idata in datas):
+                continue  # non-scalar
+            if key in ('facets', 'version'):
+                continue  # multi-index
+            if any(key in idata.indexes.get('facets', index).names for idata in datas):
+                continue  # xarray bug: https://github.com/pydata/xarray/issues/7695
+            if any(key in idata.indexes.get('version', index).names for idata in datas):
+                continue  # xarray bug: https://github.com/pydata/xarray/issues/7695
+            coord = [idata.coords[key].item() for idata in datas if key in idata.coords]
+            dtype = np.asarray(coord[0]).dtype  # see process_data()
+            isnan = np.issubdtype(dtype, float) and np.isnan(coord[0])
+            if isnan or len(coord) == 1 or coord[0] == coord[1]:
+                value = coord[0]
+            elif key in ('start', 'stop'):
+                value = coord[1]  # kludge for constraints
+            else:  # WARNING: currently dropped by _get_scalars() below
+                value = np.array(None, dtype=object)  # see process_data()
+                value[...] = tuple(coord)
+            data.coords[key] = value
+        data.name = '|'.join((idata.name for idata in datas))
+        data11, data12 = data1.values.flat
+        data21, data22 = data2.values.flat
+        rsq = ureg.Quantity(rsq.item(), '').to('percent')
+        label = f'${rsq:~L.0f}$'.replace(r'\ ', '')
+        results.append(data)
+        boxes.append([data11, data21])
+        bars.append([data12, data22])
+        annotations.append(label)
+    return results, boxes, bars, annotations
+
+
+def _merge_commands(
+    dataset, arguments, kws_collection, intersect=False, correlation=False, standard=False, relative=False,  # noqa: E501
+    horizontal=False, outers=None, inners=None, restrict=None, scale=None, offset=None, missing=None,  # noqa: E501
 ):
     """
     Merge distributions into single array and prepare violin and bar plots.
@@ -1058,7 +1173,11 @@ def _merge_dists(
     intersect : bool, optional
         Whether to intersect coordinates on outer labels.
     correlation : bool, optional
-        Whether to show correlation coefficients.
+        Whether to instead show correlation coefficients.
+    standard : bool, optional
+        Whether to instead show standard error.
+    relative : bool, optional
+        Whether to instead show relative error.
     horizontal : bool, optional
         Whether to plot horizontally.
     outers : list of str, optional
@@ -1092,85 +1211,22 @@ def _merge_dists(
         raise RuntimeError(f'Unexpected combination of argument counts {nargs}.')
     if (nargs := nargs.pop()) not in (1, 2):
         raise RuntimeError(f'Unexpected number of arguments {nargs}.')
-    refwidth = 1 + 0.25 * len(arguments)  # default width (compare with below)
-    refheight = 2.0  # default thickness (compare with below)
-    # refheight = 2.5 if nargs == 1 else 2.0
-    non_feedback = (ureg.K, ureg.K / ureg.K, ureg.W / ureg.m ** 2)
     kw_collection = copy.deepcopy(kws_collection[0])  # deep copy of namedtuple
+    weight = kw_collection.other.get('weight', False)
+    refwidth = 1 + 0.25 * len(arguments)  # default width (compare with below)
+    refheight = 2.0  # previous: 2.5 if nargs == 1 else 2.0
     for kw, field in itertools.product(kws_collection, kws_collection[0]._fields):
         getattr(kw_collection, field).update(getattr(kw, field))
     if nargs == 1:
-        # Get violin data. To facillitate putting feedbacks and sensitivity in
-        # same panel, scale 4xCO2 values into 2xCO2 values. Also detect e.g.
-        # internal sensitivitye stimates and set all values to zero.
-        boxdata = bardata = annotations = None  # {{{
-        args = [data for (data,) in arguments]
-        units = [data.climo.units for data in args]
-        for i, iunits in enumerate(units):
-            data = args[i]
-            if iunits in non_feedback and data.name not in ('ts', 'tstd', 'tdev'):
-                data = 0.5 * data  # halve the spread
-                data.attrs.clear()  # defer to feedback labels
-                if np.all(np.abs(args[i]) < 0.1):  # pre-industrial forcing/sensitivity
-                    data = xr.zeros_like(data)
-                elif ureg.parse_units('W m^-2 K^-1') in units:
-                    data = data - 4  # adjust abrupt4xco2 ecs or erf to 2xco2
-                args[i] = data   # }}}
+        bars = boxes = annotations = []
+        args = [arg for (arg,) in arguments]
+        datas = _merge_dists(*args)
     else:
-        # Get regression data. To facillitate putting feedback and sensitivity
-        # regression coefficients in same panel, scale 4xCO2 values into 2xCO2 values.
-        # TODO: Support *difference between slopes* instead of slopes of difference
-        # and support user-input 'pctile' as with reduce_facets()?
-        args, boxdata, bardata, annotations = [], [], [], []  # {{{
-        index, units = pd.Index(()), [data.climo.units for *_, data in arguments]
-        weight = kw_collection.other.get('weight', False)
+        kw_merge = dict(weight=weight, correlation=correlation)
+        kw_merge.update(standard=standard, relative=relative)  # special options
         kw_collection.command.setdefault('width', 1.0)  # ignore staggered bars
         kw_collection.command['absolute_width'] = True
-        for iargs, iunits in zip(arguments, units):  # merge into slope estimators
-            dim = iargs[0].dims[0]  # currently always 'facets'
-            keys = sorted(set(key for arg in iargs for key in arg.coords))
-            kw_regress = dict(dim=dim, weight=weight, pctile=(50, 95), nofit=True)
-            result = _get_regression(*iargs, **kw_regress)
-            data, data_lower, data_upper, *_, rsq, _ = result
-            if correlation:
-                data.attrs['units'] = ''
-                data.attrs['short_name'] = 'correlation coefficient'
-            elif iunits in non_feedback:  # adjust to 2xco2 scaling
-                data.attrs.clear()  # NOTE: defer to feedback labels!
-                data, data_lower, data_upper = 0.5 * data, 0.5 * data_lower, 0.5 * data_upper  # noqa: E501
-            else:
-                data.attrs['units'] = f'{iargs[1].units} / ({iargs[0].units})'
-                data.attrs['short_name'] = 'regression coefficient'
-            for key in keys:
-                if any(key in arg.sizes for arg in iargs):
-                    continue  # non-scalar
-                if key in ('facets', 'version'):
-                    continue  # multi-index
-                if any(key in arg.indexes.get('facets', index).names for arg in iargs):
-                    continue  # xarray bug: https://github.com/pydata/xarray/issues/7695
-                if any(key in arg.indexes.get('version', index).names for arg in iargs):
-                    continue  # xarray bug: https://github.com/pydata/xarray/issues/7695
-                coords = [arg.coords[key].item() for arg in iargs if key in arg.coords]
-                dtype = np.asarray(coords[0]).dtype  # see process_data()
-                isnan = np.issubdtype(dtype, float) and np.isnan(coords[0])
-                if isnan or len(coords) == 1 or coords[0] == coords[1]:
-                    value = coords[0]
-                elif key in ('start', 'stop'):
-                    value = coords[1]  # kludge for constraints
-                else:  # WARNING: currently dropped by _get_scalars() below
-                    value = np.array(None, dtype=object)  # see process_data()
-                    value[...] = tuple(coords)
-                data.coords[key] = value
-            data.name = '|'.join((arg.name for arg in iargs))
-            data_lower1, data_lower2 = data_lower.values.flat
-            data_upper1, data_upper2 = data_upper.values.flat
-            rsq = ureg.Quantity(rsq.item(), '').to('percent')
-            annotation = f'${rsq:~L.0f}$'.replace(r'\ ', '')
-            # annotation = f'${corr.item():.2f}$'  # latex for long dash minus sign
-            args.append(data)
-            boxdata.append([data_lower1, data_upper1])
-            bardata.append([data_lower2, data_upper2])
-            annotations.append(annotation)  # }}}
+        datas, boxes, bars, annotations = _merge_pairs(*arguments, **kw_merge)
 
     # Infer inner and outer coordinates
     # TODO: Switch to tuples=True and support tuple coords in _setup_command
@@ -1179,7 +1235,7 @@ def _merge_dists(
     # labels on the legend and only denote "outer-most" coordinates with outer labels.
     kws_outer, kws_inner = {}, {}  # {{{
     kw_scalar, kw_vector, kw_outer, kw_inner = {}, {}, {}, {},
-    kw_coords = _get_scalars(*args, pairs=True)  # select second pair
+    kw_coords = _get_scalars(*datas, pairs=True)  # select second pair
     kw_counts = {key: len(list(itertools.groupby(value))) for key, value in kw_coords.items()}  # noqa: E501
     for key, values, count in zip(kw_coords, kw_coords.values(), kw_counts.values()):
         if key == 'units':  # used for queue identifiers
@@ -1260,23 +1316,23 @@ def _merge_dists(
     # tuples along rows instead of ragged arrays. Use proplot workaround below.
     # NOTE: Only 'project' and 'institute' levels of 'components' are used elsewhere
     keys = ('short_prefix', 'short_suffix', 'short_name', 'units')  # {{{
-    attrs = {key: val for data in args for key, val in data.attrs.items() if key in keys}  # noqa: E501
     locs = np.array(locs or np.arange(len(kws_inner)), dtype=float)
+    attrs = {key: val for data in datas for key, val in data.attrs.items() if key in keys}  # noqa: E501
     if nargs == 1:  # violin plot arguments
-        values = np.empty(len(args), dtype=object)
-        values[:len(args)] = [tuple(data.values) for data in args]
+        values = np.empty(len(datas), dtype=object)
+        values[:len(datas)] = [tuple(data.values) for data in datas]
     else:
-        values = [data.item() for data in args]
+        values = [data.item() for data in datas]
         values = np.array(values)
-    name = args[0].name
+    name = datas[0].name
     index = pd.MultiIndex.from_arrays(list(kw_vector.values()), names=list(kw_vector))
     coords = {'components': index, **kw_scalar}
     values = xr.DataArray(values, name=name, dims='components', attrs=attrs, coords=coords)  # noqa: E501
     labels = labels_outer if intersect else labels_inner
-    if boxdata:
-        kw_collection.command.update(boxdata=np.array(boxdata).T, **KWARGS_ERRBOX)
-    if bardata:
-        kw_collection.command.update(bardata=np.array(bardata).T, **KWARGS_ERRBAR)
+    if boxes:
+        kw_collection.command.update(boxdata=np.array(boxes).T, **KWARGS_ERRBOX)
+    if bars:
+        kw_collection.command.update(bardata=np.array(bars).T, **KWARGS_ERRBAR)
     if labels:  # used for legend entries
         values.coords['label'] = ('components', labels)
     if annotations:  # used for _format_bars annotations
@@ -1713,7 +1769,7 @@ def _setup_defaults(
     stop = np.where(mask2, fill2, stop)
 
     # Standardize coordinates for inferring default properties
-    # WARNING: Coordinates created by _merge_dists might have NaN in place
+    # WARNING: Coordinates created by _merge_commands might have NaN in place
     # of None values in combination with other floats. Also np.isnan raises float
     # casting errors and 'is np.nan' can fail for some reason. So take advantage of
     # the property that np.nan != np.nan evaluates to true unlike all other objects.
@@ -1733,7 +1789,7 @@ def _setup_defaults(
     for idx in index:  # iterate over multi-index values
         idxs = dict(zip(index.names, np.atleast_1d(idx)))
         keys = tuple(key for name, key in idxs.items() if name not in exclude)
-        others.append(keys[-1])  # maximum of single value
+        others.append(keys and keys[-1] or None)  # maximum of single value
 
     # General settings associated with coordinates
     # NOTE: Here 'cycle' used for groups without other settings by default.
@@ -1761,13 +1817,13 @@ def _setup_defaults(
 
     # Additional settings dependent on input coordinates
     # NOTE: Here ignore input 'cycle' if autocolor was passed. Careful to support
-    # both _merge_dists() regression bars/violins and distribution bar plots.
+    # both _merge_commands() regression bars/violins and distribution bar plots.
     # order = [*early, *late, *full, *control]
     # seen = set(order)  # previously used for 'autocolor'
     # colors = [key for key in order if key in color]
     # colors.extend((key for key in color if key not in seen and not seen.add(key)))
     if autocolor:  # {{{
-        color, neutral = options, ()  # color based on experiment and period
+        color, neutral = options, ()  # colors based on experiment and period
         if len(set(options)) == 1:  # e.g. cmip5 vs. cmip6 regressions
             base, cold, warm = options[:1], (), ()
         elif not set(options) & set(early):  # no early-late partition
@@ -1778,7 +1834,7 @@ def _setup_defaults(
             base, cold, warm, neutral = control, early, (*late, *full), ()
         colors = (('gray7', 'cyan7', 'pink7', 'yellow7'), (base, cold, warm, neutral))
         colors = {key: color for color, keys in zip(*colors) for key in keys}
-    else:  # automatic colors based on inner variables
+    else:  # colors based on inner variables
         seen = set()  # record auto-generated color names
         color = others if len(set(others)) > 1 else options
         colors = [key for key in color if key not in seen and not seen.add(key)]
@@ -1962,7 +2018,7 @@ def _setup_violins(
     kw_collection = copy.deepcopy(kw_collection)  # {{{
     if not isinstance(data, xr.DataArray) or data.dtype != object or data.ndim != 1:
         raise ValueError('Unexpected input array for violin plot formatting.')
-    scale = 100  # highest precision of 'offset' used in _merge_dists
+    scale = 100  # highest precision of 'offset' used in _merge_commands
     locs = locs - np.min(locs)  # ensure starts at zero
     locs = np.round(scale * locs).astype(int)
     step = np.gcd.reduce(locs)  # e.g. 100 if locs were integer, 50 if were [1, 2.5, 4]
@@ -1976,7 +2032,7 @@ def _setup_violins(
         color = [np.array(color).item()] * len(locs)
     orient = 'h' if horizontal else 'v'  # different convention
     axis = 'y' if horizontal else 'x'
-    ticks = np.array(kw_collection.axes.get(f'{axis}ticks', 1))  # see _merge_dists
+    ticks = np.array(kw_collection.axes.get(f'{axis}ticks', 1))  # see _merge_commands
 
     # Concatenate array and update keyword args
     # WARNING: Critical to keep 'components' because formatting in _format_axes despends
@@ -2044,6 +2100,7 @@ def general_plot(
     cbarwrap=None,
     cbarpad=None,
     cbarspace=None,
+    cbarlabelpad=None,
     leggroup=None,
     legcols=None,
     legpad=None,
@@ -2130,6 +2187,8 @@ def general_plot(
         Padding for colorbar and legend entries.
     cbarspace, legspace : float, optional
         Space for colorbar and legend entries.
+    cbarlabelpad : float, optional
+        Space for colorbar axis labels.
     save : path-like, optional
         Save folder base location. Stored inside a `figures` subfolder.
     suffix : str, optional
@@ -2241,7 +2300,7 @@ def general_plot(
             cycle = kw_collection.other.get('cycle')
             attrs = kw_collection.attrs.copy()
             args, method, default = process_data(dataset, *kw_process, attrs=attrs)
-            kw_dists = _pop_kwargs(kw_collection.other.copy(), _merge_dists)
+            kw_dists = _pop_kwargs(kw_collection.other.copy(), _merge_commands)
             for key, value in kw_dists.items():  # noqa: E501
                 kw_merge.setdefault(key, value)
             for key, value in default.items():  # also adds 'method' key
@@ -2265,7 +2324,7 @@ def general_plot(
         if len(set(dims)) > 1:
             raise RuntimeError(f'Incompatible array dimensions for single subplot: {dims}')  # noqa: E501
         if not dims[0] and len(arguments) > 1:  # concatenate and add label coordinate
-            args, kw_collection = _merge_dists(dataset, arguments, kws_collection, **kw_merge)  # noqa: E501
+            args, kw_collection = _merge_commands(dataset, arguments, kws_collection, **kw_merge)  # noqa: E501
             arguments, kws_collection = (args,), (kw_collection,)
         if not dims[0] and len(arguments) == 1 and 'facets' in arguments[0][-1].dims:
             coords = _get_annotations(arguments[0][-1])
@@ -2441,8 +2500,8 @@ def general_plot(
             # Update and setup plots
             # WARNING: Critical to call format before _format_axes so default label
             # and locator corrections can be overridden by user input.
-            group, other = kw_other.get('group'), kw_other.get('other')  # {{{
-            axis, lons, lats = 'x' if 'x' in command else 'y', (130, 280), (-60, 60)
+            axis = 'x' if 'x' in command else 'y'  # {{{
+            group, other = kw_other.get('group'), kw_other.get('other')
             autoscale = getattr(ax, f'get_autoscale{axis}_on')()
             geographic = set(getattr(args[-1], 'dims', ())) == {'lon', 'lat'}
             ax.format(**{key: val for key, val in kw_axes.items() if 'proj' not in key})
@@ -2469,7 +2528,7 @@ def general_plot(
                 keys = ('fontsize', _format_scatter, process_constraint)
                 kwarg = _pop_kwargs({**kw_axes, **kw_other}, *keys)
                 oneone = oneone or kw_other.get('oneone', False)
-                handle = _format_scatter(ax, *args, handle, source=dataset, **kwarg)
+                handle = _format_scatter(ax, *args, handle, dataset=dataset, **kwarg)
             if 'line' in command and autoscale:
                 arg = data.values.copy()
                 arg[~np.isfinite(arg)] = np.nan
@@ -2490,9 +2549,9 @@ def general_plot(
             # NOTE: This optionally calculates and possibly shows spatial constraints
             # and adds hatching to region ignored by calculation.
             if geographic and other in groups_compare:  # {{{
-                iargs, dims = (groups_compare[other], args[-1]), ('lon', 'lat')
-                iargs = [arg.sel(lon=slice(*lons), lat=slice(*lats)) for arg in iargs]
-                value, defaults = _reduce_datas(*iargs, compare, dim=dims, ocean=True)
+                iargs = (groups_compare[other], args[-1], compare)
+                ikwarg = dict(dim=('lon', 'lat'), mask='pac', ocean=True)
+                value, defaults = _reduce_datas(*iargs, **ikwarg)
                 keys, kwarg = ('project', 'start', 'stop', 'period'), dict((*group, *other))  # noqa: E501
                 msg = get_labels([(kwarg,)], restrict=keys, identical=True)
                 print(f' {msg}: {compare} {value.item():.3f} {value.units}', end='')
@@ -2504,17 +2563,21 @@ def general_plot(
                 label = defaults['symbol'] + rf'${equal}{value}\,{units}$'
                 ax.format(lrtitle=label, titleweight='bold')
             if geographic and any(_ in groups_compare for _ in (other, group)):
-                lon0 = ax.projection.proj4_params.get('lon_0', 0)  # prime meridian
+                from observed.arrays import REGION_MASKS
+                lon0 = ax.projection.proj4_params.get('lon_0', 0)
                 ocean = cfeature.NaturalEarthFeature('physical', 'ocean', '110m')
                 ocean = union_all(list(ocean.geometries()))
-                globe1 = [(lon0 - 179, i, 180, i + 10) for i in range(-90, 90, 10)]
-                globe2 = [(-180, i, lon0 - 181, i + 10) for i in range(-90, 90, 10)]
-                globe = union_all([Polygon.from_bounds(*_) for _ in (*globe1, *globe2)])
-                box1 = Polygon.from_bounds(lons[0], lats[0], 180, lats[1])
-                box2 = Polygon.from_bounds(-180, lats[0], lons[1] - 360, lats[1])
-                box = box1.union(box2).intersection(ocean)  # spatial correlation
-                kwarg = dict(fc='none', ec='gray8', alpha=0.6, lw=0, hatch='....')
-                ax.add_patch(_polygon_patch(globe.difference(box), **kwarg))
+                globe1 = [(lon0 - 179, i, 180, i + 10) for i in range(-90, 90, 5)]
+                globe2 = [(-180, i, lon0 - 181, i + 10) for i in range(-90, 90, 5)]
+                boxes = [Polygon.from_bounds(*_) for _ in (*globe1, *globe2)]
+                boxes, globe = [], union_all(boxes)
+                for bnds in REGION_MASKS['pac']:
+                    (lon1, lon2), (lat1, lat2) = bnds['lon'], bnds['lat']
+                    boxes.append(Polygon.from_bounds(lon1, lat1, lon2, lat2))
+                box = union_all(boxes).intersection(ocean)  # spatial correlation
+                box = globe.difference(box)  # spatial region
+                kwarg = dict(fc='none', ec='gray8', alpha=0.6, lw=0, hatch='......')
+                ax.add_patch(_polygon_patch(box, **kwarg))
 
             # Group individual legend or colorbar labels
             # TODO: Optionally do *automatic* grouping of colorbars when they were
@@ -2597,7 +2660,9 @@ def general_plot(
                     kw_guide.setdefault(key, value)
                 for ihandle, ilabel in zip(handles, labels):
                     ilabel = _split_label(ilabel, refwidth=size)
-                    src.colorbar(ihandle, loc=loc, label=ilabel, **kw_guide)
+                    obj = src.colorbar(ihandle, loc=loc, label=ilabel, **kw_guide)
+                    if cbarlabelpad is not None:
+                        obj.set_label(ilabel, labelpad=cbarlabelpad)
 
     # Adjust shared units
     # WARNING: This is a kludge. Should consider comparing shared axes instead of
@@ -2726,8 +2791,9 @@ def general_plot(
         if not isinstance(save, str):
             name = '_'.join((methods, pathlabel, commands, indicator))
         path = path / name
-        figwidth, figheight = fig.get_size_inches()
-        figsize = f'{figwidth:.1f}x{figheight:.1f}in'  # figure size
+        # fig.auto_layout(tight=True)  # adjust size
+        width, height = fig.get_size_inches()
+        figsize = f'{width:.1f}x{height:.1f}in'  # figure size
         print(f'Saving ({figsize}): ~/{path.relative_to(Path.home())}')
         fig.save(path)  # optional extension
     return fig, fig.subplotgrid  # }}}

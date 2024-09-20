@@ -154,6 +154,8 @@ GENERAL_LABELS = {
     ('startstop', (2, 50)): 'year 2--50',
     ('startstop', (20, 150)): 'late',
     ('startstop', (100, 150)): 'year 100--150',
+    ('startstop', (0, 23)): None,  # merged scalar data
+    ('startstop', (0, 24)): None,  # merged scalar data
     ('region', 'globe'): 'global-$T$',
     ('region', 'point'): 'local-$T$',
     ('region', 'latitude'): 'zonal-$T$',
@@ -167,7 +169,8 @@ GENERAL_LABELS = {
     ('initial', 'jan'): None,  # avoid adding labels to merged distributions
     ('period', 'full'): None,
     ('period', '20yr'): None,
-    ('period', '23yr'): None,
+    ('period', '23yr'): None,  # scalar data
+    ('period', '24yr'): None,  # scalar data
     ('period', '50yr'): None,
     ('remove', 'climate'): None,
     ('remove', 'average'): None,
@@ -175,6 +178,11 @@ GENERAL_LABELS = {
     ('detrend', 'x'): None,  # avoid adding labels to merged distributions
     ('detrend', 'y'): None,
     ('detrend', 'xy'): None,
+    ('detrend', 'yx'): None,
+    ('detrend', 'i'): None,  # avoid adding labels to merged distributions
+    ('detrend', 'j'): None,
+    ('detrend', 'ij'): None,
+    ('detrend', 'ji'): None,
     ('error', 'regression'): None,
     ('error', 'internal'): 'internal',
     ('correct', ''): None,  # TODO: revisit this
@@ -230,6 +238,8 @@ GENERAL_PATHS = {
     ('startstop', (0, 50)): 'early50',
     ('startstop', (20, 150)): 'late',
     ('startstop', (100, 150)): 'late50',
+    ('startstop', (0, 23)): '23yr',  # merged scalar data
+    ('startstop', (0, 24)): '24yr',  # merged scalar data
     ('region', 'point'): 'loc',
     ('region', 'latitude'): 'lat',
     ('region', 'hemisphere'): 'hemi',
@@ -245,6 +255,10 @@ GENERAL_PATHS = {
     ('detrend', 'x'): 'rawy',
     ('detrend', 'y'): 'rawx',
     ('detrend', 'xy'): None,
+    ('detrend', 'i'): 'trendx',
+    ('detrend', 'j'): 'trendy',
+    ('detrend', 'ij'): 'trend',
+    ('detrend', 'ji'): 'trend',
     ('error', 'regression'): None,
     ('error', 'internal'): 'int',
     ('correct', ''): None,
@@ -773,7 +787,9 @@ def get_label(key, value, mode=None, dataset=None, experiment=True):
             if part and '|' in part:
                 *_, part = part.split('|')  # numerator in pattern regression
             part = ALIAS_VARIABLES.get(part, part)
-            if part and part in translate_operator:
+            if not part:
+                label = None
+            elif part in translate_operator:
                 label = part if mode == 'path' else translate_operator[part]
             elif part in (*options, *dataset.coords):
                 label = part  # e.g. get_label('name', 'experiment')
@@ -1045,16 +1061,16 @@ def parse_spec(dataset, spec, **kwargs):
     # Initial stuff
     # NOTE: This only works for optional keyword arguments with explicit defaults
     # and only for methods that have not been obfuscated (see _format_signature).
-    from .general import _merge_dists, _init_command, _props_command  # {{{
-    from .general import _setup_axes, _setup_bars, _setup_scatter
+    from .general import _format_axes, _format_bars, _format_scatter  # {{{
+    from .general import _merge_commands, _setup_command, _setup_defaults
     from .process import get_result, process_constraint
     from .reduce import reduce_facets, _reduce_data, _reduce_datas
     formats = tuple(pplt.Axes._format_signatures.values())
-    others = (_merge_dists, _init_command, _props_command)
-    setups = _setup_axes, _setup_bars, _setup_scatter
-    spaces = [k + s for k in ('span', 'share', 'align') for s in ('', 'x', 'y')]
-    sizes = [k + s for k in ('', 'ax', 'ref', 'fig') for s in ('', 'num', 'width', 'height', 'aspect')]  # noqa: E501
+    others = (_format_axes, _format_bars, _format_scatter)
+    others = (*others, _merge_commands, _setup_command, _setup_defaults)
+    grids = [k + s for k in ('', 'ax', 'ref', 'fig') for s in ('', 'num', 'width', 'height', 'aspect')]  # noqa: E501
     props = ('c', 'lw', 'color', 'linewidth', 'facecolor', 'edgecolor', 'a', 'alpha')
+    subs = [k + s for k in ('span', 'share', 'align') for s in ('', 'x', 'y')]
     if spec is None:
         name, kw = None, {}
     elif isinstance(spec, str):
@@ -1070,17 +1086,18 @@ def parse_spec(dataset, spec, **kwargs):
     # WARNING: Critical to always parse facet and version levels since figures.py will
     # auto apply these coordinates even if not present e.g. for bootstrap datasets. Then
     # have process.py ignore them when version is not present.
-    internal = '23yr' if '23yr' in getattr(dataset, 'period', []) else '20yr'
-    institute = kw.get('institute', None)  # {{{
+    values = getattr(dataset, 'period', [])  # {{{
+    period = '24yr' if '24yr' in values else '23yr' if '23yr' in values else '20yr'
+    source = kw.get('source', None)  # TODO: remove kludge?
+    institute = kw.get('institute', None)
     bootstrap = kw.pop('bootstrap', None)  # TODO: remove kludge?
     experiment = kw['experiment'] or 'abrupt4xco2' if 'experiment' in kw else None
-    kw.update({'institute': None} if institute == 'wgt' else {})
     kw_process = _pop_kwargs(kw, dataset, get_result, reduce_facets, _reduce_data, _reduce_datas)  # noqa: E501
     kw_attrs = _pop_kwargs(kw, 'short_name', 'long_name', 'standard_name', 'units')
     kw_grid = _pop_kwargs(kw, pplt.GridSpec._update_params)  # overlaps kw_figure
-    kw_figure = _pop_kwargs(kw, *spaces, *sizes, pplt.Figure._format_signature)
+    kw_figure = _pop_kwargs(kw, *subs, *grids, pplt.Figure._format_signature)
     kw_axes = _pop_kwargs(kw, *formats, pplt.Figure._parse_proj)
-    kw_other = _pop_kwargs(kw, *setups, *others, process_constraint)
+    kw_other = _pop_kwargs(kw, *others, process_constraint)
     kw_command = _pop_kwargs(kw, 'cmap', 'cycle', 'extend', *props)
     kw_config = _pop_kwargs(kw, tuple(_rc_nodots))  # overlaps kw_command (see above)
     kw_guide = _pop_kwargs(kw, pplt.Axes._add_legend, pplt.Axes._add_colorbar)
@@ -1094,12 +1111,16 @@ def parse_spec(dataset, spec, **kwargs):
     # NOTE: For subsequent processing we put the variables being combined (usually one)
     # inside process 'name' key. This helps when merging variable specifications
     # between row and column specs and between tuple-style specs (see parse_specs).
+    if source == 'merged' and name in (None, 'tstd', 'tdev', 'tpat', 'tabs'):
+        kw_process.pop('source', None)  # merged scalar spatial data
+    if institute == 'wgt':
+        kw_process.pop('institute', None)
     if institute == 'wgt':
         kw_other['weight'] = kw_process['weight'] = True
     if name is not None:
         kw_process['name'] = name
     if bootstrap is not None and experiment == 'picontrol':
-        kw_process['period'] = internal if bootstrap else 'full'  # overwrite control
+        kw_process['period'] = period if bootstrap else 'full'  # overwrite control
     elif bootstrap is not None and experiment == 'abrupt4xco2':
         kw_process['period'] = kw_process.get('period', 'full')  # avoid using control
     if 'width' in kw_figure:  # bar widths

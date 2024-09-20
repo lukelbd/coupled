@@ -152,9 +152,9 @@ def _update_attrs(dataset, boundary=None):
             head = boundary if len(options) > 1 else ''
             long = f'{head} {tail} {short}'
             long = re.sub('  +', ' ', long).strip()
+            data.attrs['units'] = units  # enforce convention
             data.attrs['long_name'] = long
             data.attrs['short_name'] = short
-            data.attrs.setdefault('units', units)
             if suffix == 'ecs' and 'lon' in dataset[name].dims:
                 dataset = dataset.drop_vars(name)
 
@@ -705,12 +705,12 @@ def feedback_datasets(
         )
         if 'region' in dataset.coords:  # xarray bug: https://github.com/pydata/xarray/issues/7695  # noqa: E501
             dataset = dataset.drop_vars(['version', 'concat', 'region'])
-        dataset = dataset.assign_coords(version=version)
-        dataset = dataset.squeeze()
         for name, array in noncat.items():
             dataset[name] = array
         if standardize:
             dataset = _standardize_order(dataset)
+        dataset = dataset.assign_coords(version=version)
+        dataset = dataset.squeeze()
         datasets[facets] = dataset
 
     if datasets:

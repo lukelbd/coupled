@@ -173,6 +173,10 @@ def open_scalar(path=None, ceres=False, suffix=None):
     names = [key for key, coord in data.coords.items() if coord.dims == ('facets',)]
     if names:  # facet levels
         data = data.set_index(facets=names)
+    if 'model' in names:  # remove excluded
+        idx = names.index('model')
+        isel = [facet[idx] not in FACETS_EXCLUDE for facet in data.facets.values]
+        data = data.isel(facets=isel)
     names = [key for key, coord in data.coords.items() if coord.dims == ('version',)]
     if names:  # version levels
         data = data.set_index(version=names)
@@ -263,10 +267,12 @@ def open_dataset(
             kwargs = {**constraints, 'project': project, 'standardize': False, **kw}
             parts = function(*paths, **kwargs)
             for facets, dataset in parts.items():
-                if facets in datasets:  # e.g. combine 'version' coordinates
-                    comb = (datasets[facets], dataset)
-                    dataset = xr.combine_by_coords(comb, combine_attrs='override')
-                datasets[facets] = dataset
+                base = datasets.get(facets, None)
+                kwargs = {'combine_attrs': 'override'}
+                if base is None:  # e.g. combine 'version' coordinates
+                    datasets[facets] = dataset
+                else:
+                    datasets[facets] = xr.combine_by_coords((base, dataset), **kwargs)
 
     # Concatenate and standardize datasets
     # NOTE: Critical to use 'override' for combine_attrs in case models
@@ -285,8 +291,7 @@ def open_dataset(
                 array = array.expand_dims(version=dataset.version.size)
                 array = array.assign_coords(version=dataset.version)
             dataset[name] = array
-    print()
-    print('Concatenating datasets.')
+    print('\nConcatenating datasets.')
     if not datasets:
         raise ValueError('No datasets found.')
     facets = xr.DataArray(

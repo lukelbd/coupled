@@ -363,6 +363,9 @@ def build_specs(outer='breakdown', pairs=None, product=None, maxcols=None, **kwa
     kws_outer = [kw for kw in kws_outer if kw]  # single gridspec
     kws_inner = _get_dicts(*kws_inner)  # inner reduce pairs
     kws_inner = [kw or [{}] for kw in kws_inner]
+    cnts, cmax = list(map(len, kws_inner)), max(map(len, kws_inner))
+    kws_inner[0] *= cmax if cnts[0] == 1 else 1  # match lengths
+    kws_inner[1] *= cmax if cnts[1] == 1 else 1
     return *kws_outer, *kws_inner, kwargs
 
 

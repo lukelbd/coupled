@@ -3,6 +3,7 @@
 Utilities for reducing coupled model data coordinates.
 """
 import functools
+import math
 import re
 import warnings
 
@@ -62,25 +63,25 @@ OBSERVED_DEFAULTS = {
 # NOTE: WPG and ENSO regions defined in https://doi.org/10.1175/JCLI-D-12-00344.1 and
 # https://doi.org/10.1038/s41598-021-99738-3, tropical ratio and feedback regions in
 # https://doi.org/10.1175/JCLI-D-18-0843.1 and https://doi.org/10.1175/JCLI-D-17-0087.1.
-# 'wpac': {'lat_lim': (-15, 15), 'lon_lim': (90, 150)},  # based on own feedbacks
-# 'epac': {'lat_lim': (-30, 0), 'lon_lim': (260, 290)},
-# 'wpac': {'lat_lim': (-15, 15), 'lon_lim': (150, 170)},  # paper based on +4K
-# 'epac': {'lat_lim': (-30, 0), 'lon_lim': (260, 280)},
-AREA_REGIONS = {
-    'so': {'lat_lim': (-60, -30)},  # labeled 'southern ocean'
-    'se': {'lat_lim': (-60, -30)},  # labeled 'southern extratropics'
-    'ne': {'lat_lim': (30, 60)},
-    'sh': {'lat_lim': (-90, 0)},
-    'nh': {'lat_lim': (0, 90)},
-    'trop': {'lat_lim': (-30, 30)},
-    'tpac': {'lat_lim': (-30, 30), 'lon_lim': (120, 280)},
-    'pool': {'lat_lim': (-30, 30), 'lon_lim': (50, 200)},
-    'wpac': {'lat_lim': (-15, 15), 'lon_lim': (90, 150)},  # slightly reduced bounds
-    'epac': {'lat_lim': (-30, 0), 'lon_lim': (260, 290)},
-    'nina': {'lat_lim': (0, 10), 'lon_lim': (130, 150)},
-    'nino': {'lat_lim': (-5, 5), 'lon_lim': (190, 240)},
-    'nino3': {'lat_lim': (-5, 5), 'lon_lim': (210, 270)},
-    'nino4': {'lat_lim': (-5, 5), 'lon_lim': (160, 210)},
+# 'wpac': {'lat': (-15, 15), 'lon': (90, 150)},  # based on own feedbacks
+# 'epac': {'lat': (-30, 0), 'lon': (260, 290)},
+# 'wpac': {'lat': (-15, 15), 'lon': (150, 170)},  # paper based on +4K
+# 'epac': {'lat': (-30, 0), 'lon': (260, 280)},
+TRUNCATE_REGIONS = {
+    'so': {'lat': (-60, -30)},  # 'southern ocean'
+    'se': {'lat': (-60, -30)},  # 'southern extratropics'
+    'ne': {'lat': (30, 60)},  # 'northern extratropic'
+    'sh': {'lat': (-90, 0)},  # 'southern hemisphere'
+    'nh': {'lat': (0, 90)},  # 'northern hemisphere'
+    'trop': {'lat': (-30, 30)},  # 'tropical'
+    'tpac': {'lat': (-30, 30), 'lon': (120, 280)},  # 'tropical pacific'
+    'wpac': {'lat': (-15, 15), 'lon': (90, 150)},  # 'west pacific'
+    'epac': {'lat': (-30, 0), 'lon': (260, 290)},  # 'east pacific'
+    'nina': {'lat': (0, 10), 'lon': (130, 150)},  # 'warm pool'
+    'pool': {'lat': (-30, 30), 'lon': (50, 200)},  # 'warm pool'
+    'nino': {'lat': (-5, 5), 'lon': (190, 240)},  # 'cold tongue'
+    'nino3': {'lat': (-5, 5), 'lon': (210, 270)},  # 'cold tongue'
+    'nino4': {'lat': (-5, 5), 'lon': (160, 210)},  # 'cold tongue'
 }
 
 
@@ -110,17 +111,23 @@ def _get_weights(data, dim=None):
     keys = list({'model', 'ensemble'} & set(index.names))
     groups = coord.reset_index(keys, drop=True)
     groups = groups.coords[dim]  # values on data array unchanged
-    groups = groups.assign_coords(facets=coord)
+    with warnings.catch_warnings():  # xarray future warning
+        warnings.simplefilter('ignore')
+        groups = groups.assign_coords(facets=coord)
     groups = groups.drop_vars(groups.coords.keys() & set(index.names))  # xarray bug
-    with warnings.catch_warnings():
+    with warnings.catch_warnings():  # xarray future warning
         warnings.simplefilter('ignore')
         grps = wgts.groupby(groups, squeeze=False)
-        wgts = grps / grps.sum()
-    wgts = wgts.assign_coords({dim: coord})
+    wgts = grps / grps.sum()
+    with warnings.catch_warnings():  # xarray future warning
+        warnings.simplefilter('ignore')
+        wgts = wgts.assign_coords({dim: coord})
     return wgts
 
 
-def _get_regression(data0, data1, dim=None, weight=False, **kwargs):
+def _get_regression(
+    data0, data1, dim=None, weight=False, standard=False, relative=False, **kwargs,
+):
     """
     Return regression along facets possibly weighted by model count.
 
@@ -133,24 +140,35 @@ def _get_regression(data0, data1, dim=None, weight=False, **kwargs):
     dim : str, default: 'facets'
         The regression dimension.
     weight : bool, optional
-        Whether to weight by model count.
+        Whether to weight the regression by model count.
+    standard : bool, optional
+        Whether to instead return the standard error.
+    relative : bool, optional
+        Whether to instead return the relative error.
     **kwargs
         Passed to `regress_dims`.
 
     Returns
     -------
-    slope, slope_lower, slope_upper : xarray.DataArray
+    slope, stat1, stat2 : xarray.DataArray
         The regression estimate and uncertainty bounds.
-    fit, fit_lower, fit_upper, rss : xarray.DataArray, optional
-        The least squares fit and residual root sum of squares.
+    fit, fit1, fit2, rse : xarray.DataArray, optional
+        The least squares fit and regression standard error.
     rsq, dof : xarray.DataArray
         The variance explained and degrees of freedom.
     """
     # NOTE: This uses N - 2 degrees of freedom for residual variance, has significant
     # effect. See: https://en.wikipedia.org/wiki/Errors_and_residuals#Regressions
+    # NOTE: Here model emergent constraint uncertainty using sigma_b * x + sigma_e
+    # where sigma_b = sigma_e / sigma_x is the slope uncertainty, and this is the
+    # same as sigma_b * (x + sigma_x). Can compare bars to estimate constraint. Also
+    # note regression model has two degrees of freedom, so when modeling constraint
+    # should sample slope and intercept uncertainty independently... probably.
     from observed.arrays import regress_dims
     dim = dim or 'facets'
     kwargs.update(manual=True, correct=False, nobnds=False)
+    if standard or relative:  # required for residual sum of squares
+        kwargs['nofit'] = False
     if not weight:
         wgts = xr.ones_like(data0.coords[dim], dtype=float)
     elif dim == 'facets':
@@ -163,14 +181,31 @@ def _get_regression(data0, data1, dim=None, weight=False, **kwargs):
         data1 = data1.drop_vars(data1.coords.keys() & set(index.names))
     result = regress_dims(data0, data1, dim=dim, weights=wgts, **kwargs)
     coords = {'facets': data0.coords['facets']} if dim == 'facets' else {}
-    slope, slope_lower, slope_upper, *fits, rsq, dof = result
-    if fits:  # i.e. nofit=False
+    stat, stat1, stat2, *fits, rsq, dof = result
+    if not standard and not relative:
+        units = f'{data1.units} / ({data0.units})'
+        stat.attrs['short_name'] = 'regression coefficient'
+        stat.attrs['units'] = stat1.attrs['units'] = stat2.attrs['units'] = units
+    if fits:  # drop_vars() is xarray bug: https://github.com/pydata/xarray/issues/7695
         fits = [fit.drop_vars(fit.coords.keys() & {'facets'}) for fit in fits]
-        rss = wgts * (data1 - fits[0]) ** 2
-        rss = np.sqrt(rss.sum(dim, skipna=True) / (wgts.sum() - 2))
-        fits = [fit.assign_coords(coords) for fit in fits]  # xarray bug (see above)
-        fits = (*fits, rss)
-    return slope, slope_lower, slope_upper, *fits, rsq, dof
+        rss = (wgts * (data1 - fits[0]) ** 2).sum(dim, skipna=True)  # residual squares
+        rse = np.sqrt(rss / (wgts.sum() - 2))  # weighted regression standard error
+        fits = [fit.assign_coords(coords) for fit in fits] + [rse]
+    if fits and standard:  # propagate constraint uncertainty (see notes)
+        xbar = data0.weighted(wgts).mean(dim, skipna=True)
+        sxx = np.sqrt(((data0 - xbar) ** 2).weighted(wgts).sum(dim, skipna=True))
+        stat, stat1, stat2 = (sxx * _ for _ in (stat, stat1, stat2))
+        stat.attrs['units'] = stat1.attrs['units'] = stat2.attrs['units'] = data1.units
+        stat.attrs['short_name'] = 'standard error'
+    if fits and relative:  # propagate constraint uncertainty (see notes)
+        xbar = data0.weighted(wgts).mean(dim, skipna=True)
+        sxx = np.sqrt(((data0 - xbar) ** 2).weighted(wgts).sum(dim, skipna=True))
+        ybar = data1.weighted(wgts).mean(dim, skipna=True)
+        syy = np.sqrt(((data1 - ybar) ** 2).weighted(wgts).sum(dim, skipna=True))
+        stat, stat1, stat2 = (sxx * _ / syy for _ in (stat, stat1, stat2))
+        stat.attrs['units'] = stat1.attrs['units'] = stat2.attrs['units'] = ''
+        stat.attrs['short_name'] = 'relative error'
+    return stat, stat1, stat2, *fits, rsq, dof
 
 
 def _get_composite(data0, data1, pctile=None, dim='facets'):
@@ -258,12 +293,15 @@ def _get_filters(facets, project=None, institute=None):
         if 'model' not in idx.names:  # already averaged or selected
             return data
         idx = idx.droplevel('model')  # preserve institute experiment
-        grp = xr.DataArray(idx, name='facets', dims='facets', attrs=data.facets.attrs)
-        data = data.groupby(grp).mean(skipna=False, keep_attrs=True)
-        index = data.indexes['facets']  # WARNING: xarray bug drops level names
-        index.names = idx.names
-        index = xr.DataArray(index, dims='facets', attrs=grp.attrs)
-        return data.climo.replace_coords(facets=index)
+        group = xr.DataArray(idx, name='facets', dims='facets', attrs=data.facets.attrs)
+        group = group.drop_vars('facets')  # WARNING: recent xarray bug
+        result = data.groupby(group).mean(skipna=False, keep_attrs=True)
+        coord = result.indexes['facets']
+        coord.names = idx.names  # WARNING: older xarray bug
+        coord = xr.DataArray(coord, dims='facets', attrs=group.attrs)
+        with warnings.catch_warnings():  # xarray future warning
+            warnings.simplefilter('ignore')
+            return result.climo.replace_coords(facets=coord)
     idx = 1 + any('CMIP' in facet[0] for facet in facets if len(facet) > 0)
     inst_to_model = {tuple(facet[:idx]): facet[idx] for facet in facets if len(facet) > 2}  # noqa: E501
     name_to_inst = {label: key for key, label in INSTITUTE_LABELS.items()}
@@ -323,7 +361,6 @@ def _fill_kwargs(data, **kwargs):
     coupled = facets.size > 1  # coupled model dataset
     coupled1 = 'experiment' in facets.names  # general coupled model data
     coupled2 = 'experiment' in version.names  # scalar feedback model data
-    merged = np.any(data.coords.get('stop', np.array([])) == 23)
     external = kwargs.get('source', None) in ('zelinka', 'geoffroy', 'forster')
     response = kwargs.get('experiment', None) in (None, 'abrupt4xco2')
     experiment = region = period = None  # see below
@@ -353,7 +390,7 @@ def _fill_kwargs(data, **kwargs):
         experiment, _ = None, kwargs.pop('experiment', None)  # single-experiment data
     if coupled and feedbacks:
         start, stop, period = map(kwargs.get, ('start', 'stop', 'period'))
-    if not merged and (coupled1 or coupled2) and experiment and 'control' in experiment:
+    if (coupled1 or coupled2) and experiment and 'control' in experiment:
         kwargs['start'], kwargs['stop'] = 0, 150  # overwrite defaults
     if response and coupled1 and period == 'early':
         kwargs['start'], kwargs['stop'] = 0, 20
@@ -444,13 +481,14 @@ def _reduce_data(
         wgts = _get_weights(data, dim=dim)
     else:
         raise TypeError(f'Invalid option {weight=} for regression dimension {dim!r}.')
-    if isinstance(index, pd.MultiIndex):  # xarray weighted error
+    if method != 'dist' and isinstance(index, pd.MultiIndex):  # xarray weighted error
         data = data.drop_vars(data.coords.keys() & set(index.names))
-    if method == 'dist':  # bars or boxes
-        if data.ndim > 1:
+    if method == 'dist':
+        name = None  # bars or boxes
+        if data.ndim == 1:
+            result = data[~data.isnull()]
+        else:
             raise ValueError(f'Invalid dimensionality {data.ndim!r} for distribution.')
-        result = data[~data.isnull()]
-        name = None
     elif method == 'std':
         with xr.set_options(keep_attrs=True):  # note name is already kept
             result = std.item() * data.weighted(wgts).std(**kwargs)
@@ -581,7 +619,8 @@ def _reduce_datas(
         name = None
         sym = r'$X$'
     elif method == 'diff':  # composite difference along first arrays
-        kw_composite = dict(dim=dim, pctile=pctile, **kwargs)
+        kw_composite = dict(dim=dim, pctile=pctile)
+        kw_composite.update(kwargs)
         result0, result1 = _get_composite(data0, data1, **kw_composite)
         result = result1 - result0
         result = result.climo.dequantify()
@@ -590,8 +629,11 @@ def _reduce_datas(
         long = f'{data0.long_name}-composite {data1.long_name} difference'
         sym = r'$\Delta X$'
     elif method in ('corr', 'rsq'):
-        kw_regress = dict(stat='corr', nobnds=True, manual=manual, weights=wgts)
-        result = regress_dims(data0, data1, dim, **kwargs, **kw_regress)
+        nobnds = all(nums is None for nums in (pctile, std))
+        kw_regress = dict(stat='corr', nobnds=nobnds, manual=manual, weights=wgts)
+        kw_regress.update(kwargs)
+        results = regress_dims(data0, data1, dim, **kw_regress)
+        result, *bnds = (results,) if isinstance(results, xr.DataArray) else results
         result = ureg.dimensionless * result
         if method == 'corr':  # correlation coefficient
             result = result.climo.to_units('dimensionless').climo.dequantify()
@@ -605,10 +647,21 @@ def _reduce_datas(
             short = f'{short_prefix}variance explained'
             long = f'{long_prefix}variance explained'
             sym = r'$r^2_{I,\,F}$'
+        if not nobnds and result.ndim == 1:
+            key = 'pctile' if pctile is not None else 'std'
+            dims = np.atleast_1d(dim).tolist()
+            nums = pctile if pctile is not None else std
+            sigma = 0.5 * (bnds[1] - bnds[0])
+            result = xr.concat((result, sigma ** 2), dim='sigma')  # see process_data()
+            shade, fade = nums if nums.size == 2 else (nums.item(), None)
+            defaults['dof'] = math.prod(data1.sizes[_] for _ in dims) - 2
+            defaults.update({f'shade{key}s': shade, f'fade{key}s': fade})
+            defaults.update({'shadealpha': 0.25, 'fadealpha': 0.15})
     elif method in ('cov', 'proj', 'slope'):
         nobnds = all(nums is None for nums in (pctile, std))
         kw_regress = dict(stat=method, nobnds=nobnds, weights=wgts, manual=manual)
-        results = regress_dims(data0, data1, dim=dim, **kwargs, **kw_regress)
+        kw_regress.update(kwargs)
+        results = regress_dims(data0, data1, dim=dim, **kw_regress)
         result, *bnds = (results,) if isinstance(results, xr.DataArray) else results
         if method == 'cov':
             result.attrs['units'] = f'{data1.units} {data0.units}'
@@ -627,11 +680,12 @@ def _reduce_datas(
             sym = r'$\beta_{I,\,F}$'  # regression
         if not nobnds and result.ndim == 1:
             key = 'pctile' if pctile is not None else 'std'
+            dims = np.atleast_1d(dim).tolist()
             nums = pctile if pctile is not None else std
             sigma = 0.5 * (bnds[1] - bnds[0])
             result = xr.concat((result, sigma ** 2), dim='sigma')  # see process_data()
             shade, fade = nums if nums.size == 2 else (nums.item(), None)
-            defaults['dof'] = data1.sizes[dim] - 2
+            defaults['dof'] = math.prod(data1.sizes[_] for _ in dims) - 2
             defaults.update({f'shade{key}s': shade, f'fade{key}s': fade})
             defaults.update({'shadealpha': 0.25, 'fadealpha': 0.15})
     else:
@@ -814,10 +868,12 @@ def reduce_general(data, attrs=None, **kwargs):
             facets = list(filter(inst, facets))
             data = data.sel(facets=facets)
 
-    # Iterate over data arrays
+    # Iterate over data reductions
     # WARNING: Sometimes multi-index reductions can eliminate previously valid
     # coords, so critical to iterate one-by-one and validate selections each time.
-    order = list(ORDER_LOGICAL)
+    # NOTE: This silently skips dummy selections (e.g. area=None) that may be needed
+    # to prevent _parse_specs from merging e.g. average and non-average selections.
+    order = list(ORDER_LOGICAL)  # {{{
     sorter = lambda item: order.index(item[0]) if item[0] in order else len(order)
     results = []
     if is_dataset := isinstance(data, xr.Dataset):
@@ -825,9 +881,6 @@ def reduce_general(data, attrs=None, **kwargs):
     else:  # iterate over arrays
         datas = (data,)
     for data in datas:
-        # Iterate over reductions
-        # NOTE: This silently skips dummy selections (e.g. area=None) that may be needed
-        # to prevent _parse_specs from merging e.g. average and non-average selections.
         result = data
         ikwargs = _fill_kwargs(data, **kwargs)
         spatials = ('area', 'start', 'stop', 'period', 'experiment')
@@ -844,7 +897,7 @@ def reduce_general(data, attrs=None, **kwargs):
             if dim == 'volume' and not result.sizes.keys() & {'lon', 'lat', 'plev'}:
                 continue
             if dim == 'area' and value != 'avg':  # average over truncated region
-                result, value = result.climo.truncate(AREA_REGIONS[value]), 'avg'
+                result, value = result.climo.truncate(TRUNCATE_REGIONS[value]), 'avg'
             if dim in quants and not isinstance(value, (str, tuple)):
                 value = ureg.Quantity(value, result.coords[dim].climo.units)
             if dim in ('time', 'month', 'season'):  # time selections
@@ -863,19 +916,24 @@ def reduce_general(data, attrs=None, **kwargs):
     # Re-combine and return
     # NOTE: Here drop then restore project to simplify general_plot() annotations and
     # permit aligning linear operations along institutes from different projects.
-    if is_dataset:
+    if is_dataset:  # {{{
         result = xr.Dataset({result.name: result for result in results})
     else:  # singular array
         result = results[0]
     result = inst(result) if inst and inst.name == 'avg' else result
     index = result.indexes.get('facets', pd.Index([]))
-    names = set(index.names)  # facet names
+    coord, names = {}, set(index.names)  # facet names
     if 'project' in index.names and len(set(result.project.values)) == 1:
-        proj, names = result.project.values[0], names - {'project'}
+        value = result.project.values[0]
+        names = names - {'project'}
         result = result.reset_index('project', drop=True)
-        result.coords['project'] = proj
+        coord['project'] = value
     if 'facets' in result.dims and len(names) == 1:
-        coord = result.coords['facets']
-        index = pd.MultiIndex.from_arrays((coord.values,), names=(names.pop(),))
-        result = result.assign_coords({'facets': index})
+        values = result.facets.values
+        index = pd.MultiIndex.from_arrays((values,), names=(names.pop(),))
+        index = xr.DataArray(index, name='facets', dims='facets')
+        coord['facets'] = index
+    with warnings.catch_warnings():  # xarray future warning
+        warnings.simplefilter('ignore')
+        result = result.assign_coords(coord)
     return result

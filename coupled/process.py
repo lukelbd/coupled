@@ -65,8 +65,6 @@ def equator_pole_diffusivity(self, name):  # noqa: E302
 # TODO: Restore this after updating climopy and move to definitions file
 # climo.register_derivation(re.compile(r'\A(ta|ts)_grad\Z'))(equator_pole_delta)
 # climo.register_derivation(re.compile(r'\A(ta|ts)_diff\Z'))(equator_pole_diffusivity)
-# with warnings.catch_warnings():  # noqa: E305
-# warnings.simplefilter('ignore')
 # vreg.define('ta_grad', 'equator-pole air temperature difference', 'K')
 # vreg.define('ts_grad', 'equator-pole surface temperature difference', 'K')
 # vreg.define('ta_diff', 'bulk energy transport diffusivity', 'PW / K')
@@ -108,11 +106,15 @@ def _get_parts(
     options : dict
         The combination options.
     """
+    # TODO: Fix possible bug where (e.g.) file with shortwave longwave cloud effect
+    # but no full cloud effect fails to read components, instead builds from net/cs.
     # NOTE: This is ad hoc implementation of cfvariable-like scheme for quickly
     # retrieving names. In future should implement these as derivations with standard
     # cfvariable properties and recursively combine / check for availability using
     # nested lists of derivation functions rather than this restricted approach.
     from .feedbacks import REGEX_FLUX as regex
+    name = name and name.replace('rluscs', 'rlus')  # equivalent by construction
+    name = name and name.replace('rsdtcs', 'rsdt')  # equivalent by construction
     trans = lambda arg, *subs: [re.sub(arg, sub, name).strip('_') for sub in subs]
     if name and (flux := regex.search(name)):
         head, _, wav, net, bnd, sky, *_, param = (*flux.groups(), *name.split('_'))
@@ -120,8 +122,6 @@ def _get_parts(
         head = wav = net = bnd = sky = param = 'NA'
     if not name:  # user-input only
         parts = parts or ()
-    elif 'rluscs' in name or 'rsdtcs' in name:
-        parts = (name[:-2],)  # all-sky same as clear-sky
     elif 'total' in name:
         parts = trans('total', 'lse', 'dse', 'ocean')
         search, replace = 'latent', 'total'
@@ -132,11 +132,11 @@ def _get_parts(
         parts = trans('dse', 'hse', 'gse')
         search, replace = 'sensible', 'dry'
     elif name == 'tdev':  # TODO: define other 'relative' variables?
-        parts, relative = ('tstd',), (True,)
-        attrs.update(units='K', long_name='relative warming')
+        parts, relative = ('tstd',), (True,)  # TODO: revisit labels
+        attrs.update(units='K / sigma', long_name='temperature deviation', short_name='deviation')  # noqa: E501
     elif name == 'tabs':  # warming pattern for scaled sensitivity
-        parts, product = ('tpat', 'ecs'), (True,)
-        attrs.update(units='K', long_name='effective warming')
+        parts, product = ('tpat', 'ecs'), (True,)  # TODO: revisit
+        attrs.update(units='K', long_name='temperature response', short_name='response')  # noqa: E501
     elif param == 'ts' or param == 'ta':  # eqtemp = temp - (temp - eqtemp) (see below)
         delta = name.replace('_' + param, '_dt')  # climate minus implied deviation
         parts, signs = (param, delta), (1, -1)
@@ -146,7 +146,7 @@ def _get_parts(
         slope = name.replace('_dt', '_lam')  # feedback in denominator
         parts, signs, product = (value, slope), (1, -1), (True,)
         search, replace = 'flux', 'temperature'
-        attrs.update(units='K', long_name='temperature difference')
+        attrs.update(units='K', long_name='temperature deviation')
     elif not scaled and re.search(temp := r'(ecs|erf)(?:([0-9.-]+)x)?', name):
         parts = trans(temp, r'\1')
         scale = re.search(temp, name).group(2)
@@ -163,9 +163,13 @@ def _get_parts(
         parts = trans(regex, r'cl\2\3\4\5\6', r'\2\3\4\5\6')
         search, replace = 'cloud', 'non-cloud'
         signs = (-1, 1)
+    elif head == 'msk':  # cloud masking = cloud minus cloud effect
+        parts = trans(regex, r'cl\2\3\4\5\6', r'\2\3\4\5ce')
+        search, replace = 'cloud', 'cloud masking'
+        signs = (1, -1)
     elif sky == 'ce':  # raw cloud effect
         parts = trans(regex, r'\1\2\3\4\5cs', r'\1\2\3\4\5')
-        search, replace = 'clear-sky', 'cloud'
+        search, replace = 'clear-sky', 'cloud effect'
         signs = (-1, 1)
     elif bnd == 'a':  # net atmosheric (surface and TOA are positive into atmosphere)
         parts = trans(regex, r'\1\2\3\4t\6', r'\1\2\3\4s\6')
@@ -202,7 +206,7 @@ def _get_parts(
     return parts, options
 
 
-def _get_result(parts, combine=True, hemisphere=None, **kwargs):
+def _get_result(parts, operate=True, hemisphere=None, **kwargs):
     """
     Get the data array associated with the input parts.
 
@@ -210,8 +214,8 @@ def _get_result(parts, combine=True, hemisphere=None, **kwargs):
     ----------
     parts : namedtuple
         The (possibly nested) components and instructions returned by `_get_parts`.
-    combine : str, optional
-        Whether to combine the arrays or just return the first component.
+    operate : str, optional
+        Whether to carry out required operations or just return the first component.
     hemisphere : bool or str, optional
         The hemisphere to optionally select.
     **kwargs
@@ -232,8 +236,8 @@ def _get_result(parts, combine=True, hemisphere=None, **kwargs):
     for part in parts.parts:
         data = part
         if isinstance(part, tuple):  # recurse
-            data = _get_result(part, combine=combine, **kwargs)
-        elif not combine:  # skip reduce
+            data = _get_result(part, operate=operate, **kwargs)
+        elif not operate:  # skip reduce
             data = part if isinstance(part, xr.DataArray) else xr.DataArray([], name=name)  # noqa: E501
         else:  # apply reduce
             data = reduce_general(data, **kwargs)
@@ -246,17 +250,17 @@ def _get_result(parts, combine=True, hemisphere=None, **kwargs):
             if 'lev' in data.coords:
                 data = data.rename(lev='plev')
         datas.append(data)
-    if combine:
+    if operate:
         datas, signs = datas, parts.signs
     else:
         datas, signs = datas[:1], parts.signs[:1]
-    if combine and parts.relative:
+    if operate and parts.relative:
         bases = [data.climo.average('area') for data in datas]
     else:
         bases = (1 if parts.product else 0,) * len(signs)
     iter_ = zip(datas, signs, bases, strict=True)
     with xr.set_options(keep_attrs=True):
-        if not combine or len(datas) == 1 and signs[0] == 1 and not parts.relative:
+        if not operate or len(datas) == 1 and signs[0] == 1 and not parts.relative:
             data = datas[0]
         elif parts.product:  # get products or ratios
             data = math.prod(data ** sign / base for data, sign, base in iter_)
@@ -265,6 +269,9 @@ def _get_result(parts, combine=True, hemisphere=None, **kwargs):
     data = data.copy(deep=False)  # update attributes on derived variable
     data.name = name
     data.attrs.update(parts.attrs)
+    data.attrs.setdefault('units', '')  # missing units
+    data.attrs.setdefault('short_name', name)  # e.g. 'model'
+    data.attrs.setdefault('long_name', name)  # e.g. 'model'
     for key in ('long_name', 'short_name', 'standard_name'):
         value = data.attrs.get(key, None)
         if parts.search and isinstance(value, str):
@@ -272,7 +279,7 @@ def _get_result(parts, combine=True, hemisphere=None, **kwargs):
     return data
 
 
-def get_parts(dataset, name, scaled=False, **kwargs):
+def get_parts(dataset, name, scaled=None, **kwargs):
     """
     Return the components needed to build the requested variable.
 
@@ -298,28 +305,32 @@ def get_parts(dataset, name, scaled=False, **kwargs):
     # add explicit indicator if '2x' or '4x' is specified. Preserve default of always
     # *displaying* the unscaled experiment results by translating 'erf' or 'ecs' below.
     from .feedbacks import ALIAS_VARIABLES as aliases
+    from .feedbacks import REGEX_FLUX as regex
     name = aliases.get(name, name)
-    scaled = scaled or 'ecs' not in name and 'erf' not in name
-    absolute = not any(name[:3] == 'pl*' for name in dataset)
-    if scaled and name in dataset or name in dataset.climo:
+    names = [key for idx in dataset.indexes.values() for key in idx.names]
+    absolute = all(name[:3] != 'pl*' for name in dataset)
+    kwargs.update(scaled=scaled, absolute=absolute)
+    if not scaled:  # scaling not necessary
+        scaled = 'ecs' not in name and 'erf' not in name
+    if scaled and name in dataset or name in names or name in dataset.climo:
         parts, options = _get_parts(parts=[name], **kwargs)  # manual parts
     else:  # automatic parts
-        parts, options = _get_parts(name, scaled=scaled, absolute=absolute, **kwargs)
+        parts, options = _get_parts(name, **kwargs)
     if name not in dataset and name in dataset.climo:
         attrs = ('short_name', 'long_name', 'standard_units')
         attrs = {attr: getattr(vreg[name], attr) for attr in attrs}
         options['attrs'].update(attrs)
-    from .feedbacks import REGEX_FLUX as regex
     fluxes = ', '.join(s for s in dataset.data_vars if regex.search(s))
     results = []
     for part in parts:
+        scaled = name != 'tabs'
         deps = VARIABLE_DEPENDENCIES.get(name, ())
-        if part in dataset:  # note 'tabs' not saved
+        if part in dataset or part in names:  # note 'tabs' not saved
             part = dataset[part]
         elif part in dataset.climo:  # climopy derivation
             part = dataset.drop_vars(dataset.data_vars.keys() - set(deps))
         elif part != name or not scaled:  # valid derivation
-            part = get_parts(dataset, part, scaled=name != 'tabs')
+            part = get_parts(dataset, part, scaled=scaled)
         else:  # print available
             raise KeyError(f'Required variable {name} not found. Options are: {fluxes}.')  # noqa: E501
         results.append(part)
@@ -330,17 +341,15 @@ def get_parts(dataset, name, scaled=False, **kwargs):
 
 
 def get_result(
-    *args, attr=None, spatial=None, hemi=None, hemisphere=None, quantify=False, standardize=True, **kwargs,  # noqa: E501
+    *args, spatial=None, hemi=None, hemisphere=None, quantify=False, standardize=True, **kwargs,  # noqa: E501
 ):
     """
     Return the requested variable or attribute.
 
     Parameters
     ----------
-    *args : namedtuple
-        The variable arguments. If not a `namedtuple` then passed to `get_parts`.
-    attr : str, optional
-        The attribute to retrieve. Can be passed as the final positional argument.
+    *args : namedtuple or xarray.Dataset, str
+        The `get_parts` `namedtuple` (or dataset plus variable name) and attribute.
     spatial : str, optional
         The spatial reduction option.
     hemi, hemisphere : str, optional
@@ -360,28 +369,31 @@ def get_result(
     # selections first (e.g. points, maxima), 4) combining variables (e.g. products,
     # sums), then 5) more complex coordinate operations (e.g. averages, integrals). And
     # optionally order operations around non-linear variable or coordinate operations.
-    if not args or len(args) > 3:
-        raise TypeError(f'Expected 1 to 3 positional arguments but got {len(args)}.')  # noqa: E501
-    if len(args) == 1 and not isinstance(args[0], tuple):
-        raise TypeError('Input argument must be namedtuple returned by get_parts().')
-    kwargs['hemi'] = hemi or hemisphere  # permit either
-    kwargs['quantify'] = quantify  # detectable with _pop_kwargs
-    kwargs['standardize'] = standardize  # detectable with _pop_kwargs
-    nargs = isinstance(args[0], xr.Dataset) + 1
-    args, attrs = args[:nargs], args[nargs:]
-    parts = args[0] if nargs == 1 else get_parts(*args)
-    attr = attr or attrs and attrs[0] or None
-    data = _get_result(parts, combine=attr is None, **kwargs)
+    scaled = kwargs.pop('scaled', None)
+    start = kwargs.get('start', 0)
+    stop = kwargs.get('stop', 150)
+    hemi = hemi or hemisphere
+    kwargs.update(hemi=hemi, quantify=quantify, standardize=standardize)
+    if args and isinstance(args[0], xr.Dataset):
+        args = (get_parts(*args[:2], scaled=scaled), *args[2:])
+    if len(args) == 1:
+        part, attr = *args, None
+    elif len(args) == 2:
+        part, attr = args
+    else:
+        raise TypeError(f'Expected one to three input arguments but got {len(args)}.')
+    if isinstance(part, tuple):
+        data = _get_result(part, operate=attr is None, **kwargs)
+    else:
+        raise TypeError(f'Invalid input arguments {args!r}. Should be data or tuple.')
+    kw_control = {'start': 0, 'stop': 150} if 'version' in data.coords else {}
+    kw_abrupt = {'start': start, 'stop': stop} if 'version' in data.coords else {}
     if spatial is not None:  # only apply custom spatial correlation
-        val0, val1 = kwargs.get('start', 0), kwargs.get('stop', 150)
-        kw0 = {'start': 0, 'stop': 150} if 'version' in data.coords else {}
-        kw1 = {'start': val0, 'stop': val1} if 'version' in data.coords else {}
-        data0 = data.sel(experiment='picontrol', **kw0)
-        data1 = data.sel(experiment='abrupt4xco2', **kw1)
+        data0 = data.sel(experiment='picontrol', **kw_control)
+        data1 = data.sel(experiment='abrupt4xco2', **kw_abrupt)
         data, attrs = _reduce_datas(data0, data1, dim='area', method=spatial)
-        data.attrs.update({**data.attrs, **attrs})
-        del data.attrs['name']  # only used in reduce_facets()
-    if attr == 'units':
+        data.attrs.update({key: val for key, val in attrs.items() if key != 'name'})
+    if attr and attr == 'units':
         result = data.climo.units
     elif attr:
         result = data.attrs.get(attr, '')
@@ -393,8 +405,9 @@ def get_result(
 
 
 def process_constraint(
-    data0, data1, constraint=None, constraint_kw=None, observed=None, perturb=False,
-    noresid=False, noerror=False, internal=False, graphical=False, pctile=None, N=None, **kwargs,  # noqa: E501
+    data0, data1, constraint=None, constraint_kw=None, observed=None, extended=None,
+    dataset=None, noresid=False, nosigma=False, pctile=None, N=None,
+    perturb=False, internal=False, combined=False, graphical=False, **kwargs,
 ):
     """
     Return percentile bounds for observational constraint.
@@ -405,30 +418,39 @@ def process_constraint(
         The predictor data. Must be 1D.
     data1 : xarray.DataArray
         The predictand data. Must be 1D.
+    dataset : xarray.Dataset, optional
+        The source dataset used for inferring masking (if necessary).
     constraint : str or 2-tuple,
         The 95% bounds on the observational constraint.
     constraint_kw : dict, optional
         The keyword arguments passed to the loading function.
     observed : int, optional
         The number of years to use for observational uncertainty.
-    perturb : bool, optional
-        Whether to perturb the model data with its own uncertainty.
+    extended : int, optional
+        The number of additional years to apply shading.
     noresid : bool, optional
         Whether to ignore the regression residuals.
-    noerror : bool, optional
+    nosigma : bool, optional
         Whether to ignore the regression standard error.
-    internal : bool or int, optional
-        Whether to include model-estimated observed uncertainty due to variability. If
-        ``True`` then ``20`` is used. If passed the bounds are with and without model
-        inferred spread due to internal variability. Also adjusts the observed spread.
-    graphical : bool, optional
-        Whether to use graphical intersections instead of residual bootstrapping. If
-        ``False`` then constrained uncertainty estimated by adding t-distribution with
-        standard error calculated from residuals of regression relationship.
     pctile : float, default: 95
         The emergent constraint percentile bounds to be returned.
     N : int, default: 1000000
         The number of bootstrapped samples to carry out.
+
+    Other Parameters
+    ----------------
+    perturb : bool, optional
+        Whether to perturb the model data with uncertainty of each regression. Since
+        errors are uncorrelated effect is very small (even slight strengthening).
+    internal : bool or int, optional
+        Whether to include model-estimated observed uncertainty due to variability. If
+        ``True`` then ``20`` is used. If passed alternative bounds exclude variability.
+    combined : bool, optional
+        Whether to include alternative bootstrapping procedure based on single
+        sampling of uncertain slope for the estimate and its offset.
+    graphical : bool, optional
+        Whether to use graphical intersections instead of residual bootstrapping. If
+        ``False`` then bootstrapped slope times observations plus residual is used.
     **kwargs
         Passed to `_get_regression`.
 
@@ -441,12 +463,13 @@ def process_constraint(
     result2 : 3-tuple
         The emergent constraint accounting for regression uncertainty.
     """
-    # Get settings and observational data
-    # TODO: Use estimates from global average model feedbacks
-    from .datasets import open_scalar
+    # Initial stuff
+    # NOTE: Here preserve regression properties between internal feedbacks and
+    # constraint. Use 'external' and 'cld' for He et al. datasets
     from .reduce import _get_regression
-    N = N or 100000  # samples to draw
-    historical = 24  # historical observation years
+    N = N or 10000000  # {{{
+    np.random.seed(51423)  # see: https://stackoverflow.com/a/63980788/4970632
+    historical = 24 + 4 / 12  # March 2000 to June 2024
     constraint = 'cre' if constraint is None or constraint is True else constraint
     observed = observed or historical
     internal = observed if internal is None or internal is True else internal
@@ -454,50 +477,79 @@ def process_constraint(
     pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
     keys = ('initial', 'detrend', 'remove', 'correct')
     name = constraint if isinstance(constraint, str) else 'cre'
-    observed_kw = {key: data0.coords[key].item() for key in keys if key in data0.coords}
-    observed_kw.update(constraint_kw or {})
-    observed_kw.update(statistic=['slope', 'sigma', 'dof'])
-    if isinstance(constraint, str):  # TODO: use generalized estimates
-        scalar = open_scalar(ceres=True)
-        scalar = get_result(scalar, constraint, **observed_kw)
+    cloud, masks = (data0.name or '')[:2] == 'cl', ()
+    kw_scalar = {key: data0.coords[key].item() for key in keys if key in data0.coords}
+    kw_scalar.update(constraint_kw or {})
+    if dataset is None and cloud:
+        suffix, kw_scalar['source'] = 'cld', 'external'  # see observed/feedbacks.py
+    elif not cloud or dataset is not None:  # possibly auto-infer masking
+        suffix, masks = 'cre', ('mask', 'swmask', 'lwmask') if cloud else ()
+    else:
+        raise ValueError(f'Source dataset required for constraint {data0.name!r}.')
+
+    # Read observational constraints
+    # NOTE: Here optionally offset constraint estimate using average of internal
+    # cloud feedback masking adjustments.
+    if isinstance(constraint, str):  # {{{
+        from .feedbacks import REGEX_FLUX as regex
+        from .datasets import open_scalar
+        scalar = open_scalar(ceres=True, suffix=suffix)  # TODO: update this
+        project = data0.coords.get('project') or xr.DataArray('CMIP6')
+        kw_mask = dict(area='avg', experiment='picontrol', project=project.item())
+        kw_mean = dict(method='avg', weight=kwargs.get('weight'), skipna=True)
+        for mask in masks:  # masking components
+            print(f'Computing cloud masking: {mask!r}')
+            (data,), *_ = reduce_facets(get_result(dataset, mask, **kw_mask), **kw_mean)
+            icld = re.sub(regex, r'cl\2\3\4\5\6', data.name).strip('_')
+            icre = re.sub(regex, r'\2\3\4\5ce', data.name).strip('_')
+            scalar[icld] = scalar[icre].copy(deep=True)
+            scalar[icld].loc[{'statistic': 'slope'}] += data.item()
+        coord = ['slope', 'sigma', 'dof']  # statistic selections
+        scalar = get_result(scalar, constraint, statistic=coord, **kw_scalar)
         constraint = scalar.values.tolist()
     if not np.iterable(constraint) or len(constraint) != 3:
         raise ValueError(f'Invalid constraint {constraint}. Must be (slope, sigma, dof).')  # noqa: E501
     if data0.ndim != 1 or data1.ndim != 1:
         raise ValueError(f'Invalid data dims {data0.ndim} and {data1.ndim}. Must be 1D.')  # noqa: E501
+    xmean, xscale, xdof = constraint  # note dof will have small effect
+    xdof *= observed / historical  # increased degrees of freedom
+    xscale /= np.sqrt(observed / historical)  # reduced regression error
+    extended = 50 if extended is True else extended or observed
+    escale = extended / observed  # extended version
+    xs1 = stats.t(df=xdof, loc=xmean, scale=xscale)
+    xs2 = stats.t(df=escale * xdof, loc=xmean, scale=xscale / np.sqrt(escale))
+    xmin1, xmax1 = xs1.ppf(0.01 * pctile)
+    xmin2, xmax2 = xs2.ppf(0.01 * pctile)
+    print(f' observed: mean {xmean:.2f} sigma {xscale:.2f} dof {xdof:.0f}')
 
-    # Get observational and regression estimates
+    # Get bootstrapped uncertainty distributions
     # NOTE: Use N - 2 degrees of freedom for both observed feedback and inter-model
     # coefficients since they are both linear regressions. For now ignore uncertainty
     # of individual feedback regressions that comprise inter-model regression because
     # their sample sizes are larger (150 years) and uncertainties are uncorrelated so
     # should roughly cancel out across e.g. 30 members of ensemble.
-    xmean, xscale, xdof = constraint  # note dof will have small effect
-    xdof *= observed / historical  # increased degrees of freedom
-    xscale /= np.sqrt(observed / historical)  # reduced regression error
-    xmin, xmax = stats.t(df=xdof, loc=xmean, scale=xscale).ppf(0.01 * pctile)
-    observations = np.array([xmin, xmean, xmax])
-    idxs = data0.argsort().values  # critical so 'fit' has same coordinates
+    idxs = data0.argsort().values  # 'fit' has same coordinates  # {{{
     data0 = data0.isel({data0.dims[0]: idxs})
     data1 = data1.isel({data0.dims[0]: idxs})
-    iscale = None  # internal variability scale
-    internal = 20 if internal is True else None
-    internal_kw = dict(**observed_kw, experiment='picontrol')
-    internal_kw.update(period=f'{internal}yr', error='internal', statistic='sigma')
-    if internal:
-        dataset = open_scalar(ceres=True)
-        iscales = get_result(dataset, name, **internal_kw)
+    if not internal and extended == observed:
+        ixs, observations = 0, np.array([xmin1, xmean, xmax1])
+    elif not internal:
+        ixs, observations = 0, np.array([xmin1, xmin2, xmean, xmax2, xmax1])
+    else:
+        internal = 20 if internal is True else internal
+        kw_internal = dict(**kw_scalar, experiment='picontrol')
+        kw_internal.update(period=f'{internal}yr', error='internal', statistic='sigma')
+        dataset = open_scalar(ceres=True, suffix='cre')
+        iscales = get_result(dataset, name, **kw_internal)
         iscale = iscales.mean().item()
         xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)
-        es = stats.norm(loc=0, scale=iscale).rvs(N)
-        observations = np.insert(np.percentile(xs + es, pctile), 1, observations)
-    if not perturb:
+        ixs = stats.norm(loc=0, scale=iscale).rvs(N)
+        observations = np.insert(np.percentile(xs + ixs, pctile), 1, observations)
+    if not perturb:  # skip perturbing model data
         bmean = None
         mean0 = data0.mean().values
         mean1 = data1.mean().values
     else:  # include regression error
-        # scalar = open_scalar(ceres=False)
-        # scalar = get_result(scalar, name, **internal_kw)
         mscale, mdof, M = 0.11, 1000, data0.size  # TODO: use errors from file
         offset0 = stats.t(df=mdof, loc=0, scale=mscale).rvs((N, M))
         offset1 = stats.t(df=mdof, loc=0, scale=mscale).rvs((N, M))
@@ -507,11 +559,11 @@ def process_constraint(
         bmean, *_ = _get_regression(datas0, datas1, pctile=pctile, nofit=True, **kwargs)
         mean0 = datas0.mean(dim='facets').values
         mean1 = datas1.mean(dim='facets').values
-    print(f' constraint: mean {xmean:.2f} sigma {xscale:.2f} dof {xdof:.0f}')
     result = _get_regression(data0, data1, pctile=False, **kwargs)
-    *slopes, fit, fit_lower, fit_upper, rscale, _, rdof = result
-    bmean = (slopes[0] if bmean is None else bmean).values  # possibly include spread
-    rdof, fit, fit_lower, fit_upper = (da.values for da in (rdof, fit, fit_lower, fit_upper))  # noqa: E501
+    slope, slope1, slope2, fit, fit1, fit2, rse, _, rdof = result
+    bmean = (slope if bmean is None else bmean).values  # possibly include spread
+    bscale = 0.5 * abs(slope2 - slope1)
+    rdof, fit, fit1, fit2 = (da.values for da in (rdof, fit, fit1, fit2))  # noqa: E501
 
     # Propagate observational uncertainty through regression uncertainty
     # NOTE: This was adapted from Simpson et al. methdology. Reverse engineer the
@@ -527,38 +579,52 @@ def process_constraint(
     # the slope uncertainty, otherwise constraint could be 'effective' when it has
     # slope near zero i.e. small residuals with large x-coordinate error.
     if graphical:  # intersection of shaded regions
-        nbounds = 2 if internal else 1  # bounds returned
-        fit_lower = fit_lower.squeeze()
-        fit_upper = fit_upper.squeeze()
+        nbounds = 2 if internal else 1  # {{{
+        fit1 = fit1.squeeze()
+        fit2 = fit2.squeeze()
         xs = np.sort(data0, axis=0)  # linefit returns result for sorted data
         ymean = mean1 + bmean * (xmean - mean0)
-        ymins = np.interp(observations[:nbounds], xs, fit_lower)
-        ymaxs = np.interp(observations[-nbounds:], xs, fit_upper)
+        ymins = np.interp(observations[:nbounds], xs, fit1)
+        ymaxs = np.interp(observations[-nbounds:], xs, fit2)
         constrained = (*ymins, ymean, *ymaxs)
-        alternative = mean1 + bmean * (observations - mean0)
-    else:
-        if internal:  # implied variability error from 150-year
-            es = stats.norm(loc=0, scale=iscale).rvs(N)
-        else:  # ignore variability error
-            es = 0
-        if not noresid:  # regerssion residual error
-            rscale = np.std(data1 - fit, ddof=1)  # model residual sigma
-            rs = stats.t(df=rdof, loc=0, scale=rscale).rvs(N)
-        else:  # ignore residual error
-            rs = 0
-        if not noerror:
-            bscale = abs(slopes[2] - slopes[1])
+        alternative = mean1 + bmean * (observations - mean0)  # }}}
+    else:  # bootstrapping
+        xs1, xs2 = xs1.rvs(N), xs2.rvs(N)  # {{{
+        if not nosigma:
             bs = stats.t(loc=bmean, scale=bscale, df=rdof).rvs(N)
-        else:
+        else:  # ignore slope error
             bs = bmean
-        xs = stats.t(df=xdof, loc=xmean, scale=xscale).rvs(N)  # observations
-        ys1 = rs + mean1 + bs * (xs + es - mean0)  # include both uncertainties
-        if internal:  # no internal error
-            ys2 = rs + mean1 + bs * (xs - mean0)
-        else:  # no regression error
-            ys2 = rs + mean1 + bmean * (xs - mean0)
-        constrained = np.insert(np.percentile(ys1, pctile), 1, np.mean(ys1))
-        alternative = np.insert(np.percentile(ys2, pctile), 1, np.mean(ys2))
+        if noresid:  # ignore residual
+            rs1 = rs2 = 0
+        elif not combined:  # regression standard error
+            rs1 = rs2 = stats.t(loc=0, scale=rse, df=rdof).rvs(N)
+        else:  # combined slope intercept
+            nsq = np.sqrt(data0.size)  # infer weighted x-standard deviation
+            std = rse.item() / bscale.item() / nsq  # compare to np.std
+            bs, ibs = bmean, bs - bmean  # slope anomaly
+            rs1, rs2 = ibs * (xs1 + std * nsq), ibs * (xs2 + std * nsq)
+        ys1 = rs1 + mean1 + bs * (xs1 + ixs - mean0)  # include both
+        ys2 = rs2 + mean1 + bs * (xs2 + ixs - mean0)
+        if internal:  # alternative has no internal error
+            as1 = rs1 + mean1 + bs * (xs1 - mean0)
+            as2 = rs2 + mean1 + bs * (xs2 - mean0)
+        else:  # alternative has no regression error
+            as1 = rs1 + mean1 + bmean * (xs1 - mean0)
+            as2 = rs2 + mean1 + bmean * (xs2 - mean0)
+        ymean = np.mean(np.append(ys1, ys2))
+        amean = np.mean(np.append(as1, as2))
+        (ymin1, ymax1) = np.percentile(ys1, pctile)  # TODO: fix for multi pctiles
+        (ymin2, ymax2) = np.percentile(ys2, pctile)
+        (amin1, amax1) = np.percentile(as1, pctile)
+        (amin2, amax2) = np.percentile(as2, pctile)
+        if extended == observed:
+            ymins, ymean, ymaxs = (ymin1,), ymean, (ymax1,)
+            amins, amean, amaxs = (amin1,), ymean, (amax1,)
+        else:
+            ymins, ymean, ymaxs = (ymin1, ymin2), ymean, (ymax2, ymax1)
+            amins, amean, amaxs = (amin1, amin2), amean, (amax2, amax1)
+        constrained = np.array([*ymins, ymean, *ymaxs])
+        alternative = np.array([*amins, amean, *amaxs])  # }}}
     return observations, alternative, constrained
 
 
@@ -591,7 +657,7 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
     # permit arbitrary combinations of names and indexers (see _parse_specs).
     # TODO: Possibly keep original 'signs' instead of _group_parts signs? See
     # below where arguments are combined and have to pick a sign.
-    kws_group, kws_count, kws_input, kws_facets = [], [], [], []
+    kws_group, kws_count, kws_input, kws_facets = [], [], [], []  # {{{
     if len(specs) not in (1, 2):
         raise ValueError(f'Expected two process dictionaries. Got {len(specs)}.')
     for i, spec in enumerate(specs):  # iterate method reduce arguments
@@ -601,7 +667,7 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
         kw_data = _group_parts(kw_data, keep_operators=True)
         for key, value in kw_data.items():
             sels = ['+']
-            for part in _expand_parts(value):
+            for part in _expand_parts(key, value):
                 if part is None:
                     sel = None
                 elif np.iterable(part) and part[:1] in ('+', '-', '*', '/'):
@@ -628,7 +694,7 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
     # WARNING: Here 'product' can be used for e.g. cmip6-cmip5 abrupt4xco2-picontrol
     # but there are some terms that we always want to group together e.g. 'experiment'
     # and 'startstop'. So include some overrides below.
-    kws_data = []
+    kws_data = []  # {{{
     for key in sorted(set(key for kw in kws_count for key in kw)):
         count = [kw.get(key, 0) for kw in kws_count]
         if count[0] == count[-1]:  # otherwise match correlation pair operators
@@ -672,7 +738,7 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
     # effect on e.g. regional correlation, regression results.
     # WARNING: Here _group_parts modified e.g. picontrol base from late-early
     # to late+early (i.e. average) so try to use sign from non-control experiment.
-    print('.', end='')
+    print('.', end='')  # {{{
     warming = ('tpat', 'tdev', 'tstd', 'tabs', 'rfnt_ecs')
     defaults = {}  # default plotting arguments
     datas_persum = []  # each item part of a summation
@@ -698,6 +764,7 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
             datas.append(data)
             exps.append(experiment)
         datas, method, default = reduce_facets(*datas, **kw_facets)
+        default.pop('symbol', None)
         for key, value in default.items():
             defaults.setdefault(key, value)
         if len(datas) == 1:  # e.g. regression applied
@@ -720,9 +787,8 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
     # e.g. 'shadepctiles' but now for consistency with line() plots of regression
     # coefficients we use sum of variances (see _reduce_data and _reduce_datas for
     # details). Institute differences are now only supported for scalar plots.
-    print('.', end=' ')
-    args = []
-    method = methods_persum.pop()
+    print('.', end=' ')  # {{{
+    args, method = [], methods_persum.pop()
     signs_persum, datas_persum = zip(*datas_persum)
     for signs, datas in zip(zip(*signs_persum), zip(*datas_persum)):  # plot arguments
         datas = xr.align(*datas)
@@ -734,11 +800,11 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
             arg = sum(sign * part for sign, part in zip(signs, parts)) / sum_scale
         if method == 'dist' and len(parts) > 1 and np.allclose(arg, 0):
             arg = parts[0]  # kludge for e.g. control late minus control early
-        if len(parts) == 1 and (name := specs[0].get('name')):
-            arg.name = name  # kluge for e.g. 'ts' minus 'tstd'
+        if not arg.name and len(datas) == 1 and (name := specs[0].get('name')):
+            arg.name = name  # TODO: revisit
         if suffix and any(sign == -1 for sign in signs):
             suffix = 'anomaly' if suffix is True else suffix
-            arg.attrs['short_suffix'] = arg.attrs['long_suffix'] = suffix
+            arg.attrs['long_suffix'] = arg.attrs['short_suffix'] = ''
         if 'sigma' in datas[0].dims:  # see _apply_single and _apply_double
             dof = defaults.pop('dof', None)
             sigma = sum(data.isel(sigma=1) for data in datas) ** 0.5
@@ -763,7 +829,7 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
     # to vector coordinate matching utilities) so try to restore them below.
     # NOTE: Global average regressions of local pre-industrial feedbacks onto global
     # pre-industrial feedbacks equal one despite regions with much larger magnitudes.
-    args = xr.align(*args)  # re-align after summation
+    args = xr.align(*args)  # re-align after summation  # {{{
     if len(args) == len(kws_input):  # one or two (e.g. scatter)
         for arg, kw_input in zip(args, kws_input):
             names = [name for index in arg.indexes.values() for name in index.names]

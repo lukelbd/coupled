@@ -21,3 +21,8 @@ from .reduce import *  # noqa: F401, F403
 from .specs import *  # noqa: F401, F403
 from .general import *  # noqa: F401, F403
 from .templates import *  # noqa: F401, F403
+
+# Add sigma units
+ureg._on_redefinition = 'ignore'
+ureg.define('sigma = 1 = σ = stdev = std')
+ureg._on_redefinition = 'warn'

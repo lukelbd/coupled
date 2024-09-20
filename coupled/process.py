@@ -250,10 +250,10 @@ def _get_result(parts, combine=True, hemisphere=None, **kwargs):
         datas, signs = datas, parts.signs
     else:
         datas, signs = datas[:1], parts.signs[:1]
-    if not combine or not parts.relative:
-        bases = (1 if parts.product else 0,) * len(signs)
-    else:
+    if combine and parts.relative:
         bases = [data.climo.average('area') for data in datas]
+    else:
+        bases = (1 if parts.product else 0,) * len(signs)
     iter_ = zip(datas, signs, bases, strict=True)
     with xr.set_options(keep_attrs=True):
         if not combine or len(datas) == 1 and signs[0] == 1 and not parts.relative:

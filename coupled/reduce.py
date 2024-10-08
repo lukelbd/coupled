@@ -16,7 +16,7 @@ from climopy import var, ureg, vreg  # noqa: F401
 from scipy import stats
 from icecream import ic  # noqa: F401
 
-from .specs import ORDER_LOGICAL, INSTITUTE_LABELS
+from .specs import ORDER_LOGICAL, INSTITUTE_LABELS, _pop_kwargs
 
 __all__ = ['reduce_time', 'reduce_facets', 'reduce_general']
 
@@ -33,6 +33,7 @@ GENERAL_DEFAULTS = {
     'start': 0,
     'stop': 150,
     'region': 'globe',
+    'area': None,
 }
 RESPONSE_DEFAULTS = {
     'period': 'full',
@@ -58,32 +59,6 @@ OBSERVED_DEFAULTS = {
     'detrend': 'xy',
     'correct': 'r',
 }
-
-# Truncation region presets
-# NOTE: WPG and ENSO regions defined in https://doi.org/10.1175/JCLI-D-12-00344.1 and
-# https://doi.org/10.1038/s41598-021-99738-3, tropical ratio and feedback regions in
-# https://doi.org/10.1175/JCLI-D-18-0843.1 and https://doi.org/10.1175/JCLI-D-17-0087.1.
-# 'wpac': {'lat': (-15, 15), 'lon': (90, 150)},  # based on own feedbacks
-# 'epac': {'lat': (-30, 0), 'lon': (260, 290)},
-# 'wpac': {'lat': (-15, 15), 'lon': (150, 170)},  # paper based on +4K
-# 'epac': {'lat': (-30, 0), 'lon': (260, 280)},
-TRUNCATE_REGIONS = {
-    'so': {'lat': (-60, -30)},  # 'southern ocean'
-    'se': {'lat': (-60, -30)},  # 'southern extratropics'
-    'ne': {'lat': (30, 60)},  # 'northern extratropic'
-    'sh': {'lat': (-90, 0)},  # 'southern hemisphere'
-    'nh': {'lat': (0, 90)},  # 'northern hemisphere'
-    'trop': {'lat': (-30, 30)},  # 'tropical'
-    'tpac': {'lat': (-30, 30), 'lon': (120, 280)},  # 'tropical pacific'
-    'wpac': {'lat': (-15, 15), 'lon': (90, 150)},  # 'west pacific'
-    'epac': {'lat': (-30, 0), 'lon': (260, 290)},  # 'east pacific'
-    'nina': {'lat': (0, 10), 'lon': (130, 150)},  # 'warm pool'
-    'pool': {'lat': (-30, 30), 'lon': (50, 200)},  # 'warm pool'
-    'nino': {'lat': (-5, 5), 'lon': (190, 240)},  # 'cold tongue'
-    'nino3': {'lat': (-5, 5), 'lon': (210, 270)},  # 'cold tongue'
-    'nino4': {'lat': (-5, 5), 'lon': (160, 210)},  # 'cold tongue'
-}
-
 
 def _get_weights(data, dim=None):
     """
@@ -410,7 +385,7 @@ def _fill_kwargs(data, **kwargs):
 
 
 def _reduce_data(
-    data, method, dim=None, weight=None, skipna=False, pctile=None, std=None, preserve=True,  # noqa: E501
+    data, method, dim=None, weight=None, sample=None, skipna=False, pctile=None, std=None, preserve=None,  # noqa: E501
 ):
     """
     Reduce individual data array using arbitrary method.
@@ -419,12 +394,14 @@ def _reduce_data(
     ----------
     data : xarray.DataArray
         The input data.
-    method : str
-        The reduction method (see `reduce_facets`).
+    method : str, default: 'avg'
+        The reduction method. See `reduce_facets` for details.
     dim : str, optional
         The reduction dimension. Default is the first dimension.
     weight : bool, optional
         Whether to weight by institute counts.
+    sample : bool, optional
+        Whether to return sample mean instead of population statistics.
     skipna : bool, optional
         Whether to skip null values.
 
@@ -440,7 +417,7 @@ def _reduce_data(
         passed e.g. ``(1, 3)`` both `shade` and `fade` keywords are used.
     preserve : bool, optional
         Whether to apply ``avg|med`` operations immediately or preserve the distribution
-        until plotting using ``shade|fade`` keyword arguments. If ``False`` this will
+        until plotting with ``shade|fade`` keyword arguments. If ``False`` this will
         cause ``process_data()`` to show uncertainty for differences of selections on
         each model e.g. ``experiment='abrupt4xco2-picontrol'`` intead of ensembles.
 
@@ -459,11 +436,12 @@ def _reduce_data(
     # and 'fadedata' arrays from the input arguments. Note resulting percentiles will
     # only be an approximation to some actual Monte Carlo sampled difference of
     # t-distributions. See: https://en.wikipedia.org/wiki/Variance#Propertieswill
+    method = method or 'avg'
+    default = 95 if method == 'pct' else 80  # default percentile
     pctile = None if pctile is False else pctile  # see below
-    pctile = 80 if pctile is True else pctile  # same for both
-    pctile = np.atleast_1d(pctile) if pctile is not None else pctile
-    bnds = 80 if pctile is None or pctile.size != 1 else pctile.item()
-    bnds = 0.01 * np.array([50 - 0.5 * bnds, 50 + 0.5 * bnds])
+    pctile = default if pctile is True else pctile
+    bnds = np.array(default if pctile is None or np.size(pctile) != 1 else pctile)
+    bnds = 0.01 * np.array([50 - 0.5 * bnds.item(), 50 + 0.5 * bnds.item()])
     std = None if std is False else std
     std = True if method == 'std' and std is None else std
     std = (1, 1)[method == 'std'] if std is True else std
@@ -474,6 +452,7 @@ def _reduce_data(
     dim = dim or data.dims[0]
     idim = dim if isinstance(dim, str) else None
     index = data.indexes.get(idim, None)
+    units = f'({data.units})' if data.units else data.units
     kwargs = {'dim': dim, 'skipna': skipna}
     if not weight:
         wgts = xr.ones_like(data.coords[dim], dtype=float)
@@ -489,35 +468,53 @@ def _reduce_data(
             result = data[~data.isnull()]
         else:
             raise ValueError(f'Invalid dimensionality {data.ndim!r} for distribution.')
-    elif method == 'std':
+    elif method == 'pctile':  # percentile range
         with xr.set_options(keep_attrs=True):  # note name is already kept
-            result = std.item() * data.weighted(wgts).std(**kwargs)
+            data0 = data.quantile(bnds[0], **kwargs)
+            data1 = data.quantile(bnds[1], **kwargs)
+            result = data1 - data0
+        short = f'{data.short_name} spread'
+        long = f'{data.long_name} percentile range'
+    elif method == 'pct':  # t-distribution percentile
+        with xr.set_options(keep_attrs=True):
+            dof = xr.ones_like(data).weighted(wgts).sum(**kwargs)
+            loc = data.weighted(wgts).mean(**kwargs)
+            scale = data.weighted(wgts).std(**kwargs)
+            scale = scale / np.sqrt(dof) if sample else scale
+        dist = stats.t(df=dof, loc=loc, scale=scale)
+        result = 0.5 * (dist.ppf(bnds[1]) - dist.ppf(bnds[0]))  # i.e. symmetric range
+        result = xr.DataArray(result, attrs=scale.attrs, dims=scale.dims, coords=scale.coords)  # noqa: E501
         short = f'{data.short_name} spread'
         long = f'{data.long_name} standard deviation'
-    elif method == 'var':
+    elif method == 'std':  # weithed standard deviation
         with xr.set_options(keep_attrs=True):  # note name is already kept
+            dof = xr.ones_like(data).weighted(wgts).sum(**kwargs)
+            result = data.weighted(wgts).std(**kwargs)
+            result = result / np.sqrt(dof) if sample else result
+        short = f'{data.short_name} spread'
+        long = f'{data.long_name} standard deviation'
+    elif method == 'var':  # weighted variance
+        with xr.set_options(keep_attrs=True):  # note name is already kept
+            dof = xr.ones_like(data).weighted(wgts).sum(**kwargs)
             result = data.weighted(wgts).var(**kwargs)
-        data.attrs['units'] = f'({data.units})^2'
+            result = result / dof if sample else result
+        result.attrs['units'] = f'{units}^2' if units else ''
         short = f'{data.short_name} variance'
         long = f'{data.long_name} variance'
-    elif method == 'skew':  # see: https://stackoverflow.com/a/71149901/4970632
+    elif method == 'skew' or method == 'kurt':  # weighted skewness kurtosis
         with xr.set_options(keep_attrs=True):
-            result = data.weighted(wgts).reduce(func=stats.skew, **kwargs)
-        data.attrs['units'] = ''
+            func = stats.kurtosis if method == 'kurt' else stats.skew
+            result = data.weighted(wgts).reduce(func=func, **kwargs)
+        result.attrs['units'] = ''  # see: https://stackoverflow.com/a/71149901/4970632
         short = f'{data.short_name} skewness'
         long = f'{data.long_name} skewness'
     elif method == 'kurt':  # see: https://stackoverflow.com/a/71149901/4970632
         with xr.set_options(keep_attrs=True):
             result = data.weighted(wgts).reduce(func=stats.kurtosis, **kwargs)
-        data.attrs['units'] = ''
+        result.attrs['units'] = ''
         short = f'{data.short_name} kurtosis'
         long = f'{data.long_name} kurtosis'
-    elif method == 'pctile':
-        with xr.set_options(keep_attrs=True):  # note name is already kept
-            result = data.quantile(bnds[1], **kwargs) - data.quantile(bnds[0], **kwargs)
-        short = f'{data.short_name} spread'
-        long = f'{data.long_name} percentile range'
-    elif method == 'avg' or method == 'med':
+    elif method == 'avg' or method == 'med':  # weighted average median
         args = () if method == 'avg' else (0.5,)
         key = 'mean' if method == 'avg' else 'quantile'
         with xr.set_options(keep_attrs=True):
@@ -544,7 +541,7 @@ def _reduce_data(
 
 
 def _reduce_datas(
-    data0, data1, method, dim=None, weight=None, pctile=None, std=None, invert=None, **kwargs,  # noqa: E501
+    data0, data1, method=None, dim=None, weight=None, pctile=None, std=None, invert=None, **kwargs,  # noqa: E501
 ):
     """
     Reduce pair of data arrays using arbitrary method.
@@ -553,8 +550,8 @@ def _reduce_datas(
     ----------
     data0, data1 : xarray.DataArray
         The input data.
-    method : str
-        The reduction method (see `reduce_facets`).
+    method : str, default: 'slope'
+        The reduction method. See `reduce_facets` for details.
     dim : str, optional
         The reduction dimension. Default is the first shared dimension.
     weight : bool, optional
@@ -588,6 +585,7 @@ def _reduce_datas(
     # only be an approximation to some actual Monte Carlo sampled difference of
     # t-distributions. See: https://en.wikipedia.org/wiki/Variance#Propertieswill
     from observed.arrays import regress_dims
+    method = method or 'slope'
     pctile = None if pctile is False else pctile
     pctile = 80 if pctile is True else pctile
     pctile = np.atleast_1d(pctile) if pctile is not None else pctile
@@ -663,18 +661,19 @@ def _reduce_datas(
         kw_regress.update(kwargs)
         results = regress_dims(data0, data1, dim=dim, **kw_regress)
         result, *bnds = (results,) if isinstance(results, xr.DataArray) else results
+        units = f'({data0.units})' if '/' in data0.units else data0.units
         if method == 'cov':
             result.attrs['units'] = f'{data1.units} {data0.units}'
             short = f'{short_prefix}covariance'
             long = f'{long_prefix}covariance'
             sym = r'Cov$(I,\,F)$'  # covariance
         elif method == 'proj':
-            result.attrs['units'] = f'{data1.units} / _sigma'
+            result.attrs['units'] = f'{data1.units} / sigma'
             short = f'{short_prefix}projection'
             long = f'{long_prefix}projection'
             sym = r'Proj$(I,\,F)$'  # projection
         else:
-            result.attrs['units'] = f'{data1.units} / ({data0.units})'
+            result.attrs['units'] = f'{data1.units} / {units}' if units else data1.units
             short = f'{short_prefix}regression coefficient'
             long = f'{long_prefix}regression coefficient'
             sym = r'$\beta_{I,\,F}$'  # regression
@@ -753,10 +752,14 @@ def reduce_facets(
         The data array(s).
     method : str, optional
         The reduction method. Here ``dist`` retains the facets dimension for e.g. bar
-        and scatter plots (and their multiples), ``avg|med|std|pctile`` reduce the
-        facets dimension for a single input argument, and ``corr|diff|proj|slope``
-        reduce the facets dimension for two input arguments. Can also end string
-        with ``_anom`` or ``_norm`` to take global anomaly or use normalization.
+        and scatter plots (and their multiples), ``avg|med|std|pct|pctile`` reduce
+        the facets dimension for a single input argument, and ``corr|diff|proj|slope``
+        reduce the facets dimension for two input arguments. Optionally append ``_anom``
+        to subtract the global average, ``_norm`` to normalize by the global average,
+        or ``_mean`` to return sample mean uncertainty (valid for ``std``, ``pct``).
+
+    Other Parameters
+    ----------------
     verbose : bool, optional
         Whether to print extra information.
     preserve : optional
@@ -778,13 +781,16 @@ def reduce_facets(
     # Apply single or double reduction methods
     # NOTE: This supports on-the-fly anomalies and normalization. Should eventually
     # move this stuff to climopy (already implemented in accessor getter).
-    kwargs.update(dim='facets')
+    kwargs.update(dim='facets')  # {{{
     ndim = max(data.ndim for data in datas)
     datas = tuple(data.copy() for data in datas)  # e.g. for distribution updates
     default = 'dist' if ndim == 1 else 'avg' if len(datas) == 1 else 'slope'
     method, *options = (method or default).split('_')
+    mean = 'mean' in options
     anomaly = 'anom' in options
     normalize = 'norm' in options
+    if set(options) - {'mean', 'anom', 'norm'}:
+        raise ValueError('Invalid method option(s)', repr('_'.join(options)))
     if len(datas) == 1:
         data, defaults = _reduce_data(*datas, method, preserve=preserve, **kwargs)
     elif len(datas) == 2:
@@ -795,19 +801,22 @@ def reduce_facets(
         if 'lon' not in data.coords and 'lat' not in data.coords:
             raise NotImplementedError('Anomaly methods require spatial coordinates.')
         with xr.set_options(keep_attrs=True):
-            data = data - data.climo.average('area')
+            base = data.climo.average('area')
+            data = data - base
     if normalize:
         if 'lon' not in data.coords and 'lat' not in data.coords:
             raise NotImplementedError('Normalized methods require spatial coordinates.')
         with xr.set_options(keep_attrs=True):
-            data = data / data.climo.average('area')
+            denom = data.climo.average('area')
+            data = data / denom
         if units := data.attrs.get('units', ''):
-            data.attrs['units'] = f'{units} / ({units})'
+            denom = f'({units})' if '/' in units else units
+            data.attrs['units'] = f'{units} / {denom}'
 
     # Standardize and possibly print information
     # NOTE: Considered re-applying coordinates here but better instead to relegate
     # to process_data so that operators can be retained more easily.
-    keys = ('facets', 'time', 'plev', 'lat', 'lon')  # coordinate sorting order
+    keys = ('facets', 'time', 'plev', 'lat', 'lon')  # {{{
     args = tuple(data) if isinstance(data, tuple) else (data,)
     args = [arg.transpose(..., *(key for key in keys if key in arg.sizes)) for arg in args]  # noqa: E501
     dependent = args[-1]
@@ -832,7 +841,7 @@ def reduce_facets(
     return args, method, defaults
 
 
-def reduce_general(data, attrs=None, **kwargs):
+def reduce_general(data, attrs=None, hemi=None, hemisphere=None, **kwargs):
     """
     Carry out arbitrary reduction of the given dataset variables.
 
@@ -853,10 +862,11 @@ def reduce_general(data, attrs=None, **kwargs):
     # Apply facet reductions and grouped averages
     # NOTE: Delay application of defaults until here so that we only include default
     # selections in automatically-generated labels if user explicitly passed them.
-    institute = kwargs.pop('institute', None)  # apply after end
-    project = kwargs.pop('project', None)  # apply after end
+    from observed.arrays import mask_region
+    proj = inst = None  # filter functions  # {{{
     index = data.indexes.get('facets', pd.Index([]))
-    proj = inst = None  # filter functions
+    project = kwargs.pop('project', None)  # apply after end
+    institute = kwargs.pop('institute', None)  # apply after end
     if 'project' in index.names and 'institute' in index.names:
         facets = data.facets.values
         label = data.facets.attrs.get('long_name') or 'source facets'
@@ -871,33 +881,37 @@ def reduce_general(data, attrs=None, **kwargs):
     # Iterate over data reductions
     # WARNING: Sometimes multi-index reductions can eliminate previously valid
     # coords, so critical to iterate one-by-one and validate selections each time.
+    # TODO: Restore functionality for 'spatial' reductions.
     # NOTE: This silently skips dummy selections (e.g. area=None) that may be needed
     # to prevent _parse_specs from merging e.g. average and non-average selections.
-    order = list(ORDER_LOGICAL)  # {{{
+    hemi = hemi or hemisphere  # {{{
+    order = list(ORDER_LOGICAL)
     sorter = lambda item: order.index(item[0]) if item[0] in order else len(order)
     results = []
+    kw_mask = _pop_kwargs(kwargs, mask_region)
     if is_dataset := isinstance(data, xr.Dataset):
         datas = data.data_vars.values()
     else:  # iterate over arrays
         datas = (data,)
     for data in datas:
         result = data
-        ikwargs = _fill_kwargs(data, **kwargs)
-        spatials = ('area', 'start', 'stop', 'period', 'experiment')
+        ikwargs = _fill_kwargs(data, **kwargs)  # includes default area=None
         for dim, value in sorted(ikwargs.items(), key=sorter):
             sizes = [*result.sizes, 'area', 'volume', 'spatial', 'time', 'month', 'season']  # noqa: E501
             names = [key for idx in result.indexes.values() for key in idx.names]
             quants = result.coords.keys() - set(names) - {'time', 'month', 'season'}
             if value is None or dim not in sizes and dim not in names:
                 continue
-            if dim in spatials and ikwargs.get('spatial', None) is not None:
-                continue
             if dim == 'area' and not result.sizes.keys() & {'lon', 'lat'}:
                 continue
             if dim == 'volume' and not result.sizes.keys() & {'lon', 'lat', 'plev'}:
                 continue
-            if dim == 'area' and value != 'avg':  # average over truncated region
-                result, value = result.climo.truncate(TRUNCATE_REGIONS[value]), 'avg'
+            if dim == 'area' and hemi:  # TODO: allow truncation without averages
+                data = data.climo.sel_hemisphere(hemi)
+            if dim == 'area' and value != 'avg':  # TODO: revisit this, ensure works
+                mask = mask_region(data, value, **kw_mask)
+                data = xr.where(mask, data, np.nan)  # unweight region
+                data, value = data.climo.add_cell_measures(), 'avg'
             if dim in quants and not isinstance(value, (str, tuple)):
                 value = ureg.Quantity(value, result.coords[dim].climo.units)
             if dim in ('time', 'month', 'season'):  # time selections

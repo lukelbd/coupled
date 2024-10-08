@@ -133,7 +133,7 @@ def _get_parts(
         search, replace = 'sensible', 'dry'
     elif name == 'tdev':  # TODO: define other 'relative' variables?
         parts, relative = ('tstd',), (True,)  # TODO: revisit labels
-        attrs.update(units='K / sigma', long_name='temperature deviation', short_name='deviation')  # noqa: E501
+        attrs.update(units='K / sigma', long_name='temperature departure', short_name='departure')  # noqa: E501
     elif name == 'tabs':  # warming pattern for scaled sensitivity
         parts, product = ('tpat', 'ecs'), (True,)  # TODO: revisit
         attrs.update(units='K', long_name='temperature response', short_name='response')  # noqa: E501
@@ -308,10 +308,10 @@ def get_parts(dataset, name, scaled=None, **kwargs):
     from .feedbacks import REGEX_FLUX as regex
     name = aliases.get(name, name)
     names = [key for idx in dataset.indexes.values() for key in idx.names]
+    if scaled is None:  # scaling not necessary
+        scaled = 'ecs' not in name and 'erf' not in name
     absolute = all(name[:3] != 'pl*' for name in dataset)
     kwargs.update(scaled=scaled, absolute=absolute)
-    if not scaled:  # scaling not necessary
-        scaled = 'ecs' not in name and 'erf' not in name
     if scaled and name in dataset or name in names or name in dataset.climo:
         parts, options = _get_parts(parts=[name], **kwargs)  # manual parts
     else:  # automatic parts
@@ -323,14 +323,13 @@ def get_parts(dataset, name, scaled=None, **kwargs):
     fluxes = ', '.join(s for s in dataset.data_vars if regex.search(s))
     results = []
     for part in parts:
-        scaled = name != 'tabs'
         deps = VARIABLE_DEPENDENCIES.get(name, ())
         if part in dataset or part in names:  # note 'tabs' not saved
             part = dataset[part]
         elif part in dataset.climo:  # climopy derivation
             part = dataset.drop_vars(dataset.data_vars.keys() - set(deps))
-        elif part != name or not scaled:  # valid derivation
-            part = get_parts(dataset, part, scaled=scaled)
+        elif not scaled or part != name:  # valid derivation
+            part = get_parts(dataset, part, scaled=True)
         else:  # print available
             raise KeyError(f'Required variable {name} not found. Options are: {fluxes}.')  # noqa: E501
         results.append(part)
@@ -341,7 +340,7 @@ def get_parts(dataset, name, scaled=None, **kwargs):
 
 
 def get_result(
-    *args, spatial=None, hemi=None, hemisphere=None, quantify=False, standardize=True, **kwargs,  # noqa: E501
+    *args, spatial=None, quantify=False, standardize=True, **kwargs,
 ):
     """
     Return the requested variable or attribute.
@@ -352,8 +351,6 @@ def get_result(
         The `get_parts` `namedtuple` (or dataset plus variable name) and attribute.
     spatial : str, optional
         The spatial reduction option.
-    hemi, hemisphere : str, optional
-        Passed to `.sel_hemisphere`.
     quantify, standardize : bool, optional
         Passed to `accessor.get`.
     **kwargs
@@ -369,11 +366,9 @@ def get_result(
     # selections first (e.g. points, maxima), 4) combining variables (e.g. products,
     # sums), then 5) more complex coordinate operations (e.g. averages, integrals). And
     # optionally order operations around non-linear variable or coordinate operations.
+    from observed.arrays import mask_region
     scaled = kwargs.pop('scaled', None)
-    start = kwargs.get('start', 0)
-    stop = kwargs.get('stop', 150)
-    hemi = hemi or hemisphere
-    kwargs.update(hemi=hemi, quantify=quantify, standardize=standardize)
+    kwargs.update(quantify=quantify, standardize=standardize)
     if args and isinstance(args[0], xr.Dataset):
         args = (get_parts(*args[:2], scaled=scaled), *args[2:])
     if len(args) == 1:
@@ -382,16 +377,18 @@ def get_result(
         part, attr = args
     else:
         raise TypeError(f'Expected one to three input arguments but got {len(args)}.')
-    if isinstance(part, tuple):
-        data = _get_result(part, operate=attr is None, **kwargs)
-    else:
+    if not isinstance(part, tuple):
         raise TypeError(f'Invalid input arguments {args!r}. Should be data or tuple.')
-    kw_control = {'start': 0, 'stop': 150} if 'version' in data.coords else {}
-    kw_abrupt = {'start': start, 'stop': stop} if 'version' in data.coords else {}
-    if spatial is not None:  # only apply custom spatial correlation
-        data0 = data.sel(experiment='picontrol', **kw_control)
-        data1 = data.sel(experiment='abrupt4xco2', **kw_abrupt)
-        data, attrs = _reduce_datas(data0, data1, dim='area', method=spatial)
+    if attr or not spatial:  # calculate result
+        kwarg = {**kwargs, 'operate': attr is None}
+        data = _get_result(part, **kwarg)
+    else:  # only apply custom spatial correlation
+        kwarg = _pop_kwargs(kwargs, mask_region)
+        kwarg.setdefault('mask', kwargs.pop('area', None))
+        kwarg.update(method=spatial, dim=('lon', 'lat'))
+        data0 = _get_result(part, **{**kwargs, 'experiment': 'picontrol'})
+        data1 = _get_result(part, **{**kwargs, 'experiment': 'abrupt4xco2'})
+        data, attrs = _reduce_datas(data0, data1, **kwarg)
         data.attrs.update({key: val for key, val in attrs.items() if key != 'name'})
     if attr and attr == 'units':
         result = data.climo.units
@@ -475,7 +472,7 @@ def process_constraint(
     internal = observed if internal is None or internal is True else internal
     pctile = 95 if pctile is None or pctile is True else pctile
     pctile = np.array([50 - 0.5 * pctile, 50 + 0.5 * pctile])
-    keys = ('initial', 'detrend', 'remove', 'correct')
+    keys = ('statistic', 'initial', 'detrend', 'remove', 'correct', 'error')
     name = constraint if isinstance(constraint, str) else 'cre'
     cloud, masks = (data0.name or '')[:2] == 'cl', ()
     kw_scalar = {key: data0.coords[key].item() for key in keys if key in data0.coords}
@@ -493,6 +490,7 @@ def process_constraint(
     if isinstance(constraint, str):  # {{{
         from .feedbacks import REGEX_FLUX as regex
         from .datasets import open_scalar
+        stat = kw_scalar.get('statistic', None) or 'slope'
         scalar = open_scalar(ceres=True, suffix=suffix)  # TODO: update this
         project = data0.coords.get('project') or xr.DataArray('CMIP6')
         kw_mask = dict(area='avg', experiment='picontrol', project=project.item())
@@ -504,9 +502,14 @@ def process_constraint(
             icre = re.sub(regex, r'\2\3\4\5ce', data.name).strip('_')
             scalar[icld] = scalar[icre].copy(deep=True)
             scalar[icld].loc[{'statistic': 'slope'}] += data.item()
-        coord = ['slope', 'sigma', 'dof']  # statistic selections
-        scalar = get_result(scalar, constraint, statistic=coord, **kw_scalar)
-        constraint = scalar.values.tolist()
+        if stat == 'slope':  # constrain slope
+            kw_scalar['statistic'] = ['slope', 'sigma', 'dof']
+            scalar = get_result(scalar, constraint, **kw_scalar)
+            constraint = scalar.values.tolist()
+        else:
+            kw_scalar['statistic'] = stat
+            scalar = get_result(scalar, constraint, **kw_scalar)
+            return [scalar.item()], [np.nan], [np.nan]
     if not np.iterable(constraint) or len(constraint) != 3:
         raise ValueError(f'Invalid constraint {constraint}. Must be (slope, sigma, dof).')  # noqa: E501
     if data0.ndim != 1 or data1.ndim != 1:
@@ -653,16 +656,19 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
         The default plotting arguments.
     """
     # Split instructions along operators
+    # TODO: Return single arrays or 2-tuples of arrays with method and argument
+    # attributes instead of multiple return values.
+    # TODO: Possibly keep original 'signs' instead of _group_parts signs (see
+    # below where arguments are combined and have to pick a sign).
     # NOTE: Initial kw_red values are formatted as (('[+-]', value), ...) to
     # permit arbitrary combinations of names and indexers (see _parse_specs).
-    # TODO: Possibly keep original 'signs' instead of _group_parts signs? See
-    # below where arguments are combined and have to pick a sign.
+    reduces = (get_result, reduce_facets, _reduce_data, _reduce_datas)
     kws_group, kws_count, kws_input, kws_facets = [], [], [], []  # {{{
     if len(specs) not in (1, 2):
         raise ValueError(f'Expected two process dictionaries. Got {len(specs)}.')
     for i, spec in enumerate(specs):  # iterate method reduce arguments
         kw_data, kw_count, kw_group = spec.copy(), {}, {}
-        kw_facets = _pop_kwargs(kw_data, reduce_facets, _reduce_data, _reduce_datas)
+        kw_facets = _pop_kwargs(kw_data, *reduces)
         kw_input = {key: val for key, val in kw_data.items() if key != 'name' and val is not None}  # noqa: E501
         kw_data = _group_parts(kw_data, keep_operators=True)
         for key, value in kw_data.items():
@@ -672,7 +678,7 @@ def process_data(dataset, *specs, attrs=None, suffix=True):
                     sel = None
                 elif np.iterable(part) and part[:1] in ('+', '-', '*', '/'):
                     sel = part[:1]
-                elif isinstance(part, (str, tuple)):  # already mapped integers
+                elif isinstance(part, (str, bool, tuple)):
                     sel = part
                 else:  # retrieve unit
                     unit = get_result(dataset, key, 'units')

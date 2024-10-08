@@ -827,7 +827,7 @@ def _format_scatter(
     # and lower and upper bounds so do not explicitly need sorted x coordinates.
     # label = rf'$r^2={sign}{value:~L.0f}$'
     # color = 'red' if constraint is None else color  # line fit color
-    if linefit or bounds or correlation or constraint is not None:  # {{{
+    if bounds or linefit or correlation or constraint is not None:  # {{{
         dim = data0.dims and data0.dims[0] or None
         pct = pctile or (99 if bounds and dim == 'time' else 95)  # default range
         result = _get_regression(data0, data1, dim=dim, pctile=pct, weight=weight)
@@ -849,7 +849,8 @@ def _format_scatter(
         title_kw = {'size': titlesize, 'weight': 'normal', 'linespacing': 0.8}
         title_kw.update(kwargs)  # additional keywords
         ax.use_sticky_edges = False  # show end of line fit shading
-        ax.plot(datax, fit, lw=1.5 * pplt.rc.metawidth, ls='-', a=1.0, c=color)
+        kw_line = dict(lw=1.5 * pplt.rc.metawidth, ls='-', a=1.0, c=color)
+        handle0, = ax.plot(datax, fit, label='least-squares fit', **kw_line)
         ax.area(datax, fit1.squeeze(), fit2.squeeze(), lw=0, a=0.3, c=color)
         ax.format(**{f'{loc}title': text, f'{loc}title_kw': title_kw})
 
@@ -896,47 +897,57 @@ def _format_scatter(
         # Process constraint
         kw_constraint.update(weight=weight, pctile=pctile)
         xs, ys1, ys2 = process_constraint(data0, data1, constraint, **kw_constraint)
+        nxs, nys = len(xs) // 2, len(ys1) // 2  # zero for scalars
         xcolor, ycolor = 'cyan7', 'pink7'
-        nbounds = len(xs) // 2  # should be one or two
-        xmins, xmean, xmaxs = xs[:nbounds], xs[nbounds], xs[-nbounds:]
-        nbounds = len(ys1) // 2  # should be one or two
-        ymins1, ymean, ymaxs1 = ys1[:nbounds], ys1[nbounds], ys1[-nbounds:]
-        ymins2, ymean, ymaxs2 = ys2[:nbounds], ys2[nbounds], ys2[-nbounds:]
-        horig, alphas = None, (0.1, 0.2)  # opacities of spanning shading
-        args = ([xmean, xmean], [min(ymins2) - 100, ymean])
-        xobjs = [ax.add_artist(mlines.Line2D(*args, lw=1, color=xcolor, label='observations'))]  # noqa: E501
+        xobjs, yobjs = [], []
+        xmins, xmean, xmaxs = xs[:nxs], xs[nxs], xs[-nxs:]
+        ymins1, ymean, ymaxs1 = ys1[:nys], ys1[nys], ys1[-nys:]
+        ymins2, ymean, ymaxs2 = ys2[:nys], ys2[nys], ys2[-nys:]
+        alphas, handle, ihandle = (0.1, 0.2), [], None
+        args = ([xmean, xmean], [min(ymins2) - 100, ymean]) if nxs and nys else ()
         color = 'cyan7' if 'y' in original or not handle else handle[0].get_color()
-        for alph, xmin, xmax in zip(alphas[-nbounds:], xmins, xmaxs[::-1]):
+        if args:  # includes uncertainty
+            xobjs.append(ax.add_artist(mlines.Line2D(*args, lw=1, color=xcolor, label='observations')))  # noqa: E501
+        else:  # scalar constraint
+            xobjs.append(ax.axvline(xmean, lw=1.5, color='red7', label='observations'))
+        for alph, xmin, xmax in zip(alphas[-nxs:], xmins, xmaxs[::-1]):
             xobjs.append(ax.axvspan(xmin, xmax, lw=0, color=xcolor, alpha=alph))
         for idx, bound in enumerate(xorigs):  # unconstrained x bounds
             ls, lw = (':', 0.9) if idx == 1 else ('--', 0.7)
-            horig = ax.axvline(bound, ls=ls, lw=lw, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
+            ihandle = ax.axvline(bound, ls=ls, lw=lw, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
         if alternative:  # with and without regression uncertainty
             ymins, ymaxs = (ymins2[0], ymins1[0]), (ymaxs2[-1], ymaxs1[-1])
         else:  # with and without bootstrapped model-impled obs uncertainty
-            ymins, ymaxs, alphas = ymins2, ymaxs2[::-1], alphas[-nbounds:]
+            ymins, ymaxs, alphas = ymins2, ymaxs2[::-1], alphas[-nys:]
         # Add labels and bounds
-        args = ([min(xmins) - 100, xmean], [ymean, ymean])
-        yobjs = [ax.add_artist(mlines.Line2D(*args, lw=1, color=ycolor, label='constrained'))]  # noqa: E501
-        color = ycolor if 'x' in original or not handle else handle[0].get_color()
-        for alph, ymin, ymax in zip(alphas, ymins, ymaxs):
-            yobjs.append(ax.axhspan(ymin, ymax, lw=0, color=ycolor, alpha=alph))
-        for idx, bound in enumerate(yorigs):  # unconstrained y bounds matching color
-            ls, lw = (':', 0.9) if idx == 1 else ('--', 0.7)
-            horig = ax.axhline(bound, ls=ls, lw=0.7, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
-        handle = [tuple(xobjs), tuple(yobjs)] + ([horig] if horig else [])
         # param = r'\sigma_{\mathrm{constrained}} - \sigma_{\mathrm{unconstrained}}'
         # param = rf'\dfrac{{{param}}}{{\sigma_{{\mathrm{{unconstrained}}}}}}'
-        param = r'\Delta \mathrm{CI}'
-        ratio = (max(ymaxs2) - min(ymins2)) / (max(yorigs) - min(yorigs)) - 1
-        ratio = ureg.Quantity(ratio, '').to('percent')
-        label = rf'${param}\,=\,{ratio:~L+.1f}$'
-        label = re.sub(r'(?<!\\)%', r'\%', label)
-        label = re.sub(r'(?<!\s)-', '{-}', label)
-        color = 'red7' if ratio > 0 else 'black'
-        title_kw = {'size': titlesize, 'color': color}
-        title_kw.update(kwargs)
-        ax.format(ultitle=label, ultitle_kw=title_kw)
+        args = ([min(xmins) - 100, xmean], [ymean, ymean]) if nxs and nys else ()
+        color = ycolor if 'x' in original or not handle else handle[0].get_color()
+        if args:
+            yobjs.append(ax.add_artist(mlines.Line2D(*args, lw=1, color=ycolor, label='constrained')))  # noqa: E501
+        for alph, ymin, ymax in zip(alphas, ymins, ymaxs):
+            yobjs.append(ax.axhspan(ymin, ymax, lw=0, color=ycolor, alpha=alph))
+        for idx, bound in enumerate(yorigs if nys else ()):  # unconstrained y bounds
+            ls, lw = (':', 0.9) if idx == 1 else ('--', 0.7)
+            ihandle = ax.axhline(bound, ls=ls, lw=0.7, color=color, alpha=0.5, label='unconstrained')  # noqa: E501
+        if nxs and nys:
+            ratio = (max(ymaxs2) - min(ymins2)) / (max(yorigs) - min(yorigs)) - 1
+            ratio = ureg.Quantity(ratio, '').to('percent')
+            label = rf'$\Delta \mathrm{{CI}}\,=\,{ratio:~L+.1f}$'
+            label = re.sub(r'(?<!\\)%', r'\%', label)
+            label = re.sub(r'(?<!\s)-', '{-}', label)
+            title_kw = {'size': titlesize, 'color': 'red7' if ratio > 0 else 'black'}
+            title_kw.update(kwargs)
+            ax.format(ultitle=label, ultitle_kw=title_kw)
+        if not yobjs:  # linear regression
+            handle.append(handle0)
+        if xobjs:  # observational estimate
+            handle.append(xobjs[0] if len(xobjs) == 1 else tuple(xobjs))
+        if yobjs:  # constraint included
+            handle.append(yobjs[0] if len(yobjs) == 1 else tuple(yobjs))
+        if ihandle:  # original distribution
+            handle.append(ihandle)
     return handle
 
 
@@ -1946,8 +1957,8 @@ def _setup_guide(*axs, loc=None, figurespan=None, cbarlength=None, cbarwrap=None
     else:
         nspan = max(cols) - min(cols) + 1
         span = (min(cols) + 1, max(cols) + 1) if src is fig else None
-    shrink = 0.5 if nspan > 2 else 0.66
-    adjust = 1.3 if src is fig and nspan > 1 else 1.0
+    shrink = 0.66 if nspan < 3 or loc and loc[0] in 'lr' else 0.5
+    adjust = 1.3 if src is not fig and nspan > 1 else 1.0
     offset = 1.10 if axs[0]._name == 'cartesian' else 1.02  # for colorbar and legend
     factor = cbarwrap or 1.2  # additional scaling
     xoffset = loc and loc[0] in 'lr' and (rows[1] - rows[0]) % 2
@@ -1956,7 +1967,7 @@ def _setup_guide(*axs, loc=None, figurespan=None, cbarlength=None, cbarwrap=None
     ycoords = {'l': offset, 'b': 1, 'r': offset, 't': 0}
     width, height = axs[0]._get_size_inches()
     if cbarlength:
-        length = cbarlength / (1 if src is fig else adjust * nspan)
+        length = cbarlength * (1 if src is fig else adjust * nspan)
     elif nspan == 1:
         length = 1
     elif src is fig:  # shrink along figure
@@ -2070,8 +2081,9 @@ def general_plot(
     dataset,
     rowspecs=None,
     colspecs=None,
-    compare=False,
+    compare=None,
     contrast=False,
+    stipple=None,
     matching=False,
     labelbottom=False,
     labelright=False,
@@ -2122,6 +2134,9 @@ def general_plot(
     compare, contrast : bool or str, optional
         Whether to compare forced panels with internal panels using given reduction
         method (default ``'corr'``). Use ``contrast=True`` to show labels on the figure.
+    stipple : str, optional
+        The region to stipple when either `compare` or `contrast` are ``True``. Default
+        is ``'ipac'`` i.e. Pacific Ocean excluding South China Sea.
     matching : bool, optional
         Whether to filter to the CMIP6 models matching He et al. models instead
         of using all available models.
@@ -2214,10 +2229,11 @@ def general_plot(
     kws_process, kws_collection, figlabel, pathlabel, gridlabels = parse_specs(  # {{{
         dataset, rowspecs, colspecs, **kwargs  # parse input specs
     )
+    stipple = stipple or 'ipac'  # stippling and comparison region
+    nopoles = tuple(nopoles) if np.iterable(nopoles) else (-60, 60) if nopoles else (-89, 89)  # noqa: E501
     argskip = np.atleast_1d(() if argskip is None else argskip)
     gridskip = np.atleast_1d(() if gridskip is None else gridskip)
     hardskip = np.atleast_1d(() if hardskip is None else hardskip)
-    nopoles = tuple(nopoles) if np.iterable(nopoles) else (-60, 60) if nopoles else (-89, 89)  # noqa: E501
     if matching:
         facets = [key for key in dataset.facets.values if key[2] in MATCHING_MODELS or key[0] != 'CMIP6']  # noqa: E501
         dataset = dataset.sel(facets=facets)
@@ -2277,7 +2293,7 @@ def general_plot(
     # variables with different declared level-restricting arguments.
     fig = gs = None  # {{{2
     compare = compare or contrast
-    compare = 'corr' if compare and not isinstance(compare, str) else compare
+    compare = 'slope' if compare and not isinstance(compare, str) else compare
     leggroup = groupnames is not True if leggroup is None else leggroup
     methods, commands, groups_compare, groups_commands = [], [], {}, {}
     count, count_items = 0, list(zip(kws_process, kws_collection, titles, *texts))
@@ -2550,7 +2566,7 @@ def general_plot(
             # and adds hatching to region ignored by calculation.
             if geographic and other in groups_compare:  # {{{
                 iargs = (groups_compare[other], args[-1], compare)
-                ikwarg = dict(dim=('lon', 'lat'), mask='pac', ocean=True)
+                ikwarg = dict(dim=('lon', 'lat'), mask=stipple, ocean=True)
                 value, defaults = _reduce_datas(*iargs, **ikwarg)
                 keys, kwarg = ('project', 'start', 'stop', 'period'), dict((*group, *other))  # noqa: E501
                 msg = get_labels([(kwarg,)], restrict=keys, identical=True)
@@ -2571,7 +2587,7 @@ def general_plot(
                 globe2 = [(-180, i, lon0 - 181, i + 10) for i in range(-90, 90, 5)]
                 boxes = [Polygon.from_bounds(*_) for _ in (*globe1, *globe2)]
                 boxes, globe = [], union_all(boxes)
-                for bnds in REGION_MASKS['pac']:
+                for bnds in REGION_MASKS[stipple]:  # TODO: allow confiurable
                     (lon1, lon2), (lat1, lat2) = bnds['lon'], bnds['lat']
                     boxes.append(Polygon.from_bounds(lon1, lat1, lon2, lat2))
                 box = union_all(boxes).intersection(ocean)  # spatial correlation

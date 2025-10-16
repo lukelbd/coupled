@@ -118,6 +118,7 @@ ORDER_READABLE = (
 # NOTE: These are used for figure path generation and for figure axes
 # and attributes. See below for details.
 GENERAL_LABELS = {
+    ('project', 'ceres'): 'CERES',
     ('project', 'cmip'): 'CMIP',
     ('project', 'cmip5'): 'CMIP5',
     ('project', 'cmip6'): 'CMIP6',
@@ -1203,7 +1204,8 @@ def parse_specs(
     # NOTE: The two arrays required for two-argument methods can be indicated with
     # either 2-tuple dictionaries in spec lists, conflicting row and column names
     # and coordiantes, or 2-tuple values in single-dictionary specifier lists.
-    refwidth, refscale, kw_shared = None, None, dict(dataset=dataset, scale=kwargs.get('scale'))  # noqa: E501
+    abcloc = refwidth = refscale = None
+    kw_shared = dict(dataset=dataset, scale=kwargs.get('scale'))  # noqa: E501
     kws_process, kws_collection, gridlabels = [], [], []
     for idx, (ispecs, ikeys) in enumerate(((rowspecs, rows), (colspecs, cols))):
         # Generate variable specs
@@ -1232,6 +1234,8 @@ def parse_specs(
                 # Iterate over correlation pairs
                 for spec in sspecs:
                     kw_process, kw_collection = parse_spec(dataset, spec, **kwargs)
+                    if value := kw_collection.axes.get('abcloc', None):
+                        abcloc = value
                     if value := kw_collection.figure.get('refwidth', None):
                         refwidth = value  # for scaling grid labels
                     if not any(kw_process.get(key) for key in ('lon', 'lat', 'area')):
@@ -1255,6 +1259,7 @@ def parse_specs(
         # NOTE: This automatically infers linebreaks based on input values and
         # accounts for space taken by a-b-c labels if possible.
         abcwidth = pplt.units(1 * pplt.rc.fontsize, 'pt', 'in')  # {{{
+        abcwidth = abcwidth if abcloc in ('l', 'c', 'r', None) else 0
         refwidth = pplt.units(refwidth or pplt.rc['subplots.refwidth'], 'in')
         refwidth -= abcwidth if len(rowspecs) < 2 or len(colspecs) < 2 else 0
         grdlabels = get_labels(
@@ -1368,10 +1373,11 @@ def parse_specs(
     strict = [name for idx in dataset.indexes.values() for name in idx.names]
     strict.extend(('area', 'name', *dataset.dims, *dataset.coords))
     ncols, nrows = len(colspecs), len(rowspecs)  # figure dimensions
+    shift = abcloc in ('l', 'c', 'r', None)
     ncols = ncols if ncols > 1 else nrows if nrows > 1 else 3
     figwidth = ncols * refwidth + 0.3 * refwidth * (ncols - 1)  # approximate width
     kw_figure = dict(refwidth=figwidth, heading=True, identical=True, short=False)
-    kw_split = dict(fontsize=pplt.rc.fontlarge, refwidth=refwidth, shift=True, scale=kw_shared['scale'])  # noqa: E501
+    kw_split = dict(fontsize=pplt.rc.fontlarge, refwidth=refwidth, shift=shift, scale=kw_shared['scale'])  # noqa: E501
     kw_grid = dict(mode='path', refwidth=np.inf)
     figlabel = get_labels(*kws_process, **kw_figure, **kw_shared)
     pathlabel = get_path(dataset, *(spec for ikws in kws_process for spec in ikws))

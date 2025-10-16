@@ -58,7 +58,10 @@ OBSERVED_DEFAULTS = {
     'remove': 'average',
     'detrend': 'xy',
     'correct': 'r',
+    'start': 2000,  # e.g. spatial feedback results
+    'stop': 2024,
 }
+
 
 def _get_weights(data, dim=None):
     """
@@ -78,6 +81,8 @@ def _get_weights(data, dim=None):
     """
     # TODO: Implement institute weightings in 'parse_specs' by adding 'weight=True'
     # to the 'other' kwarg group whenever institute='weight' is passed.
+    if dim not in data.indexes:
+        raise ValueError(f'Invalid dimension {dim!r}. Options are {data.dims}.')
     dim = dim or 'facets'  # xarray bug: https://github.com/pydata/xarray/issues/7695
     coord = data.coords[dim]
     index = data.indexes[dim]
@@ -291,13 +296,14 @@ def _get_filters(facets, project=None, institute=None):
     else:
         raise ValueError(f'Invalid institute name {institute!r}.')
     project = (project or 'cmip').lower()
-    number = re.sub(r'\Acmip', '', project)
+    header = re.sub(r'\d+\Z', '', project)
+    number = re.sub(r'\A\D+', '', project)
     digits = max(1, len(number))
     projs = []  # permit e.g. cmip6556 or inst6556
     for jdx in range(0, digits, 2):
         num = number[jdx:jdx + 2]
         if not num:
-            proj = lambda key: True  # noqa: U100
+            proj = lambda key: re.match(key[0].lower(), header)
         elif num in ('5', '6'):
             proj = lambda key: key[0][-1] == num
         elif num in ('65', '66', '56', '55'):
@@ -311,7 +317,7 @@ def _get_filters(facets, project=None, institute=None):
     return proj, inst
 
 
-def _fill_kwargs(data, **kwargs):
+def _fill_kwargs(data, project=None, **kwargs):
     """
     Return default keyword arguments given the input data.
 
@@ -319,6 +325,8 @@ def _fill_kwargs(data, **kwargs):
     ----------
     dataset : xarray.Dataset or xarray.DataArray
         The input dataset.
+    project : str, optional
+        The input project.
     **kwargs : optional
         The reduction instructions.
 
@@ -336,6 +344,8 @@ def _fill_kwargs(data, **kwargs):
     coupled = facets.size > 1  # coupled model dataset
     coupled1 = 'experiment' in facets.names  # general coupled model data
     coupled2 = 'experiment' in version.names  # scalar feedback model data
+    observed = project and project.lower() == 'ceres'
+    surface = kwargs.get('source', None) in ('gistemp', 'hadcrut')
     external = kwargs.get('source', None) in ('zelinka', 'geoffroy', 'forster')
     response = kwargs.get('experiment', None) in (None, 'abrupt4xco2')
     experiment = region = period = None  # see below
@@ -344,18 +354,24 @@ def _fill_kwargs(data, **kwargs):
         defaults.update(SCALAR_DEFAULTS)
     if (coupled1 or coupled2) and (response or external):  # abrupt response
         defaults.update(RESPONSE_DEFAULTS)
-    if not coupled1 and not coupled2:  # scalar observations
+    if not coupled1 and not coupled2 or observed:  # observed feedbacks
         defaults.update(OBSERVED_DEFAULTS)
     if coupled1 and not coupled2 and 'period' in version.names:  # outdated format
         defaults.update(period='ann')  # select coord made by average_periods()
     if coupled and feedbacks and response:
         defaults.update(initial='init', experiment='abrupt4xco2')
+    if observed:  # change default source
+        defaults.update(source='hadcrut', experiment='historical')
+    if surface and project != 'CERES':  # remove model source specification
+        kwargs.pop('source', None)
     if response and kwargs.get('period') and kwargs.get('startstop'):
         kwargs.pop('startstop', None)  # accidental invalid control period
     if 'startstop' in kwargs:
         kwargs['start'], kwargs['stop'] = kwargs.pop('startstop')
     for dim, value in defaults.items():
-        if dim in kwargs and kwargs[dim] is None and dim != 'time':
+        if observed and dim in ('experiment', 'start', 'stop'):
+            kwargs.pop(dim, None)  # dummy values required for merging
+        elif dim in kwargs and kwargs[dim] is None and dim != 'time':
             kwargs[dim] = value  # typically use 'None' as default placeholder
         else:  # for 'time' use 'None' to bypass operation
             kwargs.setdefault(dim, value)
@@ -454,9 +470,12 @@ def _reduce_data(
     index = data.indexes.get(idim, None)
     units = f'({data.units})' if data.units else data.units
     kwargs = {'dim': dim, 'skipna': skipna}
-    if not weight:
+    special = dim in data.coords and dim not in data.dims and method in ('avg', 'med')
+    if special:  # e.g. comparing observed to model average
+        method, weight = 'dist', False
+    if dim in data.coords and not weight:
         wgts = xr.ones_like(data.coords[dim], dtype=float)
-    elif dim == 'facets':
+    elif dim in data.dims and dim == 'facets':
         wgts = _get_weights(data, dim=dim)
     else:
         raise TypeError(f'Invalid option {weight=} for regression dimension {dim!r}.')
@@ -466,6 +485,8 @@ def _reduce_data(
         name = None  # bars or boxes
         if data.ndim == 1:
             result = data[~data.isnull()]
+        elif special:  # e.g. observed pattern (critical to match short name)
+            result, short = data, data.long_name
         else:
             raise ValueError(f'Invalid dimensionality {data.ndim!r} for distribution.')
     elif method == 'pctile':  # percentile range
@@ -880,8 +901,7 @@ def reduce_general(data, attrs=None, hemi=None, hemisphere=None, **kwargs):
 
     # Iterate over data reductions
     # WARNING: Sometimes multi-index reductions can eliminate previously valid
-    # coords, so critical to iterate one-by-one and validate selections each time.
-    # TODO: Restore functionality for 'spatial' reductions.
+    # coords so critical to iterate one-by-one and validate selections each time.
     # NOTE: This silently skips dummy selections (e.g. area=None) that may be needed
     # to prevent _parse_specs from merging e.g. average and non-average selections.
     hemi = hemi or hemisphere  # {{{
@@ -895,7 +915,7 @@ def reduce_general(data, attrs=None, hemi=None, hemisphere=None, **kwargs):
         datas = (data,)
     for data in datas:
         result = data
-        ikwargs = _fill_kwargs(data, **kwargs)  # includes default area=None
+        ikwargs = _fill_kwargs(data, project=project, **kwargs)  # includes area=None
         for dim, value in sorted(ikwargs.items(), key=sorter):
             sizes = [*result.sizes, 'area', 'volume', 'spatial', 'time', 'month', 'season']  # noqa: E501
             names = [key for idx in result.indexes.values() for key in idx.names]

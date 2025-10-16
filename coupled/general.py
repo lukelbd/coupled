@@ -514,7 +514,7 @@ def _get_scalars(*args, units=False, tuples=False, pairs=False):
     return result
 
 
-def _format_axes(ax, *args, command=None, zeros=None):
+def _format_axes(ax, *args, command=None, zeros=None, labelsize=None):
     """
     Adjust x and y axis labels and possibly add zero lines.
 
@@ -526,6 +526,8 @@ def _format_axes(ax, *args, command=None, zeros=None):
         The plotting command.
     zeros : bool, optional
         Whether to plot zero lines.
+    labelsize : size-spec, optional
+        The x-axis and y-axis label size.
     *args : array-like
         The plotting arguments.
     **kwargs
@@ -608,7 +610,9 @@ def _format_axes(ax, *args, command=None, zeros=None):
                 width, height = ax._get_size_inches()  # all axes present by now
             size = width if s == 'x' else height
             label = _split_label(data.climo.cfvariable.short_label, refwidth=size)
-            ax.format(**{f'{s}label': label})  # include share settings
+            kwarg = {f'{s}label': label}
+            kwarg.update({'labelsize': labelsize} if labelsize else {})
+            ax.format(**kwarg)  # include share settings
         units.append(unit)
     return units
 
@@ -726,8 +730,8 @@ def _format_bars(
 
 def _format_scatter(
     ax, data0, data1, handle=None, dataset=None, zeros=False, oneone=False,
-    linefit=False, correlation=False, bounds=False, highlight=False,
-    annotate=False, constraint=None, masking=None, original=None,
+    linefit=False, coords=None, correlation=False, bound=False, bounds=False,
+    highlight=False, annotate=False, constraint=None, masking=None, original=None,
     cumulative=False, alternative=False, weight=False, pctile=None, **kwargs,
 ):
     """
@@ -752,10 +756,14 @@ def _format_scatter(
         Whether to add a one-one dotted line.
     linefit : bool, optional
         Whether to add a least-squares fit line.
+    coords : bool or float or array-like, optional
+        Whether to extend the line coordinates
     correlation : bool, optional
         Whether to show correlation instead of r-squared.
     bounds : bool, optiona
-        Whether to show slope and bounds instead of r-squared.
+        Whether to show slope and its uncertainty instead of r-squared.
+    bound : bool, optiona
+        Whether to show slope its symbol instead of r-squared.
     highlight : bool, optional
         Whether to highlight positive slopes with red.
     annotate : bool, optional
@@ -827,7 +835,8 @@ def _format_scatter(
     # and lower and upper bounds so do not explicitly need sorted x coordinates.
     # label = rf'$r^2={sign}{value:~L.0f}$'
     # color = 'red' if constraint is None else color  # line fit color
-    if bounds or linefit or correlation or constraint is not None:  # {{{
+    if bound or bounds or linefit or correlation or constraint is not None:  # {{{
+        from observed.arrays import regress_dims
         dim = data0.dims and data0.dims[0] or None
         pct = pctile or (99 if bounds and dim == 'time' else 95)  # default range
         result = _get_regression(data0, data1, dim=dim, pctile=pct, weight=weight)
@@ -835,23 +844,38 @@ def _format_scatter(
         delta = 0.5 * (slope2 - slope1)  # confidence interval
         corr = np.sqrt(rsq.item())  # correlation coefficient
         rsq = ureg.Quantity(rsq.item(), '').to('percent')
-        loc = 'll' if bounds and dim == 'time' else 'lr'  # label location
+        loc = 'lc' if dim == 'time' and (bounds or bound) else 'lr'  # label location
         sym = r'\lambda' if dim == 'time' else r'\beta_{\lambda}'
-        sign = '{-}' if slope < 0 else ''  # negative r-squared
-        bnds = format(abs(slope.item()), '.1f' if dim == 'time' else '.2f')
-        bnds = rf'{sym}={sign}{bnds}\pm{delta.item():.2f}'
-        stat = rf'r={sign}{corr:.2f}' if correlation else rf'r^2={rsq:~L.0f}'
-        stat = re.sub(r'(?<!\\)%', r'\%', stat).replace(r'\ ', '')
-        text = f'$\\,{stat}$\n$\\,{bnds}$' if bounds else f'${stat}$'
-        datax = np.sort(data0, axis=0)  # linefit returns result for sorted data
+        slp = format(abs(slope.item()), '.1f' if dim == 'time' else '.2f')
+        unit = format_units(slope.units).strip('$').replace(r'\, / \,', '/')
+        sign = '{-}' if slope < 0 else '{+}' if dim == 'time' else ''
+        bnds = rf'{sym}={sign}{slp}\pm{delta.item():.2f}'
+        stat = rf'{sign}{slp}\,{unit}'  # value alone
+        text = rf'r={sign}{corr:.2f}' if correlation else rf'r^2={rsq:~L.0f}'
+        text = re.sub(r'(?<!\\)%', r'\%', text).replace(r'\ ', '')
+        text = f'${stat}$' if bound else f'${bnds}$' if bounds else f'${text}$'  # noqa: E501
         color = 'gray8' if constraint is None or not handle else handle[0].get_color()
         color = 'red8' if highlight and slope > 0 else color  # positive regressions
         title_kw = {'size': titlesize, 'weight': 'normal', 'linespacing': 0.8}
         title_kw.update(kwargs)  # additional keywords
         ax.use_sticky_edges = False  # show end of line fit shading
+        if coords is True:
+            coords = 0.3
+        if coords is False or coords is None:  # sorted coordinates
+            coord = np.sort(data0, axis=0)
+        elif np.size(coords) > 1:  # arbitrary coordinates
+            coord = np.asarray(coords)
+        else:  # expanded coordinates
+            delta = data0.max().item() - data0.min().item()
+            min_ = data0.min().item() - coords * delta
+            max_ = data0.max().item() + coords * delta
+            coord = np.linspace(min_, max_, 100)
+        coord = xr.DataArray(coord, dims=data0.dims, name=data0.name, attrs=data0.attrs)  # noqa: E501
+        result = regress_dims(data0, data1, dim=dim, pctile=pct, coords=coord, manual=True)  # noqa: E501
+        _, _, _, fit, fit1, fit2, *_ = result
         kw_line = dict(lw=1.5 * pplt.rc.metawidth, ls='-', a=1.0, c=color)
-        handle0, = ax.plot(datax, fit, label='least-squares fit', **kw_line)
-        ax.area(datax, fit1.squeeze(), fit2.squeeze(), lw=0, a=0.3, c=color)
+        handle0, = ax.plot(coord, fit, label='least-squares fit', **kw_line)
+        ax.area(coord, fit1.squeeze(), fit2.squeeze(), lw=0, a=0.3, c=color)
         ax.format(**{f'{loc}title': text, f'{loc}title_kw': title_kw})
 
     # Add constraint indicator
@@ -905,7 +929,8 @@ def _format_scatter(
         ymins2, ymean, ymaxs2 = ys2[:nys], ys2[nys], ys2[-nys:]
         alphas, handle, ihandle = (0.1, 0.2), [], None
         args = ([xmean, xmean], [min(ymins2) - 100, ymean]) if nxs and nys else ()
-        color = 'cyan7' if 'y' in original or not handle else handle[0].get_color()
+        # color = 'cyan7' if 'y' in original or not handle else handle[0].get_color()
+        color = 'gray8' if original == 'x' else xcolor if not handle else handle[0].get_color()  # noqa: E501
         if args:  # includes uncertainty
             xobjs.append(ax.add_artist(mlines.Line2D(*args, lw=1, color=xcolor, label='observations')))  # noqa: E501
         else:  # scalar constraint
@@ -923,7 +948,7 @@ def _format_scatter(
         # param = r'\sigma_{\mathrm{constrained}} - \sigma_{\mathrm{unconstrained}}'
         # param = rf'\dfrac{{{param}}}{{\sigma_{{\mathrm{{unconstrained}}}}}}'
         args = ([min(xmins) - 100, xmean], [ymean, ymean]) if nxs and nys else ()
-        color = ycolor if 'x' in original or not handle else handle[0].get_color()
+        color = 'gray8' if original == 'y' else ycolor if not handle else handle[0].get_color()  # noqa: E501
         if args:
             yobjs.append(ax.add_artist(mlines.Line2D(*args, lw=1, color=ycolor, label='constrained')))  # noqa: E501
         for alph, ymin, ymax in zip(alphas, ymins, ymaxs):
@@ -2190,10 +2215,14 @@ def general_plot(
         Relative x and y axis limits to apply to groups of shared or standardized axes.
     figurespan : bool, optional
         If ``False`` or ``True`` guides are always supblot-wide or figure-wide.
+    colorbar : str, optional
+        The colorbar location.
     cbarlength : float, optional
         Length of colorbar.
     cbarwrap : float, optional
         Scaling to apply to size used to wrap colorbar labels.
+    legend : str, optional
+        The legend location.
     leggroup : bool, optional
         Whether to group legends. Default is ``groupnames is not True``.
     legcols : int, optional
@@ -2522,7 +2551,7 @@ def general_plot(
             geographic = set(getattr(args[-1], 'dims', ())) == {'lon', 'lat'}
             ax.format(**{key: val for key, val in kw_axes.items() if 'proj' not in key})
             if ax._name == 'cartesian':  # WARNING: critical to call this first
-                kwarg = _pop_kwargs({**kw_other, **kw_axes}, 'zeros')
+                kwarg = _pop_kwargs({**kw_other, **kw_axes}, 'labelsize', 'zeros')
                 xunits, yunits = _format_axes(ax, *args, command=command, **kwarg)
                 groups_xunits.setdefault(xunits, []).append(ax)
                 groups_yunits.setdefault(yunits, []).append(ax)
@@ -2788,7 +2817,8 @@ def general_plot(
                 head = ax.get_title()  # used for fancy pattern figure
                 label = f'{head}\n{labels[col]}' if head else labels[col]
                 ax.format(ctitle=label, ctitle_kw={'weight': 'bold'})
-    kw_labels = {rowkey: rowlabels, colkey: collabels}
+    size = kw_axes.get('labelsize', kw_axes.get('fontsize', pplt.rc.labelsize))
+    kw_labels = {rowkey: rowlabels, f'{rowkey}ize': size, colkey: collabels, f'{colkey}ize': size}  # noqa: E501
     fig.format(figtitle=figtitle, **kw_labels)
 
     # Optionally save the figure

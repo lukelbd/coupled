@@ -401,6 +401,7 @@ def divide_specs(name, specs, **kwargs):
     count = kwargs.get(geom, None)
     titles = kwargs.get('titles', None)
     labels = kwargs.get(f'{name}labels', None)
+    pad = kwargs.get(f'{side}pad', None)
     space = kwargs.get(f'{side}space', None)
     ratios = kwargs.get(f'{side}ratios', None)
     if nosplit:  # split nothing
@@ -428,6 +429,8 @@ def divide_specs(name, specs, **kwargs):
             kwargs[f'{side}ratios'] = [ratios[idx] for idx in idxs]
         if not nosplit and np.iterable(space):
             kwargs[f'{side}space'] = space[idxs[0]:idxs[-1]] or None if noskip else None
+        if not nosplit and np.iterable(pad):
+            kwargs[f'{side}pad'] = pad[idxs[0]:idxs[-1]] or None if noskip else None
         if not nosplit and np.iterable(labels) and not isinstance(labels, str):
             if len(labels) == len(specs):  # TODO: re-address (need for tiled plots?)
                 kwargs[f'{name}labels'] = [labels[idx] for idx in idxs]
